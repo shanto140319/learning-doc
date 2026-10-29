@@ -1,0 +1,243 @@
+---
+title: "Lesson 1: The event loop"
+description: "How one JavaScript thread serves thousands of requests: the call stack, libuv, microtasks, macrotasks and how not to block."
+---
+
+Node.js runs your JavaScript on **one thread**. Yet one Node server can handle thousands of requests at the same time. This lesson explains how, and the one rule that follows from it: **never block the event loop.**
+
+## The big picture
+
+Think of a restaurant with **one waiter** (your JavaScript thread) and **a kitchen with several cooks** (the operating system and libuv's thread pool).
+
+- The waiter takes an order, gives it to the kitchen, and **does not stand there waiting**. They go to the next table.
+- When a dish is ready, the kitchen puts it on the counter (a **queue**).
+- When the waiter is free, they pick up the next ready dish and serve it (run your **callback**).
+
+One waiter serves many tables because they never wait. But if the waiter stops to fold 500 napkins (a long calculation), **every table waits**. That is "blocking the event loop".
+
+The parts, with their real names:
+
+| Part | What it does |
+| --- | --- |
+| **Call stack** | The function running right now. JavaScript runs one thing at a time, to the end. |
+| **libuv** | The C library inside Node that talks to the operating system: network, files, timers. |
+| **Thread pool** | 4 background threads (by default) in libuv for work the OS can't do asynchronously: file system calls, `crypto.pbkdf2`, `zlib`, DNS lookups. |
+| **Event loop** | The loop that checks queues and runs ready callbacks, again and again, while there is work left. |
+
+Network I/O (HTTP, database sockets) does **not** use the thread pool. The OS tells Node "data arrived on this socket" directly. That's why one Node process can hold thousands of open connections cheaply.
+
+## Run-to-completion
+
+Once a function starts, nothing else runs until it finishes (or hits an `await`). Callbacks never interrupt your code in the middle.
+
+```typescript
+setTimeout(() => console.log('timer'), 0);
+
+const start = Date.now();
+while (Date.now() - start < 2000) {} // busy for 2 seconds
+
+console.log('loop done');
+// Output: "loop done" after 2s, then "timer".
+// The 0 ms timer had to wait, because the thread was busy.
+```
+
+A timer's delay is a **minimum**, not a promise. `setTimeout(fn, 0)` means "run fn soon, after the current code and other queued work".
+
+## Microtasks vs macrotasks
+
+This is the part interviewers love. There are two kinds of queues:
+
+- **Microtasks:** promise callbacks (`.then`, code after `await`) and `queueMicrotask`. Node also has `process.nextTick`, which runs even before promise microtasks.
+- **Macrotasks** (also called "tasks"): `setTimeout`, `setInterval`, `setImmediate`, I/O callbacks.
+
+The rule: **after each macrotask finishes (and after the main script finishes), Node empties the whole microtask queue before moving on.**
+
+```typescript
+console.log('1: script start');
+
+setTimeout(() => console.log('6: setTimeout'), 0);
+setImmediate(() => console.log('7: setImmediate'));
+
+Promise.resolve().then(() => console.log('4: promise'));
+queueMicrotask(() => console.log('5: microtask'));
+process.nextTick(() => console.log('3: nextTick'));
+
+console.log('2: script end');
+```
+
+Output in a CommonJS file (`.cjs`, or a project without `"type": "module"`, which is how NestJS compiles by default):
+
+```text
+1: script start
+2: script end
+3: nextTick
+4: promise
+5: microtask
+6: setTimeout
+7: setImmediate
+```
+
+Why:
+
+1. The main script is itself one big task, so the synchronous logs (1, 2) run first.
+2. Then `nextTick` callbacks, then promise microtasks, in the order they were added.
+3. Then the event loop moves to the macrotask phases.
+
+<Callout title="Surprise: ES modules print 1 2 4 5 3 6 7">
+With our setup (`"type": "module"`), you'll see `nextTick` (3) **after** the promises. Why? An ES module's top-level code itself runs inside a promise job, so Node finishes the whole promise queue before it reaches the `nextTick` queue.
+
+This only happens at the **top level of an ES module**. Inside any callback (a request handler, a timer, an I/O callback), which is where almost all real code runs, `nextTick` always comes before promises. Try it: wrap the `Promise.resolve().then(…)` and `process.nextTick(…)` lines in a `setTimeout` and run again.
+
+In an interview, say "`nextTick` runs before promise callbacks". Mentioning the ES module exception is a bonus that shows you've actually tested it.
+</Callout>
+
+<Callout type="warn" title="setTimeout vs setImmediate">
+From the main script, the order of `setTimeout(fn, 0)` and `setImmediate` is **not guaranteed**: it depends on how fast the process started. Inside an I/O callback (for example, inside `fs.readFile`'s callback), `setImmediate` always runs first. In an interview, saying "it's not guaranteed from the main module" shows real understanding.
+</Callout>
+
+## The event loop phases (simple version)
+
+Each turn of the loop ("a tick") goes through phases. You only need these four:
+
+1. **Timers:** runs `setTimeout` and `setInterval` callbacks whose time has come.
+2. **Poll:** gets new I/O events (data arrived, file read finished) and runs their callbacks. If there is nothing to do, Node waits here.
+3. **Check:** runs `setImmediate` callbacks.
+4. **Close callbacks:** for example, `socket.on('close')`.
+
+Between every single callback, Node empties the microtask queue (`nextTick` first, then promises).
+
+## How `await` fits in
+
+`await` pauses **only the current async function**, not the thread. The rest of the function becomes a microtask that runs when the promise settles.
+
+```typescript
+async function loadBooking() {
+  console.log('B: before await');
+  await Promise.resolve();
+  console.log('D: after await');   // runs as a microtask
+}
+
+console.log('A: start');
+loadBooking();
+console.log('C: end');
+// A, B, C, D
+```
+
+The code before the first `await` runs synchronously, immediately when you call the function. Many people get this wrong.
+
+## Blocking the event loop
+
+While your code runs, **no other request is served**. A request that takes 200 ms of CPU blocks every other user for 200 ms.
+
+Common ways to block it by accident:
+
+| Blocking code | Better choice |
+| --- | --- |
+| `fs.readFileSync` inside a request handler | `await fs.promises.readFile`, or a stream |
+| `JSON.parse` / `JSON.stringify` of a 50 MB object | Stream it, paginate, or send less data |
+| A big loop: sorting 1 million rows in JavaScript | Let PostgreSQL sort and filter |
+| `crypto.pbkdf2Sync`, `bcrypt.hashSync` | Use the async versions (they run in the thread pool) |
+| A slow regular expression on user input ("ReDoS") | Simpler regex, input length limits |
+| Image or PDF processing in the request | A background job (BullMQ, Month 2) or a worker thread |
+
+The `Sync` functions are fine at **startup** (reading a config file once). They are a problem **inside request handlers**.
+
+### Seeing it for yourself
+
+```typescript
+import http from 'node:http';
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/slow') {
+    const start = Date.now();
+    while (Date.now() - start < 5000) {} // 5 seconds of CPU work
+    res.end('slow done\n');
+    return;
+  }
+  res.end('fast\n');
+});
+
+server.listen(3000, () => console.log('http://localhost:3000'));
+```
+
+Open two terminals. Run `curl.exe localhost:3000/slow` in the first, then quickly `curl.exe localhost:3000/` in the second. The "fast" request waits about 5 seconds. One slow route slowed down every user.
+
+## Fixing CPU-heavy work
+
+1. **Don't do it in Node.** Push sorting, filtering and counting into the database.
+2. **Move it to a background job.** The request returns `202 Accepted` and a worker does the work.
+3. **Use a worker thread** for real CPU work that must happen now:
+
+```typescript
+// heavy.ts
+import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+
+function countSlotsForYear(days: number): number {
+  let slots = 0;
+  for (let i = 0; i < days * 50_000_000; i++) slots++; // pretend this is hard work
+  return slots;
+}
+
+if (isMainThread) {
+  const worker = new Worker(new URL(import.meta.url), { workerData: 3 });
+  worker.on('message', (result) => console.log('result:', result));
+  console.log('main thread is still free');
+} else {
+  parentPort?.postMessage(countSlotsForYear(workerData as number));
+}
+```
+
+Worker threads have their own event loop and memory. They talk to the main thread with messages. Use them rarely; most backend work is I/O, not CPU.
+
+4. **Run more processes.** One Node process uses one CPU core for JavaScript. In production you run several copies (several containers on ECS, or Node's `cluster` module) behind a load balancer.
+
+## Common mistakes
+
+- Thinking `async` makes code run in the background. It doesn't. An `async` function full of CPU work still blocks the thread; `async` only helps when you `await` real I/O.
+- Thinking `setTimeout(fn, 0)` runs "now". It runs after the current code and all microtasks.
+- Using `readFileSync` in a handler because "it's only a small file". Small files become big files.
+- Creating an endless chain of `process.nextTick` or microtasks. The loop never reaches the I/O phase, so the server stops answering. This is called "starving" the event loop.
+
+## Exercises
+
+- **1.1** 🟢 Without running it, write down the output order for **both** CommonJS and ES modules. Then run it as `1-1.cjs` and `1-1.mjs` (`node 1-1.cjs`) and check.
+
+```typescript
+console.log('A');
+setTimeout(() => console.log('B'), 0);
+Promise.resolve().then(() => console.log('C'));
+process.nextTick(() => console.log('D'));
+(async () => {
+  console.log('E');
+  await null;
+  console.log('F');
+})();
+console.log('G');
+```
+
+- **1.2** 🟡 Write down the output order, then run it.
+
+```typescript
+setTimeout(() => {
+  console.log('T1');
+  Promise.resolve().then(() => console.log('P1'));
+}, 0);
+setTimeout(() => console.log('T2'), 0);
+```
+
+- **1.3** 🟡 Take the `/slow` server above. Replace the busy loop with `await new Promise(r => setTimeout(r, 5000))`. Test with two terminals again. Explain in two sentences why the fast request is no longer blocked.
+- **1.4** 🔴 A teammate's endpoint `GET /reports/yearly` loads 200,000 bookings into memory, groups them by month with a JavaScript loop and returns the totals. Response time is fine for them, but other users complain the whole API gets slow when someone opens the report. Explain why, and give two different fixes.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How does Node.js handle many requests on one thread?"**
+
+> "Node runs JavaScript on one thread, but it never waits for I/O. When code reads a file or queries a database, Node hands that work to the operating system or libuv's thread pool and moves on. When the result is ready, its callback goes into a queue, and the event loop runs it when the thread is free. So one thread can serve thousands of connections, as long as no single piece of code uses the CPU for a long time. That's why we never block the event loop: heavy CPU work goes to the database, a background job or a worker thread."
+
+**"What's the difference between microtasks and macrotasks?"**
+
+> "Microtasks are promise callbacks and `queueMicrotask`; macrotasks are things like `setTimeout`, `setImmediate` and I/O callbacks. After each macrotask, Node runs the whole microtask queue before moving on. So a resolved promise's `.then` always runs before a `setTimeout` with zero delay. In Node, `process.nextTick` runs even before promise microtasks."

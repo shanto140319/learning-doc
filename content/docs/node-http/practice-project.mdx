@@ -1,0 +1,128 @@
+---
+title: "Practice project: booking API with no framework"
+description: "One Friday block that uses every lesson: a plain Node.js booking API, plus the API design for Mini-build A."
+---
+
+This project pulls all seven lessons into one small, working API. It uses no framework on purpose: next month, when NestJS does these things for you, you'll know exactly what it's doing. It also prepares the design for **Mini-build A (URL shortener)**, which you'll build with NestJS and PostgreSQL.
+
+Time: one Friday block (about 4 hours) for Part 1, plus one hour for Part 2.
+
+## Part 1: The booking API (plain Node.js, in memory)
+
+Start from your Lesson 5 server and its exercises. Data lives in arrays and `Map`s; no database yet.
+
+### Requirements
+
+**Endpoints**
+
+| Endpoint | Notes |
+| --- | --- |
+| `GET /v1/services` | List services |
+| `GET /v1/bookings` | Cursor pagination, `limit` (default 20, max 100), `status` / `from` / `to` filters, `sort` with an allow-list |
+| `POST /v1/bookings` | Requires an `Idempotency-Key` header (`400` if missing). `409 SLOT_TAKEN` if the slot is taken. `201` with `Location` |
+| `GET /v1/bookings/:id` | `404` if not found |
+| `POST /v1/bookings/:id/cancel` | `409 ALREADY_CANCELLED` if already cancelled |
+| `GET /v1/bookings/export` | CSV stream with `pipeline`, created per request |
+| `GET /health` | Returns `{ "status": "ok" }` |
+
+**Quality rules**
+
+- [ ] Every error uses the `ApiError` format from Lesson 6, with `Content-Type: application/problem+json`
+- [ ] Errors are thrown as `AppError` subclasses (Lesson 3) and turned into responses in **one** place
+- [ ] Unknown errors return `500` with a safe message; the details go to the console only
+- [ ] JSON bodies have a size limit (`413`) and a content-type check (`415`)
+- [ ] Every response has an `X-Request-Id`; one log line per request with method, path, status and duration
+- [ ] Graceful shutdown on `SIGTERM` and `SIGINT`
+- [ ] `unhandledRejection` handler that logs and exits
+- [ ] Seed data: 3 services and 250 bookings, so pagination has something to page through
+- [ ] `strict` TypeScript, no `any`
+
+**Suggested file layout**
+
+```text
+src/
+  server.ts          ← createServer, routing, shutdown
+  router.ts          ← match method + path → handler
+  http-utils.ts      ← readJsonBody, sendJson, sendProblem
+  errors.ts          ← AppError and subclasses, toProblem()
+  bookings.ts        ← list, create, cancel, export
+  pagination.ts      ← encodeCursor, decodeCursor, parseSort
+  idempotency.ts     ← withIdempotency (Map version)
+  data.ts            ← in-memory arrays and seed data
+requests.http        ← requests for the REST Client extension (or a curl script)
+```
+
+### A tiny router to start you off
+
+Writing `if` statements for every route gets messy. Here is a small router; finish it yourself:
+
+```typescript
+import type http from 'node:http';
+
+type Params = Record<string, string>;
+type Handler = (req: http.IncomingMessage, res: http.ServerResponse, params: Params, url: URL) => Promise<void>;
+type Route = { method: string; pattern: RegExp; keys: string[]; handler: Handler };
+
+const routes: Route[] = [];
+
+export function route(method: string, path: string, handler: Handler) {
+  const keys: string[] = [];
+  // "/v1/bookings/:id/cancel" → /^\/v1\/bookings\/([^/]+)\/cancel$/
+  const pattern = new RegExp(
+    '^' + path.replace(/:(\w+)/g, (_, key: string) => { keys.push(key); return '([^/]+)'; }) + '$',
+  );
+  routes.push({ method, pattern, keys, handler });
+}
+
+export function match(method: string, pathname: string) {
+  // TODO: find the route whose pattern matches and whose method matches.
+  // Return { handler, params }.
+  // If a pattern matches but no method does, the caller should return 405.
+  // If nothing matches, 404.
+}
+```
+
+Note the route order: `GET /v1/bookings/export` must be registered **before** `GET /v1/bookings/:id`, or "export" is treated as an ID.
+
+### Test checklist
+
+Run each of these and check the status code and body:
+
+1. List bookings, follow `nextCursor` until it's `null`. Count the total; it must be 250 with no duplicates.
+2. `limit=500` → `400` or capped at 100 (your choice; write it in the README).
+3. `sort=password` → `400` with the `ApiError` format.
+4. Create a booking with a new key → `201`. Same request, same key → same booking, same ID, still only one new booking.
+5. Same key, different body → `422`.
+6. No `Idempotency-Key` → `400`.
+7. Book a taken slot with a new key → `409 SLOT_TAKEN`.
+8. Cancel twice → `200`, then `409 ALREADY_CANCELLED`.
+9. Broken JSON → `400`. A 2 MB body → `413`. `Content-Type: text/plain` → `415`.
+10. Export CSV, open it in Excel or VS Code.
+11. Start an export, press Ctrl+C: the server waits, then exits cleanly.
+
+## Part 2: Design Mini-build A (URL shortener)
+
+You'll build this next month with NestJS and PostgreSQL. **Design it now** using Lessons 5–7. Write a `DESIGN.md` with:
+
+1. **Endpoints**, methods, request and response JSON:
+   - create a short link (with an optional custom alias and expiry date)
+   - redirect from the short code
+   - list my links (paginated)
+   - get click stats per day for one link
+   - delete (or disable) a link
+2. **Status codes** for each case, including: alias already taken, link expired, link not found, invalid URL.
+3. **Which redirect status** you'll use (`301`, `302`, `307` or `308`) and why. Think about browser caching and analytics: if the browser caches a `301`, will you still count the click?
+4. **The error format** (reuse `ApiError`).
+5. **Pagination** style for "list my links" and why.
+6. **Should create be idempotent?** If a client retries "create link for this URL", what should happen?
+7. **Where streams or background work** might help (for example, writing click events without slowing down the redirect).
+
+Keep it to about one page. Paste it into Claude for a review before you build.
+
+## When you're done
+
+1. Push Part 1 to GitHub with a short README: how to run it, the endpoint list, and the design decisions (pagination, errors, idempotency).
+2. Paste `errors.ts`, `pagination.ts` and `idempotency.ts` into Claude for a scored code review.
+3. Ask Claude for a **10-question quiz on the whole Node.js and HTTP section**, including at least two "what's the output order?" questions and two "which status code?" questions. **Score 8 or more** to move on to NestJS and PostgreSQL.
+4. Write a short LinkedIn or dev.to post: "What I learned building an API with no framework". It counts towards Phase 1 deliverables.
+5. Update the progress box on the [section home page](/docs/node-http).

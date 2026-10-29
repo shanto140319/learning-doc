@@ -1,0 +1,216 @@
+---
+title: "Lesson 3: Error handling"
+description: "Operational vs programmer errors, custom error classes, error causes, crashes, and graceful shutdown."
+---
+
+Good error handling decides whether your API returns a clear `409 Conflict` or crashes at 3 a.m. This lesson gives you one simple model for errors and the code patterns that go with it.
+
+## Two kinds of errors
+
+This idea, from Node.js experts, is the most important part of the lesson:
+
+| | Operational errors | Programmer errors (bugs) |
+| --- | --- | --- |
+| What | Expected problems in a correct program | Mistakes in the code |
+| Examples | Slot already booked, invalid input, database timeout, payment declined, file not found | `Cannot read properties of undefined`, wrong argument type, forgotten `await` |
+| What to do | **Handle them**: return a clear status code, retry, or show a message | **Fix the code.** At runtime: log, return 500, and if the process state may be broken, restart |
+
+You cannot "handle" a bug, because you don't know what state the program is in. So don't try to: let it be logged and fix it.
+
+## Custom error classes
+
+Throwing `new Error('Slot taken')` everywhere forces callers to check message strings. Instead, create a small set of error classes that carry meaning, and later an HTTP status:
+
+```typescript
+// errors.ts
+export class AppError extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode: number,
+    public readonly code: string,          // stable, machine-readable: 'SLOT_TAKEN'
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = new.target.name;            // 'ConflictError', not 'Error'
+  }
+}
+
+export class NotFoundError extends AppError {
+  constructor(resource: string, id: string) {
+    super(`${resource} ${id} not found`, 404, 'NOT_FOUND');
+  }
+}
+
+export class ValidationError extends AppError {
+  constructor(message: string, public readonly fields: Record<string, string>) {
+    super(message, 422, 'VALIDATION_FAILED');
+  }
+}
+
+export class ConflictError extends AppError {
+  constructor(message: string, code = 'CONFLICT') {
+    super(message, 409, code);
+  }
+}
+```
+
+Using them in booking logic:
+
+```typescript
+async function createBooking(input: { serviceId: string; startsAt: Date; email: string }) {
+  const service = await db.services.findById(input.serviceId);
+  if (!service) throw new NotFoundError('Service', input.serviceId);
+
+  const clash = await db.bookings.findAt(service.id, input.startsAt);
+  if (clash) throw new ConflictError('This time slot is already booked', 'SLOT_TAKEN');
+
+  return db.bookings.insert({ ...input, status: 'confirmed' });
+}
+```
+
+The HTTP layer then has **one place** that turns errors into responses:
+
+```typescript
+function toHttpError(err: unknown): { status: number; body: object } {
+  if (err instanceof AppError) {
+    return { status: err.statusCode, body: { code: err.code, message: err.message } };
+  }
+  // Anything else is a bug or an unknown failure. Log the details, hide them from the client.
+  console.error(err);
+  return { status: 500, body: { code: 'INTERNAL', message: 'Something went wrong' } };
+}
+```
+
+NestJS works the same way: you throw `ConflictException`, and an "exception filter" turns it into a response. Now you know what it does underneath.
+
+<Callout title="Never send stack traces to clients">
+Stack traces and database error messages show your file paths, table names and library versions to attackers. Log them on the server; send the client a safe message and a code.
+</Callout>
+
+## `catch (err)` is `unknown`
+
+With `strict` on, `err` in a catch block has type `unknown` (TypeScript Lesson 1). Anything can be thrown, even a string. Narrow before using it:
+
+```typescript
+try {
+  await chargeCard(booking);
+} catch (err) {
+  const message = err instanceof Error ? err.message : String(err);
+  logger.error({ bookingId: booking.id, message }, 'Payment failed');
+  throw err;
+}
+```
+
+## Wrap errors with `cause`
+
+When you catch a low-level error and throw a clearer one, keep the original with `cause`. You keep the full story for debugging:
+
+```typescript
+try {
+  await stripe.paymentIntents.create(/* ... */);
+} catch (err) {
+  throw new AppError('Payment could not be started', 502, 'PAYMENT_PROVIDER_ERROR', { cause: err });
+}
+```
+
+Logs then show both the clear message and the original Stripe error.
+
+## Don't swallow errors
+
+```typescript
+// Bad: the error disappears. Nobody will ever know reminders are failing.
+try {
+  await sendReminder(booking);
+} catch {}
+
+// Good: if you catch, do something meaningful: retry, log with context, or rethrow.
+try {
+  await sendReminder(booking);
+} catch (err) {
+  logger.warn({ err, bookingId: booking.id }, 'Reminder failed, will retry');
+  await queue.retryLater(booking.id);
+}
+```
+
+Rule of thumb: **catch an error only where you can do something useful with it.** Otherwise let it travel up to the central handler.
+
+## When errors escape: process-level events
+
+If a promise rejects and nobody handles it, Node emits `unhandledRejection`. Since Node 15, the default is to **crash the process**. A synchronous throw that nobody catches emits `uncaughtException` and also crashes.
+
+```typescript
+process.on('unhandledRejection', (reason) => {
+  logger.fatal({ reason }, 'Unhandled promise rejection');
+  process.exit(1);
+});
+
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'Uncaught exception');
+  process.exit(1);
+});
+```
+
+Why exit instead of continuing? After an unexpected error, the program may be half-way through something: a lock not released, a counter wrong. Continuing can cause worse, silent bugs. The professional approach is: **log it, exit, and let the process manager restart a clean copy.** In production, Docker, ECS or Kubernetes restarts the process automatically, and you run more than one copy so users don't notice.
+
+## Graceful shutdown
+
+When you deploy a new version, the platform sends your process a `SIGTERM` signal: "please stop". If you stop instantly, requests in progress are cut off. A graceful shutdown:
+
+1. Stops accepting **new** connections.
+2. Lets requests **already in progress** finish.
+3. Closes database and Redis connections.
+4. Exits. If that takes too long, forces an exit.
+
+```typescript
+import http from 'node:http';
+
+const server = http.createServer(handler);
+server.listen(3000);
+
+let shuttingDown = false;
+
+async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received, shutting down`);
+
+  // Safety net: force exit after 10 seconds
+  setTimeout(() => process.exit(1), 10_000).unref();
+
+  server.close(async () => {          // stops new connections; callback runs when existing ones end
+    await db.disconnect();
+    console.log('Clean shutdown');
+    process.exit(0);
+  });
+  server.closeIdleConnections();      // close keep-alive connections that are doing nothing
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM')); // sent by Docker, ECS, Kubernetes
+process.on('SIGINT', () => void shutdown('SIGINT'));   // Ctrl+C in your terminal
+```
+
+`.unref()` means "don't keep the process alive just for this timer". NestJS gives you this with `app.enableShutdownHooks()`.
+
+## Common mistakes
+
+- Returning `500` for everything. A taken slot is a `409`; bad input is a `400` or `422`. The client needs to know whether to retry or to fix the request.
+- Catching errors too early and returning `null`. The caller can't tell "not found" from "database down".
+- `throw 'Something failed'` (a string). It has no stack trace. Always throw `Error` objects.
+- Keeping the server running after `uncaughtException`.
+
+## Exercises
+
+- **3.1** 🟢 Add a `ForbiddenError` (status 403, code `FORBIDDEN`) and an `UnauthorizedError` (401). In one sentence each, explain when to use 401 and when to use 403.
+- **3.2** 🟡 Write `cancelBooking(bookingId, userId)` that throws `NotFoundError` if the booking doesn't exist, `ForbiddenError` if the user doesn't own it, and `ConflictError` with code `ALREADY_CANCELLED` if it's already cancelled. Use an in-memory array as the database.
+- **3.3** 🟡 Write a small script that creates a rejected promise without handling it. Run it and read the crash message. Then add the `unhandledRejection` handler and run it again. Write down what changed.
+- **3.4** 🔴 Add graceful shutdown to the `/slow` server from Lesson 1 (with the async `setTimeout` version). Start a slow request, press Ctrl+C, and confirm the slow request still gets its response before the process exits.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you handle errors in a Node.js API?"**
+
+> "I separate operational errors, like a slot already being booked or invalid input, from programmer errors, which are bugs. For operational errors, I throw custom error classes that carry a status code and a stable error code, and one central handler turns them into consistent HTTP responses. Unknown errors become a 500 with a safe message, and the details go to the logs, never to the client. If something escapes completely, like an unhandled rejection, I log it and let the process exit, because its state may be broken; the orchestrator restarts it. I also handle `SIGTERM` for graceful shutdown so deploys don't cut off requests."

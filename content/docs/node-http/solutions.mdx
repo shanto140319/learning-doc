@@ -1,0 +1,533 @@
+---
+title: "Solutions"
+description: "Model answers for every exercise in the Node.js and HTTP section. Try the exercises first."
+---
+
+<Callout type="warn" title="Try first">
+Do each exercise yourself and get it reviewed before reading the answer. Reading a solution feels like learning, but it isn't the same as getting stuck and finding your way out.
+</Callout>
+
+Other correct answers exist. If yours is different, ask: "Is my version correct? Is it better or worse, and why?"
+
+## Lesson 1: The event loop
+
+**1.1** CommonJS: `A`, `E`, `G`, `D`, `C`, `F`, `B`. ES module: `A`, `E`, `G`, `C`, `F`, `D`, `B`.
+
+- `A`, `E`, `G` are synchronous. `E` prints right away because the code in an async function runs synchronously until the first `await`.
+- Then microtasks. In CommonJS, `nextTick` first (`D`), then promise jobs in the order they were queued. `C`'s `.then` was queued before the `await null` continuation, so `C` then `F`.
+- In an ES module, the top-level code runs inside a promise job, so the promise queue (`C`, `F`) empties before the `nextTick` queue (`D`).
+- The timer (`B`) is a macrotask, so it runs last in both.
+
+**1.2** Output: `T1`, `P1`, `T2`. After each timer callback, Node empties the microtask queue, so `P1` runs before the second timer. (Before Node 11, the output was `T1 T2 P1`. Interviewers sometimes ask about this.)
+
+**1.3** `await new Promise(r => setTimeout(r, 5000))` doesn't use the CPU; it registers a timer and gives the thread back to the event loop. The thread is free during those 5 seconds, so it can serve the fast request immediately.
+
+**1.4** Why: grouping 200,000 rows in a JavaScript loop is CPU work on the only JavaScript thread, so while it runs, every other request waits. Loading 200,000 rows also uses a lot of memory and garbage-collection time. Fixes (any two):
+
+- Let PostgreSQL do it: `SELECT date_trunc('month', starts_at) AS month, count(*) FROM bookings WHERE business_id = $1 GROUP BY 1`. The database returns 12 rows, not 200,000.
+- Pre-compute monthly totals in a summary table, updated by a background job each night.
+- Generate the report in a background job (`202 Accepted`), and notify the user when it's ready.
+- Run the calculation in a worker thread (works, but the first two fixes are better).
+
+## Lesson 2: Async patterns
+
+**2.1**
+
+```typescript
+async function loadDashboard(businessId: string) {
+  console.time('dashboard');
+  const [business, staff, bookings, unreadCount] = await Promise.all([
+    getBusiness(businessId),
+    getStaff(businessId),
+    getTodaysBookings(businessId),
+    getUnreadCount(businessId),
+  ]);
+  console.timeEnd('dashboard'); // about 300 ms, not 1,200 ms
+  return { business, staff, bookings, unreadCount };
+}
+```
+
+**2.2** The three bugs:
+
+1. `forEach` doesn't wait for async callbacks, so the log is written (and the function returns) **before** any email is sent.
+2. Errors thrown inside the `forEach` callbacks are **not caught** by the `try/catch`. They become unhandled rejections, which crash the process.
+3. `db.log.insert(…)` is not awaited, so its errors are also lost.
+
+```typescript
+async function sendDailyReminders(bookings: Booking[]) {
+  for (const b of bookings) {
+    await emailService.send(b.customerEmail, 'Reminder');
+  }
+  await db.log.insert({ type: 'reminders_sent', count: bookings.length });
+}
+```
+
+(Remove the `try/catch` that only logs, or keep it and **rethrow**. Swallowing the error hides the failure from the job runner.)
+
+**2.3**
+
+```typescript
+async function sendDailyReminders(bookings: Booking[]): Promise<{ sent: number; failed: string[] }> {
+  const results = await mapWithLimit(bookings, 5, async (b) => {
+    try {
+      await emailService.send(b.customerEmail, 'Reminder');
+      return { ok: true as const };
+    } catch {
+      return { ok: false as const, email: b.customerEmail };
+    }
+  });
+
+  const failed = results.flatMap((r) => (r.ok ? [] : [r.email]));
+  const sent = results.length - failed.length;
+  await db.log.insert({ type: 'reminders_sent', count: sent, failed: failed.length });
+  return { sent, failed };
+}
+```
+
+Catching inside the callback turns each failure into a value, the same idea as `allSettled`, while `mapWithLimit` keeps at most 5 running.
+
+**2.4**
+
+```typescript
+class HttpError extends Error {
+  constructor(public readonly status: number, url: string) {
+    super(`Request to ${url} failed with status ${status}`);
+    this.name = 'HttpError';
+  }
+}
+
+async function fetchJson<T>(url: string, timeoutMs: number): Promise<T> {
+  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!res.ok) throw new HttpError(res.status, url);
+  return (await res.json()) as T;
+}
+
+try {
+  await fetchJson('https://httpbin.org/delay/5', 2000);
+} catch (err) {
+  if (err instanceof Error && err.name === 'TimeoutError') console.log('Timed out, as expected');
+  else throw err;
+}
+```
+
+Note: `as T` trusts the server. In real code, validate with a Zod schema instead (TypeScript Lesson 5): `fetchJson(url, schema, timeoutMs)`.
+
+## Lesson 3: Error handling
+
+**3.1**
+
+```typescript
+export class UnauthorizedError extends AppError {
+  constructor(message = 'Authentication required') {
+    super(message, 401, 'UNAUTHORIZED');
+  }
+}
+export class ForbiddenError extends AppError {
+  constructor(message = 'You are not allowed to do this') {
+    super(message, 403, 'FORBIDDEN');
+  }
+}
+```
+
+- **401:** the server doesn't know who you are (no token, invalid or expired token). Log in again.
+- **403:** the server knows who you are, but you don't have permission.
+
+**3.2**
+
+```typescript
+type Booking = { id: string; userId: string; status: 'confirmed' | 'cancelled' };
+const bookings: Booking[] = [{ id: 'b1', userId: 'u1', status: 'confirmed' }];
+
+async function cancelBooking(bookingId: string, userId: string): Promise<Booking> {
+  const booking = bookings.find((b) => b.id === bookingId);
+  if (!booking) throw new NotFoundError('Booking', bookingId);
+  if (booking.userId !== userId) throw new ForbiddenError('You can only cancel your own bookings');
+  if (booking.status === 'cancelled') {
+    throw new ConflictError('This booking is already cancelled', 'ALREADY_CANCELLED');
+  }
+  booking.status = 'cancelled';
+  return booking;
+}
+```
+
+Think about it: for a booking in **another business**, return `NotFoundError` rather than `ForbiddenError`, so you don't reveal it exists (Lesson 6). For another customer in the same business, either is defensible.
+
+**3.3** Without a handler, Node prints the error and stack trace and exits with code 1 (the default since Node 15). With the handler, your own log line is printed first (in production this goes to your log system with context), then the process exits on purpose with `process.exit(1)`. Behaviour is the same, but you now control the logging. That's the point.
+
+**3.4**
+
+```typescript
+import http from 'node:http';
+import { setTimeout as sleep } from 'node:timers/promises';
+
+const server = http.createServer(async (req, res) => {
+  if (req.url === '/slow') {
+    await sleep(5000);
+    res.end('slow done\n');
+    return;
+  }
+  res.end('fast\n');
+});
+server.listen(3000);
+
+let shuttingDown = false;
+function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal}: waiting for open requests`);
+  setTimeout(() => process.exit(1), 10_000).unref();
+  server.close(() => {
+    console.log('All requests finished, exiting');
+    process.exit(0);
+  });
+  server.closeIdleConnections();
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+```
+
+The `curl` for `/slow` still gets "slow done", then the process exits. Note: `npx tsx watch` handles Ctrl+C itself, so test with `npx tsx server.ts` (no `watch`).
+
+## Lesson 4: Streams
+
+**4.1**
+
+```typescript
+import { createWriteStream, createReadStream } from 'node:fs';
+import { once } from 'node:events';
+import { createInterface } from 'node:readline';
+
+const out = createWriteStream('big.csv');
+for (let i = 0; i < 4_000_000; i++) {
+  const ok = out.write(`b${i},customer${i}@example.com,2026-11-03T10:00:00Z,confirmed\n`);
+  if (!ok) await once(out, 'drain'); // backpressure: wait until the buffer empties
+}
+out.end();
+await once(out, 'finish');
+
+let count = 0;
+for await (const _line of createInterface({ input: createReadStream('big.csv'), crlfDelay: Infinity })) {
+  count++;
+}
+console.log({ count, rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024) });
+```
+
+Memory stays around 50–100 MB even though the file is about 250 MB. Remove the `drain` check and watch memory grow.
+
+**4.2** Two exports running at the same time would share **one** `Transform` stream. A stream can only be used once, so the second export would fail with "write after end" or mix data. Create a new one per request:
+
+```typescript
+const CSV_HEADER = 'id,customer_email,starts_at,status\n';
+
+function createCsvTransform() {
+  let headerSent = false;
+  return new Transform({
+    objectMode: true,
+    transform(row: BookingRow, _enc, done) {
+      const line = [row.id, row.customerEmail, row.startsAt.toISOString(), row.status].map(csvEscape).join(',') + '\n';
+      if (!headerSent) {
+        headerSent = true;
+        done(null, CSV_HEADER + line);
+      } else {
+        done(null, line);
+      }
+    },
+    flush(done) {
+      // No rows at all: still send the header
+      done(null, headerSent ? undefined : CSV_HEADER);
+    },
+  });
+}
+
+// inside the handler
+res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+res.setHeader('Content-Encoding', 'gzip');
+res.setHeader('Content-Disposition', 'attachment; filename="bookings.csv"');
+await pipeline(Readable.from(allBookings('biz_1')), createCsvTransform(), createGzip(), res);
+```
+
+With gzip, the header line must also go through the gzip stream. If you `res.write()` it directly, the file is half plain text, half gzip, and broken. That's why the transform now writes the header itself. `curl.exe --compressed -o bookings.csv localhost:3000/bookings/export` decompresses the download.
+
+**4.3**
+
+```typescript
+const onlyConfirmed = new Transform({
+  objectMode: true,
+  transform(row: BookingRow, _enc, done) {
+    if (row.status === 'confirmed') done(null, row);
+    else done(); // no data: the row is dropped
+  },
+});
+// pipeline(source, onlyConfirmed, createCsvTransform(), res)
+```
+
+Better still: filter in the database query (`WHERE status = 'confirmed'`), so you don't read rows you'll throw away.
+
+**4.4**
+
+```typescript
+import { rm } from 'node:fs/promises';
+
+class PayloadTooLargeError extends Error {}
+
+function limitSize(maxBytes: number) {
+  let total = 0;
+  return new Transform({
+    transform(chunk: Buffer, _enc, done) {
+      total += chunk.length;
+      if (total > maxBytes) done(new PayloadTooLargeError());
+      else done(null, chunk);
+    },
+  });
+}
+
+async function handleUpload(req: http.IncomingMessage, res: http.ServerResponse) {
+  const path = `./uploads/${randomUUID()}.bin`;
+  try {
+    await pipeline(req, limitSize(10 * 1024 * 1024), createWriteStream(path));
+  } catch (err) {
+    await rm(path, { force: true }); // delete the half-written file
+    if (err instanceof PayloadTooLargeError) {
+      res.writeHead(413, { 'Content-Type': 'application/json', Connection: 'close' });
+      return res.end(JSON.stringify({ code: 'PAYLOAD_TOO_LARGE' }));
+    }
+    throw err;
+  }
+  res.writeHead(201, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ path }));
+}
+```
+
+Also check the `Content-Length` header first: if it says 50 MB, reject at once without reading anything. But don't trust it alone; clients can lie or leave it out.
+
+## Lesson 5: HTTP basics
+
+**5.1**
+
+| Request | Safe | Idempotent |
+| --- | --- | --- |
+| `GET /bookings` | ✅ | ✅ |
+| `POST /bookings` | ❌ | ❌ |
+| `PUT /services/s1` | ❌ | ✅ |
+| `DELETE /bookings/b1` | ❌ | ✅ |
+| `POST /bookings/b1/cancel` | ❌ | ❌ by the HTTP rules, but you can **design** it to behave idempotently |
+
+**5.2**
+
+```typescript
+const bookingMatch = url.pathname.match(/^\/bookings\/([^/]+)$/);
+if (bookingMatch) {
+  const id = bookingMatch[1];
+  const index = bookings.findIndex((b) => b.id === id);
+  if (req.method === 'GET') {
+    if (index === -1) return sendJson(res, 404, { code: 'NOT_FOUND', message: 'Booking not found' });
+    return sendJson(res, 200, bookings[index]);
+  }
+  if (req.method === 'DELETE') {
+    if (index === -1) return sendJson(res, 404, { code: 'NOT_FOUND', message: 'Booking not found' });
+    bookings.splice(index, 1);
+    res.writeHead(204);
+    return res.end();
+  }
+}
+```
+
+The second `DELETE` returns `404`. That's still idempotent: idempotency is about the **effect on the server** (the booking is gone after one call or ten), not about getting the same response. Some teams return `204` again to make retries look clean; both are accepted.
+
+**5.3**
+
+```typescript
+const server = http.createServer(async (req, res) => {
+  const started = performance.now();
+  const incoming = req.headers['x-request-id'];
+  const requestId = typeof incoming === 'string' && incoming.length <= 100 ? incoming : randomUUID();
+  res.setHeader('X-Request-Id', requestId);
+
+  res.on('finish', () => {
+    const ms = (performance.now() - started).toFixed(1);
+    console.log(`${req.method} ${req.url} ${res.statusCode} ${ms}ms id=${requestId}`);
+  });
+
+  // ...routing as before
+});
+```
+
+`setHeader` must be called before `writeHead`, and `sendJson`'s `writeHead` merges headers already set with `setHeader`. Limit the length of the incoming ID so a client can't flood your logs.
+
+**5.4**
+
+```typescript
+import { createHash } from 'node:crypto';
+
+if (req.method === 'GET' && url.pathname === '/services') {
+  const json = JSON.stringify({ data: services });
+  const etag = `"${createHash('sha1').update(json).digest('base64url')}"`;
+  if (req.headers['if-none-match'] === etag) {
+    res.writeHead(304, { ETag: etag });
+    return res.end();
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json', ETag: etag, 'Cache-Control': 'private, no-cache' });
+  return res.end(json);
+}
+```
+
+ETags are quoted strings, so keep the quotes. `no-cache` means "you may cache it, but check with me first", which is exactly what the ETag check does. The `304` saves bandwidth, not server work (we still build the JSON).
+
+## Lesson 6: REST API design
+
+**6.1**
+
+- (a) Wrong password: `401`. Use the same message for "no such email" and "wrong password", so attackers can't discover which emails exist.
+- (b) Slot in the past: `422` (or `400` if your team uses `400` for all validation).
+- (c) Staff changing prices: `403`.
+- (d) Email provider down: the best design returns **`201`**. The booking is the important part; the email should go through a queue and be retried later (Month 2). If you must call it in the request and it fails, `502`, but that's the weaker design.
+- (e) Broken JSON: `400`.
+- (f) Rescheduling a cancelled booking: `409` (conflicts with the current state), type `booking-cancelled`.
+
+**6.2**
+
+| Before | After | Why |
+| --- | --- | --- |
+| `GET /getAllServices` | `GET /services` | The method is the verb; plural noun |
+| `POST /service/new` | `POST /services` | POST on the collection creates |
+| `POST /bookings/delete/b1` | `DELETE /bookings/b1` | Use the HTTP method, ID after the collection |
+| `GET /Bookings/b1/` | `GET /bookings/b1` | Lowercase, no trailing slash |
+| `GET /bookings/b1/cancel` | `POST /bookings/b1/cancel` | GET must be safe; cancelling changes data |
+
+**6.3**
+
+```typescript
+export function toProblem(err: unknown, requestId: string, path: string): ApiError {
+  if (err instanceof ValidationError) {
+    return {
+      type: 'validation-failed',
+      title: 'Your request has invalid fields',
+      status: 422,
+      instance: path,
+      requestId,
+      errors: Object.entries(err.fields).map(([field, message]) => ({ field, message })),
+    };
+  }
+  if (err instanceof AppError) {
+    return {
+      type: err.code.toLowerCase().replaceAll('_', '-'), // SLOT_TAKEN → slot-taken
+      title: err.message,
+      status: err.statusCode,
+      instance: path,
+      requestId,
+    };
+  }
+  console.error({ requestId, err });
+  return { type: 'internal', title: 'Something went wrong', status: 500, instance: path, requestId };
+}
+```
+
+The `ValidationError` check must come **before** the `AppError` check, because `ValidationError` is also an `AppError`.
+
+**6.4** One good design:
+
+```text
+GET    /v1/staff/:id/time-off?from=&to=          → 200 { data: TimeOff[] }
+POST   /v1/staff/:id/time-off                    → 201 TimeOff + Location
+       body: { startsAt, endsAt, reason? }
+       errors: 422 (endsAt before startsAt), 403 (staff can only add their own), 404 (staff not found)
+DELETE /v1/staff/:id/time-off/:timeOffId         → 204
+```
+
+Clashing bookings: creating time off **doesn't silently cancel** customers' bookings. If there are clashes, return `409` with type `time-off-clashes-with-bookings` and the list of clashing booking IDs. The client shows them, and the owner can either reschedule or cancel them (through the normal booking endpoints, which send emails), or send the request again with `"cancelClashingBookings": true`. That keeps the dangerous action explicit and on purpose, and each cancellation still follows the booking rules.
+
+## Lesson 7: Lists and safe retries
+
+**7.1** Items sorted newest first, page size 3: `[F, E, D | C, B, A]`. Page 1 (`offset=0`) shows F, E, D. Now a new booking G is added: `[G, F, E | D, C, B | A]`. Page 2 (`offset=3`) shows **D**, C, B. D appears twice, because adding G pushed every item one position down. With a cursor ("after D"), page 2 is C, B, A, whatever was added at the top.
+
+**7.2**
+
+```typescript
+function compareDesc(a: Booking, b: Booking): number {
+  if (a.startsAt !== b.startsAt) return a.startsAt < b.startsAt ? 1 : -1;
+  return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+}
+
+function listBookings(url: URL) {
+  const limitParam = Number(url.searchParams.get('limit') ?? 20);
+  if (!Number.isInteger(limitParam) || limitParam < 1) throw new ValidationError('Invalid limit', { limit: 'Must be a positive integer' });
+  const limit = Math.min(limitParam, 100);
+
+  const sorted = [...bookings].sort(compareDesc);
+  const cursorParam = url.searchParams.get('cursor');
+
+  let start = 0;
+  if (cursorParam) {
+    const after = decodeCursor(cursorParam); // { startsAt, id }
+    // first item that comes after the cursor in the sort order
+    start = sorted.findIndex((b) => b.startsAt < after.startsAt || (b.startsAt === after.startsAt && b.id < after.id));
+    if (start === -1) start = sorted.length;
+  }
+
+  const page = sorted.slice(start, start + limit);
+  const last = page.at(-1);
+  const hasMore = start + limit < sorted.length;
+  return { data: page, nextCursor: hasMore && last ? encodeCursor(last) : null };
+}
+```
+
+(In this in-memory version `startsAt` is an ISO string, and ISO strings in UTC compare correctly as text. Adapt `encodeCursor` to take a string.)
+
+**7.3**
+
+```typescript
+const STATUSES = ['confirmed', 'cancelled'] as const;
+type Status = (typeof STATUSES)[number];
+
+function parseFilters(url: URL) {
+  const status = url.searchParams.get('status');
+  if (status && !STATUSES.includes(status as Status)) {
+    throw new ValidationError('Invalid status', { status: `Use one of: ${STATUSES.join(', ')}` });
+  }
+  const from = url.searchParams.get('from');
+  const to = url.searchParams.get('to');
+  for (const [name, value] of [['from', from], ['to', to]] as const) {
+    if (value && Number.isNaN(Date.parse(value))) {
+      throw new ValidationError('Invalid date', { [name]: 'Must be an ISO 8601 date' });
+    }
+  }
+  return { status, from, to, sort: parseSort(url.searchParams.get('sort')) };
+}
+
+// Then: bookings.filter(b => (!status || b.status === status) && (!from || b.startsAt >= from) && (!to || b.startsAt <= to))
+```
+
+In the shared error handler, map `ValidationError` to `400` for query parameters if your team uses that rule (Lesson 6).
+
+**7.4**
+
+```typescript
+type Saved = { requestHash: string; status: 'processing' | 'completed'; response?: { status: number; body: unknown } };
+const keys = new Map<string, Saved>();
+
+async function withIdempotency(key: string, body: unknown, handler: () => Promise<{ status: number; body: unknown }>) {
+  const requestHash = createHash('sha256').update(JSON.stringify(body)).digest('hex');
+  const existing = keys.get(key);
+
+  if (existing) {
+    if (existing.requestHash !== requestHash) throw new AppError('Key reused with a different body', 422, 'IDEMPOTENCY_MISMATCH');
+    if (existing.status === 'processing' || !existing.response) throw new ConflictError('Request in progress', 'REQUEST_IN_PROGRESS');
+    return existing.response;
+  }
+
+  keys.set(key, { requestHash, status: 'processing' }); // get + set with no await between: safe in one process
+  try {
+    const response = await handler();
+    if (response.status < 500) keys.set(key, { requestHash, status: 'completed', response });
+    else keys.delete(key);
+    return response;
+  } catch (err) {
+    keys.delete(key);
+    throw err;
+  }
+}
+```
+
+With two copies of the server, each has its **own `Map`**. A retry that the load balancer sends to the other copy isn't recognised, so the booking is created twice. It also forgets everything on restart. That's why the real version uses a shared store: a PostgreSQL table with a unique constraint (or Redis with `SET key value NX`). This "works with one server, breaks with two" pattern is a classic system design interview point.
+
+`JSON.stringify` of the body is a simple hash input, but key order matters: `{a,b}` and `{b,a}` give different hashes. For production, hash the **validated, normalised** input.

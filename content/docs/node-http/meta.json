@@ -1,0 +1,16 @@
+{
+  "title": "Node.js and HTTP",
+  "pages": [
+    "index",
+    "lesson-1-event-loop",
+    "lesson-2-async-patterns",
+    "lesson-3-error-handling",
+    "lesson-4-streams",
+    "lesson-5-http-basics",
+    "lesson-6-rest-design",
+    "lesson-7-lists-and-retries",
+    "practice-project",
+    "solutions",
+    "cheat-sheet"
+  ]
+}

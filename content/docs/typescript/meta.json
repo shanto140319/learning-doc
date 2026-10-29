@@ -1,0 +1,14 @@
+{
+  "title": "TypeScript",
+  "pages": [
+    "index",
+    "lesson-1-strict-mode",
+    "lesson-2-narrowing",
+    "lesson-3-generics",
+    "lesson-4-utility-types",
+    "lesson-5-real-world",
+    "capstone",
+    "solutions",
+    "best-practices"
+  ]
+}

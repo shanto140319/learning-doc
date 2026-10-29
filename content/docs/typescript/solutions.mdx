@@ -1,0 +1,239 @@
+---
+title: "Solutions"
+description: "Model answers for the exercises. Try each one first and get it reviewed before reading."
+---
+
+<Callout type="warn" title="Try first">
+Do each exercise and get your answer reviewed before reading these. There is usually more than one correct solution. Exercises 1.1, 1.3, 2.2 and the capstone have no fixed answer: get them reviewed instead.
+</Callout>
+
+## Lesson 1
+
+**1.2**
+
+```typescript
+type DayBookings = { count: number };
+
+function getBookedCount(bookingsByDay: Record<string, DayBookings>, day: string): number {
+  return bookingsByDay[day]?.count ?? 0;
+}
+```
+
+With `noUncheckedIndexedAccess`, `bookingsByDay[day]` is `DayBookings | undefined`, so the compiler forces the `?.` check. A day with no entry has zero bookings, so `0` is a sensible fallback.
+
+## Lesson 2
+
+**2.1**
+
+```typescript
+type UploadState =
+  | { status: 'idle' }
+  | { status: 'uploading'; percent: number }
+  | { status: 'done'; url: string }
+  | { status: 'failed'; reason: string; retryable: boolean };
+
+function describe(state: UploadState): string {
+  switch (state.status) {
+    case 'idle': return 'Choose a file';
+    case 'uploading': return `Uploading ${state.percent}%`;
+    case 'done': return `Uploaded: ${state.url}`;
+    case 'failed': return state.retryable ? `Failed: ${state.reason}. Retry?` : `Failed: ${state.reason}`;
+    default: {
+      const unreachable: never = state;
+      throw new Error(`Unhandled: ${JSON.stringify(unreachable)}`);
+    }
+  }
+}
+```
+
+**2.3**
+
+```typescript
+type Service = { id: string; name: string };
+
+function isService(value: unknown): value is Service {
+  return (
+    typeof value === 'object' && value !== null &&
+    'id' in value && typeof value.id === 'string' &&
+    'name' in value && typeof value.name === 'string'
+  );
+}
+
+function isServiceArray(value: unknown): value is Service[] {
+  return Array.isArray(value) && value.every(isService);
+}
+```
+
+**2.4**
+
+```typescript
+type AuthState =
+  | { isLoggedIn: false }
+  | { isLoggedIn: true; user: User; token: string };
+```
+
+It prevents impossible states: logged in with no user or token, or logged out with a stale token still present.
+
+## Lesson 3
+
+**3.1**
+
+```typescript
+function groupBy<T, K extends string>(items: T[], getKey: (item: T) => K): Record<K, T[]> {
+  const result = {} as Record<K, T[]>;
+  for (const item of items) {
+    const key = getKey(item);
+    (result[key] ??= []).push(item);
+  }
+  return result;
+}
+```
+
+Caveat: if no service is `'online'`, `result.online` is `undefined` at runtime even though the type says `T[]`. Returning `Partial<Record<K, T[]>>` is stricter and safer.
+
+**3.2**
+
+```typescript
+// Keys of T whose values are assignable to V
+type KeysOfType<T, V> = { [K in keyof T]-?: T[K] extends V ? K : never }[keyof T];
+
+function sortBy<T>(items: T[], key: KeysOfType<T, string | number>): T[] {
+  return [...items].sort((a, b) => {
+    const x = a[key] as string | number;
+    const y = b[key] as string | number;
+    return x < y ? -1 : x > y ? 1 : 0;
+  });
+}
+
+sortBy(services, 'name');      // ok
+sortBy(services, 'createdAt'); // error: Date is not string | number
+```
+
+The cast is one of the rare acceptable ones: TypeScript can't connect the mapped type back to the value type inside a generic function. `[...items]` avoids mutating the caller's array.
+
+**3.3**
+
+```tsx
+type SelectProps<T> = {
+  options: T[];
+  value: T | null;
+  onChange: (value: T) => void;
+  getLabel: (item: T) => string;
+  getKey: (item: T) => string;
+};
+
+function Select<T>({ options, value, onChange, getLabel, getKey }: SelectProps<T>) {
+  return (
+    <select
+      value={value !== null ? getKey(value) : ''}
+      onChange={e => {
+        const selected = options.find(o => getKey(o) === e.target.value);
+        if (selected !== undefined) onChange(selected);
+      }}
+    >
+      <option value="" disabled>Select…</option>
+      {options.map(o => (
+        <option key={getKey(o)} value={getKey(o)}>{getLabel(o)}</option>
+      ))}
+    </select>
+  );
+}
+```
+
+`getKey` is needed because an HTML `<select>` only stores strings; it maps the chosen string back to your object.
+
+**3.4**
+
+```typescript
+type Result<T, E = Error> = { ok: true; value: T } | { ok: false; error: E };
+
+function safeJsonParse(text: string): Result<unknown> {
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err : new Error(String(err)) };
+  }
+}
+```
+
+## Lesson 4
+
+**4.1**
+
+```typescript
+type PublicUser = Omit<User, 'passwordHash'>;
+type SignupInput = Pick<User, 'email' | 'name'> & { password: string };
+type UpdateProfileInput = Partial<Pick<User, 'name' | 'email'>>;
+```
+
+**4.2**
+
+```typescript
+const ROLES = ['owner', 'staff'] as const;
+type Role = (typeof ROLES)[number]; // 'owner' | 'staff'
+// in User: role: Role;
+```
+
+**4.3**
+
+```typescript
+const routes = {
+  home: '/',
+  bookings: '/bookings',
+  booking: '/bookings/:bookingId',
+} satisfies Record<string, string>;
+
+routes.bokings; // error: Property 'bokings' does not exist
+```
+
+With `const routes: Record<string, string> = …` the typo would compile and return `undefined` at runtime.
+
+**4.4**
+
+```typescript
+type BookingStats = Awaited<ReturnType<typeof getBookingStats>>;
+// { bookingsThisWeek: number; noShows: number }
+```
+
+## Lesson 5
+
+**5.1**
+
+```typescript
+const ServiceSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string().min(1),
+  location: z.enum(['in_person', 'online']),
+  durationMinutes: z.number().int().positive(),
+  createdAt: z.coerce.date(),
+});
+const CreateServiceSchema = ServiceSchema.omit({ id: true, createdAt: true });
+
+type Service = z.infer<typeof ServiceSchema>;
+type CreateServiceInput = z.infer<typeof CreateServiceSchema>;
+```
+
+The resulting type equals `Omit<Service, 'id' | 'createdAt'>`, but the Zod version also validates at runtime.
+
+**5.2**
+
+```typescript
+export async function apiPost<Req extends z.ZodType, Res extends z.ZodType>(
+  path: string,
+  body: z.infer<Req>,
+  requestSchema: Req,
+  responseSchema: Res,
+): Promise<z.infer<Res>> {
+  const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestSchema.parse(body)),
+  });
+  if (!res.ok) throw new Error(`POST ${path} failed: ${res.status}`);
+  return responseSchema.parse(await res.json());
+}
+```
+
+**5.3** Use the `EnvSchema` pattern from Lesson 5 with your real variables. Removing one should crash at startup with a Zod error naming the missing variable.
+
+**5.4** A model answer: "TypeScript types are erased at compile time, so they only check the code I wrote. Data from the network, users or the database arrives at runtime and can be anything. Runtime validation enforces the contract at the boundary, so bad data fails early with a clear error instead of causing a crash deep in the app."

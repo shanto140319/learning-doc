@@ -1,0 +1,85 @@
+---
+title: "Lesson 4: Utility types, as const and satisfies"
+description: "Define a shape once and derive the rest with Partial, Pick, Omit and friends; keep literal values with as const; check values with satisfies."
+---
+
+Utility types build new types from existing ones, so you define a shape once and derive the rest. When the base type changes, everything derived from it updates automatically.
+
+## The ones you'll use every week
+
+| Utility | What it does | Typical use |
+| --- | --- | --- |
+| `Partial<T>` | All properties optional | Update/PATCH payloads |
+| `Required<T>` | All properties required | Config after defaults are applied |
+| `Pick<T, K>` | Keep only keys `K` | A card that shows only `id` and `name` |
+| `Omit<T, K>` | Remove keys `K` | Create payload without `id` and `createdAt` |
+| `Record<K, V>` | Object with keys `K`, values `V` | Lookup maps, grouped data |
+| `Readonly<T>` | Properties can't be reassigned | Props, constants |
+| `ReturnType<F>` | Return type of a function | Types of hooks or helpers you don't control |
+| `Parameters<F>` | Argument types as a tuple | Wrapping another function |
+| `Awaited<T>` | Unwraps a Promise | `Awaited<ReturnType<typeof fetchServices>>` |
+| `NonNullable<T>` | Removes `null` and `undefined` | After a check you know it exists |
+| `Exclude<U, X>` / `Extract<U, X>` | Remove / keep members of a union | `Exclude<Status, 'idle'>` |
+
+## Derive, don't duplicate
+
+```typescript
+type Service = {
+  id: string;
+  name: string;
+  location: 'in_person' | 'online';
+  durationMinutes: number;
+  createdAt: Date;
+};
+
+type CreateServiceInput = Omit<Service, 'id' | 'createdAt'>;
+type UpdateServiceInput = Partial<CreateServiceInput>;
+type ServiceCardProps = Pick<Service, 'id' | 'name' | 'location'>;
+type ServicesByLocation = Record<Service['location'], Service[]>;
+```
+
+## `as const`: keep literal values
+
+By default TypeScript widens `'online'` to `string`. `as const` keeps the exact values and makes them readonly, so you can derive a union type from a runtime array:
+
+```typescript
+const LOCATIONS = ['in_person', 'online'] as const;
+type Location = (typeof LOCATIONS)[number];   // 'in_person' | 'online'
+
+const isLocation = (v: string): v is Location => (LOCATIONS as readonly string[]).includes(v);
+```
+
+One list now powers both the dropdown at runtime and the type at compile time.
+
+## `satisfies`: check without losing detail
+
+A type annotation (`: Type`) widens the value to that type. `satisfies` checks the value against the type but keeps the precise inferred type:
+
+```typescript
+type StatusColors = Record<string, { bg: string; text: string }>;
+
+const statusColors = {
+  confirmed: { bg: '#e6f4ea', text: '#1e7b34' },
+  cancelled: { bg: '#fce8e6', text: '#a50e0e' },
+} satisfies StatusColors;
+
+statusColors.confirmed.bg;   // allowed, and autocomplete knows 'confirmed' | 'cancelled'
+statusColors.pending;        // error: no such key. With ': StatusColors' this would compile.
+```
+
+## Exercises
+
+- **4.1** Given `type User = { id: string; email: string; passwordHash: string; name: string; role: 'owner' | 'staff'; createdAt: Date }`, derive: `PublicUser` (no `passwordHash`), `SignupInput` (only `email`, `name`, plus a `password: string`), and `UpdateProfileInput` (optional `name` and `email` only).
+- **4.2** Create a `const ROLES = [...] as const`, derive `Role` from it, and use it in `User` instead of the hand-written union.
+- **4.3** Write a `routes` object mapping route names to paths using `satisfies Record<string, string>`, then find one typo that it catches.
+- **4.4** Given `async function getBookingStats(businessId: string) { return { bookingsThisWeek: 12, noShows: 1 }; }`, get its resolved return type without writing the object type by hand.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What's the difference between a type annotation and `satisfies`?"**
+
+> "An annotation like `const x: Theme` makes the variable exactly that type, so I lose the specific details, like which keys exist. `satisfies` checks that the value matches the type, but keeps the precise type TypeScript inferred. So I get both: an error if the shape is wrong, and exact autocomplete afterwards."

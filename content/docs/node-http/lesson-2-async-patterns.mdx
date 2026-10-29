@@ -1,0 +1,261 @@
+---
+title: "Lesson 2: Async patterns"
+description: "async/await pitfalls, Promise.all vs sequential calls, allSettled, race, timeouts with AbortController and concurrency limits."
+---
+
+Most real backend bugs are not syntax errors. They are async mistakes: a missing `await`, calls that run one by one when they could run together, or 5,000 requests fired at once. This lesson covers the patterns you'll use every day.
+
+To follow along, use this fake "database" with delays, so you can see timing:
+
+```typescript
+// fake-db.ts
+export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+export async function getBusiness(id: string) {
+  await sleep(300);
+  return { id, name: 'Dhaka Smiles Dental' };
+}
+export async function getServices(businessId: string) {
+  await sleep(300);
+  return [{ id: 's1', businessId, name: 'Check-up' }];
+}
+export async function getTodaysBookings(businessId: string) {
+  await sleep(300);
+  return [{ id: 'b1', businessId, customerEmail: 'rahim@example.com' }];
+}
+```
+
+## Pitfall 1: The forgotten `await`
+
+```typescript
+async function cancelBooking(id: string) {
+  db.bookings.update(id, { status: 'cancelled' }); // no await!
+  return { ok: true };
+}
+```
+
+The function returns `ok: true` before the update finishes. If the update fails, nobody knows, and you may get an "unhandled rejection" crash later.
+
+Fix: always `await` (or `return`) promises. Turn on the ESLint rule `@typescript-eslint/no-floating-promises`; it catches this automatically. If you really want "fire and forget" (rare), write it on purpose with a catch: `void sendEmail(x).catch(logError)`.
+
+## Pitfall 2: Accidentally sequential
+
+```typescript
+// Slow: about 900 ms. Each call waits for the one before.
+const business = await getBusiness(id);
+const services = await getServices(id);
+const bookings = await getTodaysBookings(id);
+```
+
+These three calls don't depend on each other. Start them together:
+
+```typescript
+// Fast: about 300 ms. All three run at the same time.
+const [business, services, bookings] = await Promise.all([
+  getBusiness(id),
+  getServices(id),
+  getTodaysBookings(id),
+]);
+```
+
+TypeScript even keeps the right type for each item in the result array.
+
+**Sequential is correct when one call needs the result of another:**
+
+```typescript
+const booking = await getBooking(bookingId);
+const service = await getService(booking.serviceId); // needs booking first
+```
+
+Ask yourself: "Does this line need the result of the line above?" If not, the calls can run together.
+
+## Pitfall 3: `await` inside `forEach`
+
+```typescript
+// Bug: forEach does not wait. "done" prints before any email is sent,
+// and errors are not caught by the surrounding try/catch.
+bookings.forEach(async (b) => {
+  await sendReminder(b);
+});
+console.log('done');
+```
+
+`forEach` ignores the promises your callback returns. Choose one of these instead:
+
+```typescript
+// One by one, in order (use when order matters or the other side has strict limits)
+for (const b of bookings) {
+  await sendReminder(b);
+}
+
+// All at the same time (use for a small, known number of items)
+await Promise.all(bookings.map((b) => sendReminder(b)));
+```
+
+The same problem happens with `.filter(async …)` and `.reduce(async …)`: they don't wait either.
+
+## The four Promise combinators
+
+| Function | Waits for | Fails when | Use it for |
+| --- | --- | --- | --- |
+| `Promise.all` | All to succeed | **Any one** fails (fails fast) | Data you need all of: loading a page |
+| `Promise.allSettled` | All to finish, success or failure | Never fails | Batch jobs where some may fail: sending 50 reminders |
+| `Promise.race` | The **first to finish** (success or failure) | The first one fails | Timeouts |
+| `Promise.any` | The **first to succeed** | **All** fail (`AggregateError`) | Trying several mirrors or providers |
+
+### `Promise.all` fails fast, but doesn't cancel
+
+If one promise rejects, `Promise.all` rejects immediately. The other operations **keep running** in the background; their results are just ignored. JavaScript has no automatic cancellation.
+
+### `allSettled` for batch work
+
+```typescript
+const results = await Promise.allSettled(bookings.map((b) => sendReminder(b)));
+
+const failed = results
+  .map((r, i) => ({ r, booking: bookings[i] }))
+  .filter(({ r }) => r.status === 'rejected');
+
+console.log(`Sent ${results.length - failed.length}, failed ${failed.length}`);
+// Retry or log the failed ones. One bad email address doesn't stop the others.
+```
+
+Each result is a discriminated union (from TypeScript Lesson 2): `{ status: 'fulfilled', value }` or `{ status: 'rejected', reason }`.
+
+## Timeouts with `AbortController`
+
+A call to an outside service (payment provider, email API) can hang for minutes. Always set a timeout. The modern way is an `AbortSignal`:
+
+```typescript
+async function getExchangeRate(): Promise<number> {
+  const res = await fetch('https://api.example.com/rate?from=USD&to=BDT', {
+    signal: AbortSignal.timeout(3000), // give up after 3 seconds
+  });
+  if (!res.ok) throw new Error(`Rate API failed with ${res.status}`);
+  const body = (await res.json()) as { rate: number };
+  return body.rate;
+}
+```
+
+If the time runs out, `fetch` rejects with an error named `TimeoutError` **and the HTTP request is actually stopped**. This is better than `Promise.race` with a timer, which only stops *waiting*; the request keeps running.
+
+You can also cancel by hand, for example when the user disconnects:
+
+```typescript
+const controller = new AbortController();
+req.on('close', () => controller.abort()); // client left: stop the work
+await fetch(url, { signal: controller.signal });
+```
+
+A generic timeout helper for any promise (when the API doesn't take a signal):
+
+```typescript
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timed out after ${ms} ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer); // otherwise the timer keeps the process alive
+  }
+}
+```
+
+## Concurrency limits
+
+`Promise.all` on 5,000 items starts 5,000 operations **at once**. That can exhaust your database connection pool, hit the email provider's rate limit, or run out of memory. The fix is to run, say, 10 at a time:
+
+```typescript
+async function mapWithLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+
+  async function worker() {
+    while (next < items.length) {
+      const index = next++;          // safe: JavaScript is single-threaded
+      results[index] = await fn(items[index]!);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+// Send 5,000 reminders, 10 at a time
+await mapWithLimit(bookings, 10, (b) => sendReminder(b));
+```
+
+Each "worker" takes the next item when it finishes its current one, so there are never more than 10 running. In real projects, the `p-limit` npm package does this. In Month 2 you'll use a BullMQ queue for big batches, which also survives a server restart.
+
+## Error handling with async code
+
+`try/catch` works with `await`:
+
+```typescript
+try {
+  const [business, services] = await Promise.all([getBusiness(id), getServices(id)]);
+} catch (err) {
+  // catches a rejection from either call
+}
+```
+
+But it only catches promises you **await inside the try**. A promise created and not awaited escapes it (see pitfall 1 and 3). Lesson 3 covers errors fully.
+
+## Mixing callbacks and promises
+
+Old Node APIs use callbacks: `fs.readFile(path, (err, data) => …)`. Today, prefer the promise versions:
+
+```typescript
+import { readFile } from 'node:fs/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
+
+const text = await readFile('config.json', 'utf8');
+await sleep(1000);
+```
+
+For an old library that only has callbacks, `util.promisify(fn)` converts it.
+
+## Common mistakes
+
+- Using `Promise.all` for a list that can be very large. Use a limit.
+- Using `Promise.all` for batch jobs where partial failure is fine. Use `allSettled`.
+- `return` without `await` inside a `try`: `try { return fetchData(); } catch {}` doesn't catch the rejection. Write `return await fetchData();` inside `try` blocks.
+- Thinking `Promise.race` timeouts cancel the slow work. They don't; use `AbortSignal` when the API supports it.
+
+## Exercises
+
+- **2.1** 🟢 The booking dashboard needs the business, its staff, today's bookings and the unread notifications count. Write `loadDashboard(businessId)` using the fake DB style above so all four load in parallel. Print how long it takes with `console.time`.
+- **2.2** 🟡 Find and fix every async bug in this code. There are three.
+
+```typescript
+async function sendDailyReminders(bookings: Booking[]) {
+  try {
+    bookings.forEach(async (b) => {
+      await emailService.send(b.customerEmail, 'Reminder');
+    });
+    db.log.insert({ type: 'reminders_sent', count: bookings.length });
+  } catch (err) {
+    console.error('Reminder job failed', err);
+  }
+}
+```
+
+- **2.3** 🟡 Rewrite your answer to 2.2 so that one failed email doesn't stop the others, at most 5 emails are sent at a time, and the function returns `{ sent: number; failed: string[] }` (the failed emails).
+- **2.4** 🔴 Write `fetchJson<T>(url: string, timeoutMs: number): Promise<T>` with `fetch` and `AbortSignal.timeout`. If the status is not 2xx, throw an error that includes the status. Test it with `https://httpbin.org/delay/5` and a 2-second timeout.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What's the difference between `Promise.all` and awaiting calls one by one?"**
+
+> "If I await calls one by one, each starts only after the previous one finishes, so three 300-millisecond calls take 900 milliseconds. With `Promise.all`, they all start together, so it takes about 300. I use `Promise.all` when the calls don't depend on each other. It fails fast if any call fails, so for batch jobs where some failures are fine, I use `Promise.allSettled`. And for large lists, I limit concurrency, so I don't overload the database or an external API."

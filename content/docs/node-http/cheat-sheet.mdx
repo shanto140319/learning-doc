@@ -1,0 +1,102 @@
+---
+title: "Cheat sheet"
+description: "One page to revise the whole Node.js and HTTP section before an interview."
+---
+
+## Event loop order
+
+1. Synchronous code (including the start of an async function, up to its first `await`)
+2. `process.nextTick` callbacks
+3. Promise microtasks (`.then`, code after `await`, `queueMicrotask`). Exception: at the top level of an ES module, promises run before `nextTick`
+4. Macrotasks, by phase: **timers** (`setTimeout`) → **poll** (I/O) → **check** (`setImmediate`) → close
+5. After **every** macrotask: empty the microtask queue again
+
+Golden rule: **never block the event loop.** Heavy CPU work goes to the database, a background job, or a worker thread.
+
+## Async: which tool?
+
+| Situation | Use |
+| --- | --- |
+| Calls depend on each other | `await` one by one |
+| Independent calls, need all | `Promise.all` |
+| Batch, some may fail | `Promise.allSettled` |
+| Large list | Concurrency limit (`p-limit`, a queue) |
+| Timeout | `AbortSignal.timeout(ms)` |
+| First to succeed | `Promise.any` |
+| Loop with await | `for…of`, **never** `forEach` |
+
+## Errors
+
+- Operational errors (expected): custom `AppError` classes with a status and a code → one central handler
+- Programmer errors (bugs): log, `500`, fix the code
+- `catch (err)`: `err` is `unknown`, narrow it
+- Wrap with `{ cause: err }`
+- Unhandled rejection: log, exit, let the orchestrator restart
+- `SIGTERM` → stop new connections, finish open requests, close the DB, exit
+
+## Streams
+
+- `pipeline(source, transform, destination)` from `node:stream/promises`: backpressure and cleanup included
+- `Readable.from(asyncGenerator)` to produce data
+- `for await (const chunk of stream)` to consume
+- Create transforms **per request**
+- Can't change the status after the body has started
+
+## Methods
+
+| | Safe | Idempotent |
+| --- | --- | --- |
+| GET, HEAD, OPTIONS | ✅ | ✅ |
+| PUT, DELETE | ❌ | ✅ |
+| POST, PATCH | ❌ | ❌ |
+
+## Status codes
+
+| Code | When |
+| --- | --- |
+| 200 / 201 / 204 | OK / Created (+`Location`) / No Content |
+| 202 | Accepted, queued for later |
+| 304 | Not Modified (ETag) |
+| 400 | Can't read the request |
+| 401 / 403 | Who are you? / Not allowed |
+| 404 | Doesn't exist (or another tenant's) |
+| 409 | Conflicts with current state |
+| 413 / 415 | Body too big / wrong content type |
+| 422 | Valid JSON, invalid values |
+| 429 | Rate limited (+`Retry-After`) |
+| 500 / 502 / 503 / 504 | Bug / bad upstream / unavailable / upstream timeout |
+
+**4xx = client must change something. 5xx = server problem, retry may work.**
+
+## REST design rules
+
+- Plural nouns, methods as verbs, lowercase-with-hyphens, nest one level at most
+- Actions with rules: `POST /bookings/:id/cancel`
+- camelCase JSON, UTC ISO dates, money in integer minor units, IDs as strings
+- Lists wrapped: `{ data, nextCursor }`
+- One error shape everywhere (`type`, `title`, `status`, `detail`, `errors[]`, `requestId`)
+- `/v1` in the path; only **add** things to avoid breaking changes
+
+## Pagination
+
+- **Offset:** page numbers, slow on deep pages, skips/repeats when data changes
+- **Cursor:** `WHERE (starts_at, id) < ($1, $2) ORDER BY starts_at DESC, id DESC LIMIT n+1`, fast and stable
+- Sort by a unique combination; default and maximum `limit`
+- Sort and filter fields from an **allow-list** (no SQL injection)
+
+## Idempotency keys
+
+Client generates one UUID per user action, sends `Idempotency-Key` on every retry. Server: insert the key (unique constraint) → if new, do the work and save the response → if it exists, return the saved response (or `409` if still processing, `422` if the body differs). Expire after 24 h. Pass a key to Stripe too.
+
+## Interview answers to practise
+
+1. **How does Node handle many requests on one thread?** Hands I/O to the OS and libuv, callbacks queue up, the event loop runs them when the thread is free; works as long as nothing blocks the CPU.
+2. **Microtasks vs macrotasks?** Promises vs timers and I/O; all microtasks run after each macrotask; `nextTick` first.
+3. **`Promise.all` vs sequential?** Parallel for independent calls; fails fast; `allSettled` for batches; limit concurrency for big lists.
+4. **How do you handle errors?** Operational vs programmer errors, custom classes, one central handler, safe messages, crash and restart on unknown failures, graceful shutdown.
+5. **What are streams for?** Big data in small chunks: exports, uploads; `pipeline` handles backpressure and cleanup.
+6. **What is idempotent?** Same effect once or many times; matters because networks fail and clients retry.
+7. **What makes a good REST API?** Consistent resources, correct status codes, one error format, pagination, versioning, safe retries.
+8. **401 vs 403?** Not authenticated vs not allowed; 404 for other tenants' resources.
+9. **Offset or cursor pagination?** Cursor for growing or live data (fast, stable); offset for small tables with page numbers.
+10. **How do you prevent double charges?** Idempotency key with a unique constraint, replay the saved response, pass a key to the payment provider.

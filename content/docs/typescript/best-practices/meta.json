@@ -1,0 +1,10 @@
+{
+  "title": "Best practices by framework",
+  "pages": [
+    "index",
+    "react",
+    "nextjs",
+    "angular",
+    "nestjs"
+  ]
+}

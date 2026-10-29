@@ -1,0 +1,100 @@
+---
+title: "Lesson 2: Narrowing"
+description: "Go from a wide type to a specific one: typeof, instanceof, in, discriminated unions, never and type guards."
+---
+
+Narrowing is how you go from a wide type (`string | number`, `unknown`) to a specific one, with TypeScript tracking each branch. It is the most-used skill in daily TypeScript.
+
+## The built-in checks
+
+```typescript
+function format(value: string | number | null) {
+  if (value === null) return '-';                         // equality
+  if (typeof value === 'number') return value.toFixed(1); // typeof
+  return value.toUpperCase();                             // here value is string
+}
+
+function handle(err: unknown) {
+  if (err instanceof Error) return err.message;           // instanceof
+}
+
+type InPerson = { location: 'in_person'; address: string };
+type Online = { location: 'online'; meetingUrl: string };
+function whereToGo(venue: InPerson | Online) {
+  if ('address' in venue) return venue.address;           // in
+  return venue.meetingUrl;
+}
+```
+
+## Discriminated unions: the most important pattern
+
+Give each variant a shared literal field (`kind`, `status`, `type`). Then a `switch` on it narrows perfectly. Use this for API states, events, reducer actions and WebSocket messages.
+
+```typescript
+type LoadState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'success'; data: Booking[] }
+  | { status: 'error'; message: string };
+
+function render(state: LoadState) {
+  switch (state.status) {
+    case 'idle': return 'Pick a date';
+    case 'loading': return 'Loading…';
+    case 'success': return `${state.data.length} bookings`; // data exists here
+    case 'error': return state.message;                     // message exists here
+  }
+}
+```
+
+Compare this with `{ loading: boolean; data?: Booking[]; error?: string }`, which allows impossible states like loading and error at the same time.
+
+## Exhaustive checks with `never`
+
+Add a `default` that assigns to `never`. If someone later adds a new status and forgets to handle it, the compiler errors:
+
+```typescript
+  default: {
+    const unreachable: never = state;
+    throw new Error(`Unhandled state: ${JSON.stringify(unreachable)}`);
+  }
+```
+
+## Custom type guards and assertion functions
+
+When the built-in checks are not enough (often with `unknown` data), write a function that returns `value is T`:
+
+```typescript
+type BookingRequest = { serviceId: string; startsAt: string };
+
+function isBookingRequest(value: unknown): value is BookingRequest {
+  return (
+    typeof value === 'object' && value !== null &&
+    'serviceId' in value && typeof value.serviceId === 'string' &&
+    'startsAt' in value && typeof value.startsAt === 'string'
+  );
+}
+
+function assertIsBookingRequest(value: unknown): asserts value is BookingRequest {
+  if (!isBookingRequest(value)) throw new Error('Invalid booking request');
+}
+```
+
+In real projects, Zod writes these guards for you ([Lesson 5](/docs/typescript/lesson-5-real-world)). Knowing how they work helps you read errors and libraries.
+
+## Exercises
+
+- **2.1** 🟡 Model a file upload (for example a business logo) as a discriminated union with states `idle`, `uploading` (with `percent`), `done` (with `url`) and `failed` (with `reason` and `retryable: boolean`). Write a `describe(state)` function with an exhaustive `never` check. _Union type done; `describe` still to write._
+- **2.2** Add a fifth state `processing` to your union from 2.1 without touching `describe`. Confirm the compiler errors, then fix it.
+- **2.3** Write a type guard `isServiceArray(value: unknown): value is Service[]` where `Service = { id: string; name: string }`.
+- **2.4** Rewrite this badly typed state as a discriminated union and explain which bug it prevents: `{ isLoggedIn: boolean; user?: User; token?: string }`
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What is a discriminated union, and why use it?"**
+
+> "It's a union of object types that all share one literal field, like `status`. When I switch on that field, TypeScript knows exactly which fields exist in each branch. It stops impossible states, like loading and error at the same time. With a `never` check in the `default` case, the compiler also tells me when a new state isn't handled."

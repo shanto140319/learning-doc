@@ -1,0 +1,59 @@
+---
+title: "Practical TypeScript"
+description: "The practical 90% of TypeScript that real jobs and interviews need, in 5 lessons over 3 weeks."
+---
+
+This section covers the TypeScript that full-stack jobs and interviews actually use. It skips type-level puzzles on purpose. All examples use **Project 1, the multi-tenant booking platform**, so the code can go straight into the real project.
+
+<Callout title="My progress">
+- Lesson 1: done
+- Lesson 2: in progress (2.1 union type fixed; `describe` function not yet written)
+- Lessons 3–5 and the capstone: not started
+</Callout>
+
+After the lessons, [Best practices by framework](/docs/typescript/best-practices) shows how to apply these rules in React, Next.js, Angular and NestJS.
+
+## Setup (15 minutes)
+
+1. Create a folder `ts-practice`, run `npm init -y` and `npm i -D typescript tsx zod`.
+2. Run `npx tsc --init`, then set `"strict": true` and `"noUncheckedIndexedAccess": true` in `tsconfig.json`.
+3. Create one file per lesson (`lesson1.ts`, `lesson2.ts`…). Run `npx tsc --noEmit` to type-check and `npx tsx lesson1.ts` to run.
+
+## How each lesson works
+
+1. Read the lesson and type the examples yourself. Don't copy-paste; typing builds memory.
+2. Do the exercises without AI help first. Getting stuck for 10 minutes is part of learning.
+3. Paste your answers into Claude for a review, an honest score and extra practice where you're weak.
+4. Only then check the [Solutions](/docs/typescript/solutions) page.
+5. After each lesson, ask for a quiz. Five quick questions locks it in.
+
+## Schedule
+
+| Week | Lessons | Sessions |
+| --- | --- | --- |
+| 1 | Lesson 1 and Lesson 2 | 3 sessions of about 60 min |
+| 2 | Lesson 3 and Lesson 4 | 3 sessions |
+| 3 | Lesson 5 and the capstone | 3 sessions + Friday build block |
+
+**Done means:** you can use every concept here in your own code without looking it up, and explain it out loud in English in under a minute.
+
+## The example domain
+
+Most examples use these booking-platform types:
+
+```typescript
+type Service = {
+  id: string;
+  name: string;                       // "Haircut", "Consultation"
+  location: 'in_person' | 'online';
+  durationMinutes: number;
+  createdAt: Date;
+};
+
+type Booking = {
+  id: string;
+  serviceId: string;
+  customerEmail: string;
+  startsAt: Date;
+};
+```

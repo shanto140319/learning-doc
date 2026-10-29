@@ -1,0 +1,320 @@
+---
+title: "Lesson 7: Lists and safe retries"
+description: "Offset vs cursor pagination, filtering and sorting safely, and idempotency keys that stop double bookings and double payments."
+---
+
+Two problems appear in every real API. First, lists grow: a busy clinic has 200,000 bookings, and you can't return them all. Second, networks fail: a customer taps "Pay" on a weak mobile connection, the request times out, and the app retries. Did they just pay twice? This lesson solves both.
+
+## Part 1: Pagination
+
+### Offset pagination
+
+The simple way: "skip N rows, take 20".
+
+```text
+GET /v1/bookings?limit=20&offset=40     ← page 3
+```
+
+```sql
+SELECT * FROM bookings
+WHERE business_id = $1
+ORDER BY starts_at DESC, id DESC
+LIMIT 20 OFFSET 40;
+```
+
+Response:
+
+```json
+{ "data": [ ... ], "total": 1834, "limit": 20, "offset": 40 }
+```
+
+Good: easy to build, and the user can jump to any page ("page 37 of 92").
+
+Two problems:
+
+1. **It gets slow on deep pages.** `OFFSET 100000` makes the database read and throw away 100,000 rows before giving you 20. Page 5,000 is much slower than page 1.
+2. **It skips or repeats items when data changes.** You load page 1 (bookings 1–20). Meanwhile, a new booking is added at the top. Now everything moves down by one, so page 2 starts with item 20, which you already saw. If something is deleted, you skip an item instead.
+
+Also, `total` needs a `COUNT(*)`, which is slow on big tables.
+
+### Cursor pagination (keyset pagination)
+
+Instead of "skip 40", say "**give me 20 items after the last one I saw**". The "cursor" is a pointer to that last item.
+
+```text
+GET /v1/bookings?limit=20
+GET /v1/bookings?limit=20&cursor=eyJzIjoiMjAyNi0xMS0wM1QxMDowMDowMFoiLCJpZCI6ImI5MiJ9
+```
+
+```sql
+-- First page
+SELECT * FROM bookings
+WHERE business_id = $1
+ORDER BY starts_at DESC, id DESC
+LIMIT 21;                                -- one extra row to know if there's a next page
+
+-- Next pages: continue after the last row of the previous page
+SELECT * FROM bookings
+WHERE business_id = $1
+  AND (starts_at, id) < ($2, $3)         -- $2, $3 = last row's starts_at and id
+ORDER BY starts_at DESC, id DESC
+LIMIT 21;
+```
+
+With an index on `(business_id, starts_at DESC, id DESC)`, the database jumps straight to the right place. **Page 5,000 is as fast as page 1.** New or deleted rows don't cause skips or repeats.
+
+Why `id` too? Two bookings can have the same `starts_at`. Sorting by a **unique** combination makes the order stable; otherwise rows with the same time can appear on two pages or none.
+
+The `(a, b) < (x, y)` syntax is a "row comparison" in PostgreSQL. It means `a < x OR (a = x AND b < y)`.
+
+### Building the cursor
+
+The cursor is the last row's sort values, encoded so clients treat it as a **black box** (they shouldn't build or edit it):
+
+```typescript
+type CursorData = { startsAt: string; id: string };
+
+function encodeCursor(row: { startsAt: Date; id: string }): string {
+  const data: CursorData = { startsAt: row.startsAt.toISOString(), id: row.id };
+  return Buffer.from(JSON.stringify(data)).toString('base64url');
+}
+
+function decodeCursor(cursor: string): CursorData {
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+    if (
+      typeof parsed === 'object' && parsed !== null &&
+      'startsAt' in parsed && typeof parsed.startsAt === 'string' &&
+      'id' in parsed && typeof parsed.id === 'string'
+    ) {
+      return { startsAt: parsed.startsAt, id: parsed.id };
+    }
+  } catch {
+    // fall through
+  }
+  throw new ValidationError('Invalid cursor', { cursor: 'Malformed cursor' }); // → 400 / 422
+}
+```
+
+Fetching a page:
+
+```typescript
+async function listBookings(businessId: string, limit: number, cursor?: string) {
+  const after = cursor ? decodeCursor(cursor) : undefined;
+  const rows = await db.bookings.findPage({ businessId, after, take: limit + 1 });
+
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+  const last = page.at(-1);
+
+  return {
+    data: page,
+    nextCursor: hasMore && last ? encodeCursor(last) : null,
+  };
+}
+```
+
+Response:
+
+```json
+{
+  "data": [ ... 20 bookings ... ],
+  "nextCursor": "eyJzdGFydHNBdCI6IjIwMjYtMTEtMDNUMTA6MDA6MDBaIiwiaWQiOiJiOTIifQ"
+}
+```
+
+`nextCursor: null` means "no more pages". The frontend's "Load more" button or infinite scroll sends it back. (TanStack Query's `useInfiniteQuery` works exactly like this.)
+
+### Which one to use
+
+| | Offset | Cursor |
+| --- | --- | --- |
+| Jump to page 37 | ✅ Yes | ❌ No, only next (and previous with extra work) |
+| Deep pages | Slow | Fast |
+| Data changing while paging | Skips or repeats | Stable |
+| Total count | Easy (but slow on big tables) | Usually not included |
+| Best for | Small admin tables, search results with page numbers | Feeds, infinite scroll, APIs, exports, large or live data |
+
+**Default to cursor pagination for APIs**, especially on tables that grow (bookings, logs, messages). Use offset for small, slow-changing data where users want page numbers.
+
+Always **set a default and maximum `limit`** (for example default 20, max 100). Without a maximum, someone sends `limit=1000000`.
+
+## Filtering and sorting
+
+```text
+GET /v1/bookings?status=confirmed&from=2026-11-01T00:00:00Z&to=2026-11-30T23:59:59Z&serviceId=s1&sort=-startsAt
+```
+
+Conventions:
+
+- One query parameter per filter, with the field's name: `status=confirmed`.
+- Ranges with clear names: `from` / `to`, or `startsAfter` / `startsBefore`.
+- Multiple values with commas: `status=confirmed,cancelled`.
+- Sorting with `sort=field` for ascending and `sort=-field` for descending.
+
+### Use allow-lists, never pass input straight to the database
+
+```typescript
+const SORTABLE = { startsAt: 'starts_at', createdAt: 'created_at' } as const;
+type SortField = keyof typeof SORTABLE;
+
+function parseSort(input: string | null): { column: string; direction: 'ASC' | 'DESC' } {
+  const raw = input ?? '-startsAt';
+  const direction = raw.startsWith('-') ? 'DESC' : 'ASC';
+  const field = raw.replace(/^-/, '');
+  if (!(field in SORTABLE)) {
+    throw new ValidationError('Invalid sort', { sort: `Use one of: ${Object.keys(SORTABLE).join(', ')}` });
+  }
+  return { column: SORTABLE[field as SortField], direction };
+}
+```
+
+Column names and sort directions **can't be SQL parameters** (`$1`), so if you put `req.query.sort` straight into SQL, you have a **SQL injection** hole. An allow-list (the `as const` object from TypeScript Lesson 4) solves it: only names you chose can reach the query. Also, only allow sorting and filtering on **indexed** columns, or a single request can make the database scan millions of rows.
+
+Note: with cursor pagination, the cursor must contain the values of whatever you sort by. If the user changes the sort, start again from the first page.
+
+## Part 2: Idempotency keys
+
+### The problem
+
+1. The app sends `POST /v1/bookings` with payment.
+2. The server creates the booking and charges the card.
+3. The response is lost (the train goes into a tunnel).
+4. The app sees a timeout and retries.
+5. **Two bookings, two charges.** An angry customer.
+
+The client can't know if step 2 happened. `POST` isn't idempotent (Lesson 5), so retrying is dangerous. The fix is to make it idempotent.
+
+### The solution
+
+The client creates a **unique key for each user action** (a UUID), and sends the same key with every retry of that action:
+
+```http
+POST /v1/bookings
+Idempotency-Key: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+Content-Type: application/json
+
+{ "serviceId": "s1", "startsAt": "2026-11-03T10:00:00Z", "email": "rahim@example.com" }
+```
+
+The server remembers each key and the response it gave:
+
+- **New key:** do the work, save the key with the response, return the response.
+- **Same key again, finished:** don't do the work again. **Return the saved response.** The client gets exactly what it would have got the first time.
+- **Same key, still running** (the first request hasn't finished): return `409 Conflict`, "request in progress, retry later".
+- **Same key, different body:** return `422`. The client has a bug (it reused a key for a different action).
+
+This is exactly how Stripe's API works. The client generates the key **when the user clicks the button**, not on each retry.
+
+### The table
+
+```sql
+CREATE TABLE idempotency_keys (
+  business_id   text        NOT NULL,
+  key           text        NOT NULL,
+  request_hash  text        NOT NULL,        -- hash of method + path + body
+  status        text        NOT NULL,        -- 'processing' | 'completed'
+  response_code int,
+  response_body jsonb,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (business_id, key)             -- scoped per tenant
+);
+```
+
+The `PRIMARY KEY` is the important part: **the database guarantees only one request can insert a given key.** Even if two retries arrive at the same millisecond, one insert wins and the other fails. A check in JavaScript ("does the key exist? if not, insert") would have a race condition between the check and the insert.
+
+### The flow in code
+
+```typescript
+import { createHash } from 'node:crypto';
+
+async function withIdempotency(
+  businessId: string,
+  key: string,
+  requestBody: unknown,
+  handler: () => Promise<{ status: number; body: unknown }>,
+): Promise<{ status: number; body: unknown }> {
+  const requestHash = createHash('sha256').update(JSON.stringify(requestBody)).digest('hex');
+
+  // 1. Try to claim the key. ON CONFLICT DO NOTHING returns no row if it already exists.
+  const claimed = await db.query(
+    `INSERT INTO idempotency_keys (business_id, key, request_hash, status)
+     VALUES ($1, $2, $3, 'processing')
+     ON CONFLICT (business_id, key) DO NOTHING
+     RETURNING key`,
+    [businessId, key, requestHash],
+  );
+
+  if (claimed.rowCount === 0) {
+    // 2. Key exists: a retry.
+    const existing = await db.findIdempotencyKey(businessId, key);
+    if (existing.request_hash !== requestHash) {
+      throw new AppError('Idempotency-Key reused with a different body', 422, 'IDEMPOTENCY_MISMATCH');
+    }
+    if (existing.status === 'processing') {
+      throw new ConflictError('A request with this key is still in progress', 'REQUEST_IN_PROGRESS');
+    }
+    return { status: existing.response_code, body: existing.response_body }; // replay
+  }
+
+  // 3. We own the key: do the real work.
+  try {
+    const result = await handler();
+    await db.query(
+      `UPDATE idempotency_keys SET status = 'completed', response_code = $3, response_body = $4
+       WHERE business_id = $1 AND key = $2`,
+      [businessId, key, result.status, JSON.stringify(result.body)],
+    );
+    return result;
+  } catch (err) {
+    // Failed before finishing: delete the key so the client can retry for real.
+    await db.query(`DELETE FROM idempotency_keys WHERE business_id = $1 AND key = $2`, [businessId, key]);
+    throw err;
+  }
+}
+```
+
+Details that matter:
+
+- **Which errors to save?** Saving a `409 SLOT_TAKEN` or `422` response is fine: the retry should see the same answer. For a `500` or a crash, delete the key so a retry can try again.
+- **Best: do the work and save the response in one database transaction**, so it's impossible to create the booking but fail to save the key. You'll learn transactions in the PostgreSQL topic.
+- **Expire old keys** after 24 hours (a scheduled job deletes them). Retries happen within seconds or minutes.
+- **Calls to outside services** (Stripe) can't be inside your transaction. Pass your own idempotency key to Stripe too; Stripe supports it for exactly this reason.
+- In Month 2, the same idea makes **BullMQ job handlers** and **webhook handlers** safe, because queues and webhooks also deliver the same message more than once.
+
+### Idempotency keys vs a unique constraint
+
+For bookings, you'll *also* have a database rule that stops two bookings for the same staff at the same time (Project 1). Both are needed, for different reasons:
+
+- The **database constraint** stops **two different customers** taking the same slot.
+- The **idempotency key** stops **one customer's retry** from being treated as a second booking, and from paying twice. Without it, the retry gets `409 SLOT_TAKEN` for their own booking, which is confusing, and the payment may still go through twice.
+
+## Common mistakes
+
+- Offset pagination on a large, growing table.
+- Sorting by a non-unique column only (`starts_at`), so pages overlap.
+- No maximum `limit`.
+- Putting `sort` or field names from the query string straight into SQL.
+- Generating a new idempotency key on each retry (then it does nothing).
+- Checking "does the key exist?" in JavaScript before inserting, instead of letting a unique constraint decide.
+
+## Exercises
+
+- **7.1** 🟢 In your own words: why does offset pagination show a duplicate item when a new booking is added while the user is paging? Draw it with 6 items and page size 3.
+- **7.2** 🟡 Add cursor pagination to `GET /bookings` in your Lesson 5 server (in memory: sort the array by `startsAt` desc then `id` desc, and use the cursor to find where to start). Support `limit` with default 20 and maximum 100, and return `nextCursor`.
+- **7.3** 🟡 Add `status` and `from`/`to` filters and a `sort` parameter with an allow-list to the same endpoint. Return `400` with the `ApiError` format for unknown sort fields.
+- **7.4** 🔴 Add idempotency keys to `POST /bookings` in your server, using a `Map` instead of a database table. Test it: send the same request with the same key twice and confirm you get the same booking ID and only one booking exists. Then send a different body with the same key and confirm you get `422`. What would break with a `Map` if you ran two copies of the server?
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"Offset or cursor pagination, which would you use?"**
+
+> "For most APIs, cursor pagination. Offset is simple and lets users jump to a page number, but the database still reads all the skipped rows, so deep pages get slow, and if rows are added while someone is paging, they see duplicates or miss items. With a cursor, the client sends the last item's sort values, and the query asks for rows after them, using an index. It's fast on any page and stable when data changes. I sort by a unique combination, like start time plus ID, so the order is stable. I'd still use offset for small admin tables where users want page numbers."
+
+**"How would you stop a customer being charged twice when they retry a payment?"**
+
+> "With an idempotency key. The client generates a unique key when the user clicks Pay and sends it in a header with every retry. On the server, I insert the key into a table with a unique constraint before doing the work. If the insert fails, it's a retry, so I return the saved response instead of charging again. The unique constraint means even two requests at the same moment can't both win. I also pass an idempotency key to the payment provider, and I expire old keys after a day. Stripe's API works the same way."

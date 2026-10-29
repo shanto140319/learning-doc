@@ -1,0 +1,100 @@
+---
+title: "Node.js and HTTP"
+description: "How Node.js really runs your code, and how to design REST APIs that senior engineers respect. Phase 1, Month 1."
+---
+
+This section is the foundation for everything in Phase 1. NestJS, Prisma, BullMQ and WebSockets all sit on top of two things: **the Node.js runtime** and **HTTP**. If you understand these well, framework bugs stop being mysterious, and you can answer the "how does it work underneath?" questions that separate senior candidates from mid-level ones.
+
+All examples use **Project 1, the multi-tenant booking platform**, and plain Node.js built-ins (no Express, no NestJS). Frameworks come next month; here you learn what they do for you.
+
+<Callout title="My progress">
+- Lesson 1 (event loop): not started
+- Lesson 2 (async patterns): not started
+- Lesson 3 (error handling): not started
+- Lesson 4 (streams): not started
+- Lesson 5 (HTTP basics): not started
+- Lesson 6 (REST design): not started
+- Lesson 7 (lists and retries): not started
+- Practice project: not started
+</Callout>
+
+## What you will learn
+
+| Part | Lessons | You will be able to… |
+| --- | --- | --- |
+| Node.js runtime | 1–4 | Predict the order code runs in, avoid async bugs, handle errors without crashing, process big files with little memory |
+| HTTP and REST | 5–7 | Build a server with no framework, pick the right status code, design consistent URLs and errors, paginate, and make retries safe |
+
+## Setup (10 minutes)
+
+You need Node.js 22 or newer. Check with `node -v`.
+
+1. Create a folder `node-practice`, then run `npm init -y` and `npm i -D typescript tsx @types/node`.
+2. Run `npx tsc --init`, then set these in `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+3. Add `"type": "module"` to `package.json` so you can use `import` and top-level `await`.
+4. Create one file per lesson (`lesson1.ts`, `lesson2.ts`…). Run with `npx tsx lesson1.ts`. Use `npx tsx watch server.ts` for servers, so they restart when you save.
+
+You also need `curl` to test servers. It is already installed on Windows 10 and 11 (use `curl.exe` in PowerShell, because `curl` there is an alias for a different command).
+
+## How each lesson works
+
+1. Read the lesson and type the examples yourself. Run every one and look at the output.
+2. Before running an "order of output" example, write down your guess first. Being wrong is where the learning happens.
+3. Do the exercises without AI help first. Then paste your answers into Claude for a review and an honest score.
+4. Only then check the [Solutions](/docs/node-http/solutions) page.
+5. Write your mistakes in the "My notes and mistakes" box on each page.
+6. Practise the interview answer out loud until you can say it without reading.
+
+## Schedule (2 weeks, about 5 study hours a week)
+
+| When | What |
+| --- | --- |
+| Week 1, sessions 1–2 | Lesson 1 (event loop) and Lesson 2 (async patterns) |
+| Week 1, session 3 | Lesson 3 (error handling) |
+| Week 1, session 4 | Lesson 4 (streams) |
+| Week 1, Friday block | Lesson 5 (HTTP basics): build the tiny server |
+| Week 2, sessions 1–2 | Lesson 6 (REST design) |
+| Week 2, sessions 3–4 | Lesson 7 (pagination and idempotency) |
+| Week 2, Friday block | [Practice project](/docs/node-http/practice-project) |
+
+After this section, start NestJS and PostgreSQL. You'll build Mini-build A (URL shortener) with them, using the API design you write in the practice project.
+
+**Done means:** you can explain the event loop, `Promise.all` vs sequential calls, and cursor pagination out loud in English in under a minute each, and you can design a REST API for a new feature without looking anything up.
+
+## The example domain
+
+The same types as the TypeScript section, plus a few new fields:
+
+```typescript
+type Service = {
+  id: string;
+  businessId: string;
+  name: string;              // "Haircut", "Consultation"
+  durationMinutes: number;
+  priceCents: number;        // money is stored as whole cents, never as a float
+};
+
+type Booking = {
+  id: string;
+  businessId: string;
+  serviceId: string;
+  customerEmail: string;
+  startsAt: Date;
+  status: 'confirmed' | 'cancelled';
+  createdAt: Date;
+};
+```

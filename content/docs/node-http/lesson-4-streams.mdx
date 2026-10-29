@@ -1,0 +1,205 @@
+---
+title: "Lesson 4: Streams"
+description: "Process big data with small memory: readable, writable and transform streams, backpressure and pipeline."
+---
+
+A stream processes data **piece by piece** instead of loading it all into memory first. It's how you export 1 million bookings as CSV, accept a 500 MB upload, or read a huge log file with a server that has only 512 MB of RAM.
+
+## Why streams matter
+
+```typescript
+import { readFile } from 'node:fs/promises';
+
+// Loads the WHOLE file into memory. A 2 GB file needs 2 GB of RAM,
+// and nothing is sent until everything is read.
+const data = await readFile('bookings-export.csv');
+res.end(data);
+```
+
+```typescript
+import { createReadStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+
+// Reads 64 KB at a time and sends each piece as it arrives.
+// Memory stays small, whatever the file size. The user starts downloading immediately.
+await pipeline(createReadStream('bookings-export.csv'), res);
+```
+
+Think of it like water: `readFile` fills a whole tank and then carries it; a stream is a pipe.
+
+## The four types
+
+| Type | What it does | Examples |
+| --- | --- | --- |
+| **Readable** | Produces data | `fs.createReadStream`, an incoming HTTP request (`req`), a database cursor |
+| **Writable** | Consumes data | `fs.createWriteStream`, an HTTP response (`res`), `process.stdout` |
+| **Transform** | Reads data, changes it, passes it on | `zlib.createGzip()`, CSV formatting, encryption |
+| **Duplex** | Both readable and writable, independently | A TCP socket |
+
+In an HTTP server, **`req` is a readable stream** (the body the client sends) and **`res` is a writable stream** (what you send back). That's why the next lessons treat them as streams.
+
+## Backpressure, in plain words
+
+What if you read data faster than you can write it? For example, reading from a fast disk and sending to a user on a slow mobile connection. The unsent data piles up in memory, and the server can run out of RAM.
+
+**Backpressure** is the writable side saying "stop, I'm full", and the readable side pausing until the writable side says "ready again" (the `drain` event).
+
+You almost never manage this by hand. **`pipeline()` does it for you.** That's the main reason to use it.
+
+## `pipeline`: the one function to remember
+
+```typescript
+import { pipeline } from 'node:stream/promises';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { createGzip } from 'node:zlib';
+
+await pipeline(
+  createReadStream('bookings.csv'),
+  createGzip(),
+  createWriteStream('bookings.csv.gz'),
+);
+console.log('Compressed');
+```
+
+`pipeline`:
+
+- connects the streams in order,
+- handles backpressure,
+- **destroys all streams if any one fails** (no leaked file handles),
+- returns a promise, so you can `await` it and use `try/catch`.
+
+<Callout type="warn" title="Avoid .pipe()">
+Older tutorials use `a.pipe(b).pipe(c)`. It handles backpressure, but **not errors**: if one stream fails, the others stay open and the error may crash your process. Use `pipeline` from `node:stream/promises` instead.
+</Callout>
+
+## Example: export all bookings as CSV
+
+A business owner clicks "Export bookings". There may be 300,000 rows. You don't want them all in memory.
+
+```typescript
+import http from 'node:http';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+
+// Pretend database: yields bookings one page at a time.
+// With PostgreSQL you'd read with a cursor (Phase 1 PostgreSQL topic).
+async function* allBookings(businessId: string) {
+  for (let page = 0; page < 3_000; page++) {
+    const rows = Array.from({ length: 100 }, (_, i) => ({
+      id: `b${page * 100 + i}`,
+      customerEmail: `customer${i}@example.com`,
+      startsAt: new Date(),
+      status: 'confirmed',
+    }));
+    yield* rows; // send each row one by one
+  }
+}
+
+function csvEscape(value: string): string {
+  return /[",\n]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
+}
+
+const toCsvLine = new Transform({
+  objectMode: true, // input is objects, not bytes
+  transform(row: { id: string; customerEmail: string; startsAt: Date; status: string }, _enc, done) {
+    const line = [row.id, row.customerEmail, row.startsAt.toISOString(), row.status]
+      .map(csvEscape)
+      .join(',');
+    done(null, line + '\n');
+  },
+});
+
+const server = http.createServer(async (req, res) => {
+  if (req.url !== '/bookings/export') {
+    res.statusCode = 404;
+    return res.end();
+  }
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="bookings.csv"');
+  res.write('id,customer_email,starts_at,status\n');
+
+  try {
+    await pipeline(Readable.from(allBookings('biz_1')), toCsvLine, res);
+  } catch (err) {
+    // Usually the client closed the download. Headers are already sent,
+    // so we can't send a 500 now; just log it.
+    console.error('Export stopped:', (err as Error).message);
+  }
+});
+
+server.listen(3000);
+```
+
+Test it with `curl.exe -o bookings.csv localhost:3000/bookings/export` and watch memory stay low.
+
+Key points:
+
+- `Readable.from()` turns any async generator (or array) into a readable stream. Async generators (`async function*`) are the easiest way to produce data.
+- `objectMode: true` lets a stream carry JavaScript objects instead of bytes.
+- Once you start writing the body, **you can't change the status code**. Check permissions and validate input *before* streaming.
+- Always escape CSV values. A customer name with a comma breaks the file; one starting with `=` can even run a formula in Excel ("CSV injection").
+
+<Callout type="warn" title="One Transform per request">
+In real code, create the `Transform` **inside the request handler**. A stream can only be used once; sharing one between requests breaks the second export. It's at the top level here only to keep the example short. Exercise 4.2 asks you to fix this.
+</Callout>
+
+## Example: save a large upload to disk
+
+The request body is a readable stream, so you can save it without holding it in memory:
+
+```typescript
+import type http from 'node:http';
+import { createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import { randomUUID } from 'node:crypto';
+
+async function handleUpload(req: http.IncomingMessage, res: http.ServerResponse) {
+  const path = `./uploads/${randomUUID()}.bin`; // never use the client's filename as the path
+  await pipeline(req, createWriteStream(path));
+  res.statusCode = 201;
+  res.end(JSON.stringify({ path }));
+}
+```
+
+In production you usually don't store uploads on the server's disk at all; the browser uploads straight to S3 with a signed URL (Month 3). But the stream idea is the same.
+
+## Example: read a big file line by line
+
+```typescript
+import { createReadStream } from 'node:fs';
+import { createInterface } from 'node:readline';
+
+const lines = createInterface({ input: createReadStream('access.log'), crlfDelay: Infinity });
+
+let errors = 0;
+for await (const line of lines) {
+  if (line.includes(' 500 ')) errors++;
+}
+console.log(`500 errors: ${errors}`);
+```
+
+`for await…of` works on any readable stream. It's the simplest way to consume one, and it handles backpressure too.
+
+## Common mistakes
+
+- Using `readFile` or `JSON.stringify` on huge data in a request handler. Stream it or paginate it.
+- Using `.pipe()` without error handling.
+- Trying to send a `500` after the stream has started. Headers are already sent; you can only end or destroy the response.
+- Forgetting `objectMode: true` when the stream carries objects. You get the error "The chunk argument must be of type string or Buffer".
+
+## Exercises
+
+- **4.1** 🟢 Write a script that creates a 200 MB file of fake booking lines (use a writable stream and respect backpressure: check the return value of `write()` and wait for `drain`). Then count its lines with `readline`. Print the memory used with `process.memoryUsage().rss`.
+- **4.2** 🟡 Change the CSV export so the `Transform` is created inside the request handler (why does this matter if two people export at the same time?), and add gzip compression with `createGzip()` and a `Content-Encoding: gzip` header.
+- **4.3** 🟡 Add a `Transform` that filters the export to only `confirmed` bookings. (Hint: in a transform, call `done()` with no data to drop a row.)
+- **4.4** 🔴 Add a size limit to the upload handler: if more than 10 MB arrives, stop and respond `413 Payload Too Large`. (Hint: a `Transform` that counts bytes and passes an error to `done(err)` when the limit is passed.)
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What are streams, and when would you use them?"**
+
+> "Streams process data in small chunks instead of loading it all into memory. I use them for large files, exports and uploads. For example, exporting 300,000 bookings as CSV: I read rows from the database with a cursor, transform each row into a CSV line, and pipe it straight into the HTTP response. Memory stays flat and the user starts downloading immediately. I use `pipeline` because it handles backpressure, which means pausing the reader when the writer is slow, and it cleans up all the streams if one of them fails."

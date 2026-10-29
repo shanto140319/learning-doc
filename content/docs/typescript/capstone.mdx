@@ -1,0 +1,21 @@
+---
+title: "Capstone: type the booking platform's core"
+description: "Build the typed foundation of Project 1 in one Friday block, using everything from the five lessons."
+---
+
+Build the typed foundation of the booking platform in one Friday block (about 4 hours). This becomes real code in Project 1, not throwaway practice.
+
+## Requirements
+
+- A `packages/shared` folder with Zod schemas for `Service`, `Booking` and `User` (public version), with inferred types and derived create/update inputs
+- A discriminated union `BookingEvent` for `created`, `rescheduled` (with `newStartsAt`), `cancelled` (with `reason`) and `reminder_failed` (with `reason`), plus an exhaustive handler
+- A generic `Result<T, E>` type used by a `createBooking()` function instead of throwing (for example, returning an error when the slot is already taken)
+- A typed `apiGet` / `apiPost` helper validating every response
+- A typed `env` module for the backend
+- `strict` and `noUncheckedIndexedAccess` on, zero `any`, zero `!` assertions
+
+## When you're done
+
+1. Push it to GitHub.
+2. Paste the shared schemas file and the event handler into Claude for a code review.
+3. Ask for a 10-question mixed quiz on all five lessons. Score 8 or more and move on to the rest of Phase 1.

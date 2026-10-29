@@ -1,0 +1,124 @@
+---
+title: "Angular"
+description: "Strict templates, signals, typed inputs and outputs, inject(), typed forms and safe HttpClient calls in modern Angular."
+---
+
+Angular is built with TypeScript, so it has more type features built in than React. The key is to turn on the strict template checks and to remember that `HttpClient` generics do **not** validate anything.
+
+## Strict compiler and template checks
+
+New projects have these on by default. In older projects, check `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": { "strict": true },
+  "angularCompilerOptions": {
+    "strictTemplates": true,
+    "strictInjectionParameters": true,
+    "strictInputAccessModifiers": true
+  }
+}
+```
+
+`strictTemplates` type-checks your HTML templates: wrong input types, typos in properties, and possible `null` values all become build errors.
+
+## Signals, inputs and outputs
+
+Use signal-based APIs. They are fully typed and need no `!`:
+
+```typescript
+@Component({
+  selector: 'app-service-card',
+  template: `
+    <h3>{{ service().name }}</h3>
+    <button (click)="book.emit(service().id)">Book</button>
+  `,
+})
+export class ServiceCardComponent {
+  service = input.required<Service>();    // Signal<Service>, never undefined
+  compact = input(false);                 // Signal<boolean>, inferred from default
+  book = output<string>();                // emits a serviceId
+
+  title = computed(() => `${this.service().name} (${this.service().durationMinutes} min)`);
+}
+```
+
+Compare with the old `@Input() service!: Service;`, where the `!` hides a possible `undefined`.
+
+For queries, `viewChild.required<ElementRef<HTMLInputElement>>('email')` also avoids `!`.
+
+## Dependency injection with `inject()`
+
+`inject()` gets its type from the class, so there's nothing to annotate. For non-class values (config, feature flags), use a typed `InjectionToken`:
+
+```typescript
+export type BookingConfig = { slotMinutes: number; maxDaysAhead: number };
+export const BOOKING_CONFIG = new InjectionToken<BookingConfig>('booking.config');
+
+export class SlotService {
+  private http = inject(HttpClient);
+  private config = inject(BOOKING_CONFIG);   // typed as BookingConfig
+}
+```
+
+## HttpClient: the generic is not validation
+
+`http.get<Service[]>(url)` is just a type cast. If the API returns something else, the type is wrong and nothing tells you. Validate the response:
+
+```typescript
+getServices(): Observable<Service[]> {
+  return this.http
+    .get<unknown>('/api/services')
+    .pipe(map(data => ServiceSchema.array().parse(data)));
+}
+```
+
+## Typed reactive forms
+
+Use `NonNullableFormBuilder` so values aren't `string | null`:
+
+```typescript
+private fb = inject(NonNullableFormBuilder);
+
+form = this.fb.group({
+  customerEmail: ['', [Validators.required, Validators.email]],
+  startsAt: [''],
+});
+
+submit() {
+  const value = this.form.getRawValue();   // { customerEmail: string; startsAt: string }
+}
+```
+
+`form.value` is `Partial<...>` because disabled controls are left out. Use `getRawValue()` when you need every field.
+
+## Templates and unions
+
+The new control flow narrows types in templates:
+
+```html
+@switch (state().status) {
+  @case ('loading') { <app-spinner /> }
+  @case ('success') { <app-slot-list [slots]="state().data" /> }
+  @case ('error') { <p>{{ state().message }}</p> }
+}
+
+@if (selectedService(); as service) {
+  <p>{{ service.name }}</p>   <!-- service is not null here -->
+}
+```
+
+Note: narrowing a signal call like `state()` inside `@switch` depends on your Angular version. If it doesn't narrow, store it first with `@let s = state();` and switch on `s.status`.
+
+## Common mistakes
+
+- Trusting `http.get<T>()` as if it checked the data.
+- Using `$any()` in templates to silence errors.
+- `@Input() x!: T` instead of `input.required<T>()`.
+- `form.value` used as if every field were present.
+
+## Interview answer
+
+**"Does `http.get<User>()` make the response type-safe?"**
+
+> "No. The generic only tells TypeScript what to assume; nothing checks the data at runtime. If the backend changes, the app still thinks it has a `User`. I request `unknown` and validate with a Zod schema in a `map` operator, so a wrong response fails right away with a clear error."

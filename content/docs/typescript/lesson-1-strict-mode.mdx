@@ -1,0 +1,177 @@
+---
+title: "Lesson 1: Strict mode and unknown"
+description: "Turn on strict mode and noUncheckedIndexedAccess, use unknown instead of any, and know why the ! assertion is risky."
+---
+
+Strict mode makes TypeScript actually protect you; without it, half the bugs it could catch slip through. Turn it on in every project from day one.
+
+## What `strict: true` turns on (the parts that matter)
+
+- `strictNullChecks`: `null` and `undefined` are not allowed unless the type says so. This alone prevents the most common runtime crash: "cannot read property of undefined".
+- `noImplicitAny`: TypeScript refuses to silently guess `any` for untyped parameters.
+- `strictFunctionTypes` and `strictPropertyInitialization`: safer callbacks and class fields (important in NestJS).
+
+## `noUncheckedIndexedAccess`: the flag `strict` forgets
+
+This flag is **not** part of `strict`. You add it yourself in `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true
+  }
+}
+```
+
+**The problem it fixes.** Even with `strict`, TypeScript assumes that reading by index always finds something:
+
+```typescript
+const freeSlots: Date[] = [];
+const next = freeSlots[0];   // without the flag: Date (wrong! the array is empty)
+next.toISOString();          // compiles, then crashes at runtime
+```
+
+With the flag on, the type becomes `Date | undefined`, so the compiler makes you handle the empty case:
+
+```typescript
+const next = freeSlots[0];   // Date | undefined
+next.toISOString();          // error: 'next' is possibly 'undefined'. Good!
+```
+
+**What it affects.** Reading by index or by key:
+
+```typescript
+const slots: Date[] = [];
+slots[0];                    // Date | undefined
+slots[i];                    // Date | undefined
+const [first] = slots;       // first: Date | undefined
+
+const bookingsByDay: Record<string, number> = {};
+bookingsByDay['2027-01-10']; // number | undefined: the key might not exist
+```
+
+**What it doesn't affect.** Loops and array methods, which only visit items that exist:
+
+```typescript
+for (const slot of slots) slot.toISOString();   // slot: Date, no check needed
+slots.map(slot => slot.toISOString());          // slot: Date
+```
+
+**How to handle `T | undefined`.** Pick whichever reads best:
+
+```typescript
+const next = freeSlots[0];
+
+// 1. Check and return early
+if (next === undefined) return 'No free slots';
+next.toISOString();                              // now Date
+
+// 2. Optional chaining: undefined if missing
+const label = freeSlots[0]?.toISOString();       // string | undefined
+
+// 3. A default value with ??
+const count = bookingsByDay[day] ?? 0;           // number
+```
+
+Tip: store the value in a `const` first, then check it. Checking `slots[i]` directly and then using `slots[i]` again doesn't always narrow.
+
+**Why turn it on?** "Array is empty" and "key doesn't exist" are some of the most common real bugs, and plain `strict` can't see them. The cost is a few extra checks, and each one is a case you should handle anyway.
+
+## `any` vs `unknown`
+
+`any` switches type checking off. `unknown` means "I don't know yet, so prove it before you use it". Use `unknown` for anything from outside your code: API responses, `JSON.parse`, `catch` errors, user input.
+
+```typescript
+function parseBad(json: string): any {
+  return JSON.parse(json);
+}
+parseBad('{}').customer.email;   // compiles, crashes at runtime
+
+function parseSafe(json: string): unknown {
+  return JSON.parse(json);
+}
+const data = parseSafe('{}');
+data.customer;                   // error: you must narrow first (Lesson 2)
+```
+
+In `catch` blocks, the error is `unknown` under strict mode. Check it before using it:
+
+```typescript
+try {
+  await createBooking(input);
+} catch (err) {
+  const message = err instanceof Error ? err.message : String(err);
+  console.error(message);
+}
+```
+
+## The non-null assertion `!`
+
+Putting `!` after a value tells TypeScript: "trust me, this is not `null` or `undefined`". It removes `null` and `undefined` from the type:
+
+```typescript
+const next = freeSlots[0];    // Date | undefined
+next!.toISOString();          // compiles: the type is now Date
+```
+
+**The danger:** `!` is deleted when TypeScript compiles to JavaScript. It **checks nothing at runtime**. If you're wrong, you get exactly the crash strict mode was meant to stop:
+
+```typescript
+const freeSlots: Date[] = [];
+freeSlots[0]!.toISOString();  // compiles, then: TypeError: Cannot read properties of undefined
+```
+
+So `!` switches off the safety you turned on with `strictNullChecks` and `noUncheckedIndexedAccess`, one value at a time. It's a small `any`.
+
+**Better options.** Use the same tools as above: check and return early, `?.`, or `??`. If the value must exist and a missing value is a real bug, throw a clear error instead of crashing with an unclear one:
+
+```typescript
+const service = services.find(s => s.id === serviceId);
+if (service === undefined) throw new Error(`Service ${serviceId} not found`);
+service.name;                 // Service, and a clear error if it's missing
+```
+
+**When `!` is acceptable.** Only when you know something TypeScript can't see, and it's obvious to a reader:
+
+1. **Right after a check TypeScript doesn't connect.** `Map.has()` doesn't narrow `Map.get()`:
+
+   ```typescript
+   if (cache.has(key)) return cache.get(key)!;   // we just checked it exists
+   ```
+
+2. **Class fields set by a framework, not a constructor.** For example NestJS DTOs filled by the validation pipe: `serviceId!: string;` ([NestJS page](/docs/typescript/best-practices/nestjs)).
+3. **Test code,** where a crash just fails the test.
+
+In normal app code, aim for zero `!`. The lint rule `no-non-null-assertion` warns about each one, so you have to think twice.
+
+**Rule of thumb:** zero `any` and almost zero `!` in your own code. If you truly can't type something yet, use `unknown` and narrow it.
+
+## Exercises
+
+- **1.1** Take any small file from an old JavaScript or loosely typed project, turn on `strict` and `noUncheckedIndexedAccess`, and fix every error without using `any` or `!`. Note which kinds of errors appeared most.
+- **1.2** ✅ Fix this function so it compiles under strict mode and never crashes:
+
+```typescript
+function getBookedCount(bookingsByDay, day) {
+  return bookingsByDay[day]?.count;
+}
+
+// bookingsByDay looks like: { "2027-01-10": { count: 4 }, "2027-01-11": { count: 2 } }
+```
+
+- **1.3** ✅ In one sentence each, explain: why is `unknown` safer than `any`, and when is `!` (non-null assertion) acceptable?
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What's the difference between `any` and `unknown`?"**
+
+> "`any` turns off type checking, so mistakes reach production. `unknown` means the type isn't known yet, and TypeScript makes me check it before I use it. I use `unknown` for data from outside my code, like API responses, `JSON.parse` and errors in `catch` blocks, and I keep `any` out of my own code."
+
+**"What does the `!` operator do, and when do you use it?"**
+
+> "It's the non-null assertion. It tells TypeScript a value isn't `null` or `undefined`, but it's removed at compile time, so nothing checks it at runtime. If I'm wrong, the app crashes. I avoid it and narrow the type instead, with an `if` check, optional chaining or a default value. I only use it when I know something the compiler can't see, like right after `Map.has()`."

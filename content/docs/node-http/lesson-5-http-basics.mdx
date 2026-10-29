@@ -1,0 +1,239 @@
+---
+title: "Lesson 5: HTTP basics"
+description: "Requests, responses, methods, safe and idempotent, important headers, and a server with no framework."
+---
+
+Every API you build is HTTP. Express, NestJS and Next.js route handlers all hide it a little, but the request, response, methods and headers are always underneath. This lesson shows the raw protocol, then builds a tiny booking server with only `node:http`.
+
+## What HTTP is
+
+HTTP is a **text protocol** for request and response. The client sends a request; the server sends back exactly one response. Each request is **stateless**: the server doesn't remember the previous request, so every request must carry everything needed (for example, the auth token).
+
+A real request, as text on the wire:
+
+```text
+POST /v1/bookings HTTP/1.1
+Host: api.bookly.dev
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOi...
+Content-Length: 78
+
+{"serviceId":"s1","startsAt":"2026-11-03T10:00:00Z","email":"rahim@example.com"}
+```
+
+And the response:
+
+```text
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: /v1/bookings/b_8f2k
+
+{"id":"b_8f2k","serviceId":"s1","startsAt":"2026-11-03T10:00:00Z","status":"confirmed"}
+```
+
+The parts:
+
+| Request | Response |
+| --- | --- |
+| **Method** (`POST`) and **path** (`/v1/bookings`), with an optional **query string** (`?status=confirmed`) | **Status code** (`201`) and reason (`Created`) |
+| **Headers**: metadata, as `Name: value` lines | **Headers** |
+| An empty line, then the optional **body** | An empty line, then the optional **body** |
+
+See it yourself: `curl.exe -v https://httpbin.org/get`. Lines starting with `>` are what you sent; lines starting with `<` are what came back.
+
+## Methods
+
+| Method | Meaning | Has body? | Safe | Idempotent |
+| --- | --- | --- | --- | --- |
+| `GET` | Read a resource | No | ✅ | ✅ |
+| `HEAD` | Like GET, headers only | No | ✅ | ✅ |
+| `POST` | Create, or run an action | Yes | ❌ | ❌ |
+| `PUT` | Replace a resource completely | Yes | ❌ | ✅ |
+| `PATCH` | Change some fields | Yes | ❌ | ❌ (usually) |
+| `DELETE` | Remove a resource | Usually no | ❌ | ✅ |
+| `OPTIONS` | Ask what's allowed (used by CORS) | No | ✅ | ✅ |
+
+Two words you must know:
+
+- **Safe:** the request doesn't change anything on the server. A `GET` should never cancel a booking. (Browsers, crawlers and link previews call `GET` URLs freely. If `GET /bookings/5/cancel` cancels a booking, a Slack link preview could cancel it!)
+- **Idempotent:** sending the same request **once or ten times has the same effect** on the server. `DELETE /bookings/5` ten times: the booking is deleted, same as once. `POST /bookings` ten times: ten bookings. That's a problem, and Lesson 7 solves it with idempotency keys.
+
+Idempotency matters because **networks fail**. If a request times out, the client doesn't know if the server did the work. Retrying is safe only for idempotent requests.
+
+`PATCH` is not idempotent in general: `PATCH { "op": "increment" }` gives a different result each time. A `PATCH` that just sets fields is idempotent in practice.
+
+## Headers you'll use every week
+
+| Header | Direction | What it's for |
+| --- | --- | --- |
+| `Content-Type` | Both | The body's format: `application/json`, `text/csv`, `multipart/form-data` |
+| `Accept` | Request | Formats the client can read |
+| `Authorization` | Request | Credentials: `Bearer <token>` |
+| `Cookie` / `Set-Cookie` | Request / response | Session cookies. Use `HttpOnly; Secure; SameSite=Lax` flags |
+| `Location` | Response | URL of a newly created resource (with `201`) or the redirect target (with `3xx`) |
+| `Cache-Control` | Response | Caching rules: `no-store`, `private, max-age=60`, `public, max-age=31536000, immutable` |
+| `ETag` / `If-None-Match` | Response / request | A version tag for a resource. If it hasn't changed, the server replies `304 Not Modified` with no body |
+| `Retry-After` | Response | With `429` or `503`: how many seconds to wait before retrying |
+| `Idempotency-Key` | Request | A unique key that makes a `POST` safe to retry (Lesson 7) |
+| `X-Request-Id` | Both | A unique ID per request, written in every log line, so you can trace one request across services |
+
+Header names are case-insensitive. Node gives them to you in lowercase: `req.headers['content-type']`.
+
+## A server with no framework
+
+This is what frameworks do for you. Type it all out once; it's worth it.
+
+```typescript
+// server.ts
+import http from 'node:http';
+import { randomUUID } from 'node:crypto';
+
+type Service = { id: string; name: string; durationMinutes: number };
+type Booking = { id: string; serviceId: string; email: string; startsAt: string };
+
+const services: Service[] = [
+  { id: 's1', name: 'Check-up', durationMinutes: 30 },
+  { id: 's2', name: 'Teeth cleaning', durationMinutes: 45 },
+];
+const bookings: Booking[] = [];
+
+function sendJson(res: http.ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
+  const json = JSON.stringify(body);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(json),
+    ...headers,
+  });
+  res.end(json);
+}
+
+// The body is a stream: collect the chunks, with a size limit.
+async function readJsonBody(req: http.IncomingMessage, maxBytes = 100_000): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > maxBytes) throw new Error('BODY_TOO_LARGE');
+    chunks.push(chunk as Buffer);
+  }
+  const text = Buffer.concat(chunks).toString('utf8');
+  return text ? JSON.parse(text) : undefined;   // throws SyntaxError on bad JSON
+}
+
+const server = http.createServer(async (req, res) => {
+  // req.url is only the path + query, e.g. "/services?limit=5". Add a base to parse it.
+  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+
+  try {
+    if (req.method === 'GET' && url.pathname === '/services') {
+      return sendJson(res, 200, { data: services });
+    }
+
+    const serviceMatch = url.pathname.match(/^\/services\/([^/]+)$/);
+    if (req.method === 'GET' && serviceMatch) {
+      const service = services.find((s) => s.id === serviceMatch[1]);
+      if (!service) return sendJson(res, 404, { code: 'NOT_FOUND', message: 'Service not found' });
+      return sendJson(res, 200, service);
+    }
+
+    if (req.method === 'POST' && url.pathname === '/bookings') {
+      if (!req.headers['content-type']?.startsWith('application/json')) {
+        return sendJson(res, 415, { code: 'UNSUPPORTED_MEDIA_TYPE', message: 'Send JSON' });
+      }
+      const body = (await readJsonBody(req)) as Partial<Booking> | undefined;
+      // Simple checks for now. Next month, Zod or class-validator does this.
+      if (!body?.serviceId || !body.email || !body.startsAt) {
+        return sendJson(res, 422, { code: 'VALIDATION_FAILED', message: 'serviceId, email and startsAt are required' });
+      }
+      if (bookings.some((b) => b.serviceId === body.serviceId && b.startsAt === body.startsAt)) {
+        return sendJson(res, 409, { code: 'SLOT_TAKEN', message: 'This time slot is already booked' });
+      }
+      const booking: Booking = { id: randomUUID(), serviceId: body.serviceId, email: body.email, startsAt: body.startsAt };
+      bookings.push(booking);
+      return sendJson(res, 201, booking, { Location: `/bookings/${booking.id}` });
+    }
+
+    // The path exists but the method doesn't: 405. The path doesn't exist: 404.
+    if (url.pathname === '/services' || url.pathname === '/bookings') {
+      return sendJson(res, 405, { code: 'METHOD_NOT_ALLOWED', message: `${req.method} not allowed` }, { Allow: url.pathname === '/services' ? 'GET' : 'POST' });
+    }
+    return sendJson(res, 404, { code: 'NOT_FOUND', message: 'Route not found' });
+  } catch (err) {
+    if (err instanceof SyntaxError) return sendJson(res, 400, { code: 'INVALID_JSON', message: 'Body is not valid JSON' });
+    if (err instanceof Error && err.message === 'BODY_TOO_LARGE') return sendJson(res, 413, { code: 'PAYLOAD_TOO_LARGE', message: 'Body too large' });
+    console.error(err);
+    return sendJson(res, 500, { code: 'INTERNAL', message: 'Something went wrong' });
+  }
+});
+
+server.listen(3000, () => console.log('Listening on http://localhost:3000'));
+```
+
+Run it with `npx tsx watch server.ts`.
+
+## Testing with curl (PowerShell)
+
+PowerShell changes quotes inside arguments, which breaks JSON. The easy fix: put the JSON in a file and send the file with `-d "@file"`. Create `booking.json`:
+
+```json
+{ "serviceId": "s1", "email": "rahim@example.com", "startsAt": "2026-11-03T10:00:00Z" }
+```
+
+```powershell
+curl.exe -i localhost:3000/services
+curl.exe -i localhost:3000/services/s1
+curl.exe -i localhost:3000/services/nope
+
+# Create a booking from the file
+curl.exe -i -X POST localhost:3000/bookings -H "Content-Type: application/json" -d "@booking.json"
+
+# Run the same command again: you should get 409 SLOT_TAKEN.
+curl.exe -i -X DELETE localhost:3000/services   # 405
+```
+
+`-i` shows the status line and headers. Use `-v` for full detail. In Git Bash, you can write JSON inline instead: `curl -d '{"serviceId":"s1", ...}'`. The VS Code extension "REST Client" is another nice option: you write requests in a `.http` file and click "Send".
+
+## What a framework adds
+
+Look at how much code the server needed: routing with regular expressions, body parsing, size limits, content-type checks, error mapping. A framework gives you:
+
+| You wrote by hand | NestJS gives you |
+| --- | --- |
+| `if (req.method === 'GET' && …)` and regex | `@Get(':id')` decorators and a router |
+| `readJsonBody` with a size limit | A built-in body parser |
+| Manual `if (!body?.serviceId …)` | DTOs with validation pipes |
+| `try/catch` mapping errors to statuses | Exception filters |
+| Nothing for auth | Guards |
+
+You'll appreciate (and debug) NestJS much better because you did it by hand once.
+
+## A few more things worth knowing
+
+- **Keep-alive:** HTTP/1.1 reuses one TCP connection for many requests, which saves time. That's why `server.close()` waits for idle connections (Lesson 3).
+- **HTTP/2:** sends many requests at the same time over one connection, and compresses headers. Usually your load balancer or CDN speaks HTTP/2 to the browser, and your Node app still speaks HTTP/1.1 behind it. You rarely configure it yourself.
+- **HTTPS:** HTTP inside TLS encryption. In production, TLS usually ends at the load balancer (AWS ALB, CloudFront), not in Node.
+- **CORS:** a browser rule. A page on `app.bookly.dev` can't read responses from `api.bookly.dev` unless the API sends `Access-Control-Allow-Origin`. Browsers first send an `OPTIONS` "preflight" request for non-simple requests. It's covered properly in Month 2 (security).
+
+## Common mistakes
+
+- Changing data in a `GET` handler.
+- Forgetting `Content-Type: application/json` on responses (some clients won't parse it) or on requests (some servers won't read it).
+- Reading the body with no size limit. A client could send 5 GB and fill your memory.
+- Trusting `req.url` without parsing it. Always use `new URL()`.
+
+## Exercises
+
+- **5.1** 🟢 For each request, say if it is safe and/or idempotent: `GET /bookings`, `POST /bookings`, `PUT /services/s1`, `DELETE /bookings/b1`, `POST /bookings/b1/cancel`.
+- **5.2** 🟡 Add `GET /bookings/:id` and `DELETE /bookings/:id` to the server. `DELETE` should return `204 No Content`. What should a second `DELETE` of the same booking return, and why is that still "idempotent"?
+- **5.3** 🟡 Add an `X-Request-Id` header to every response: reuse the one from the request if the client sent one, otherwise create one with `randomUUID()`. Log one line per request: method, path, status, duration in ms, request ID. (Hint: `res.on('finish', …)`.)
+- **5.4** 🔴 Add `ETag` support to `GET /services`: compute a hash of the JSON body (`createHash('sha1')`), send it as `ETag`, and if the request's `If-None-Match` matches, return `304` with no body. Test in Git Bash with `curl -i -H 'If-None-Match: "<the etag>"' localhost:3000/services` (PowerShell drops the inner quotes).
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What does idempotent mean, and why does it matter?"**
+
+> "An idempotent request has the same effect on the server whether you send it once or many times. GET, PUT and DELETE are idempotent; POST isn't, because sending it twice usually creates two things. It matters because networks fail: if a request times out, the client doesn't know if it worked, and the only safe thing to do automatically is retry. Retrying is only safe if the request is idempotent. For POST requests like payments or bookings, I make them safe to retry with an idempotency key."

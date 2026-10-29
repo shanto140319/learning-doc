@@ -1,0 +1,49 @@
+---
+title: "Phase 2: AI product engineering"
+description: "Months 4–6: LLMs, RAG, agents, evaluation and Project 2."
+---
+
+Goal: by the end of April you have two real-world projects live, one of them with an AI agent that does real work safely, and you can explain how to make LLM features reliable, affordable and secure. This is what separates you from thousands of other React developers applying for the same roles.
+
+## Month 4 — LLM fundamentals (while finishing Project 1)
+
+- Calling LLM APIs (Anthropic, OpenAI) directly and through the Vercel AI SDK; choosing models by cost, speed and quality
+- Streaming responses into a React UI; structured output validated with Zod
+- Prompt design, system prompts, prompt caching, token costs, rate limits, retries, timeouts and fallbacks
+- Tool-calling: letting the model call your own NestJS endpoints
+- Finish Project 1: Stripe payments and subscriptions, polish, final deploy
+
+## Month 5 — RAG: answering from a company's own data
+
+- Embeddings, chunking strategies and pgvector inside your existing Postgres; metadata filtering
+- Hybrid search (vector + Postgres full-text), reranking, citing sources in answers
+- Keeping the index fresh when documents change (background re-embedding jobs)
+
+## Month 6 — Agents, evaluation and safety
+
+- Multi-step agents with tool use, MCP basics, human approval before risky actions; when an agent is the wrong tool
+- Evaluation: test sets with expected outcomes, automated scoring, regression checks in CI
+- Safety: prompt injection, data leaking between tenants, output guardrails
+- LLM observability: tracing each call, latency and cost per conversation (for example with Langfuse)
+
+**Project 2 (Months 5–6): AI customer-support agent for Project 1.** An embeddable chat widget that businesses on your booking platform add to their own websites:
+
+- Answers questions from each business's own FAQ and policy documents, with citations (RAG)
+- Takes real actions through tool-calling: check availability, book, reschedule or cancel, always confirming with the customer before anything changes
+- Hands off to a human (dashboard inbox or email) when it isn't confident
+- Each business's data fully isolated, with per-business usage limits and cost tracking
+- An evaluation suite of 50+ test conversations that runs in CI
+
+This mirrors what many product teams are building right now: AI that works inside an existing product and takes real actions safely, not a standalone chatbot demo.
+
+## Phase 2 deliverables
+
+- [ ] Project 1 complete with payments and subscriptions, live
+- [ ] Project 2 live, embedded on a demo business website, with a 3-minute demo video
+- [ ] READMEs covering architecture, evaluation results and cost per conversation
+- [ ] Two blog posts, for example "Building an AI agent that books appointments safely"
+- [ ] 50 DSA problems total (add trees, graphs, binary search, sliding window)
+- [ ] At least 1 merged pull request to an open-source TypeScript or AI library
+- [ ] Bonus: 2–3 real local businesses (a clinic, salon or tutor you know) using Project 1. Real users make interview stories far stronger
+
+Checkpoint, end of April: if a stranger looked at your GitHub and LinkedIn for two minutes, would they see a full-stack AI engineer? If yes, start applying in May, a month early.

@@ -1,0 +1,88 @@
+---
+title: "Lesson 3: Generics"
+description: "Write code once and keep exact types for every caller: type parameters, extends constraints, keyof and generic React components."
+---
+
+A generic is a type parameter: a placeholder filled in when the function or component is used. It lets you write code once and keep exact types for every caller, instead of falling back to `any`.
+
+## The basic idea
+
+```typescript
+// Without generics: the type is lost
+function firstAny(items: any[]) { return items[0]; }
+
+// With generics: the type flows through
+function first<T>(items: T[]): T | undefined {
+  return items[0];
+}
+const service = first([{ id: 'a', name: 'Haircut' }]); // { id: string; name: string } | undefined
+const n = first([1, 2, 3]);                             // number | undefined
+```
+
+You rarely write `first<number>(...)` yourself. TypeScript infers `T` from the arguments.
+
+## Constraints with `extends`
+
+Use `extends` when the generic must have a certain shape:
+
+```typescript
+function byId<T extends { id: string }>(items: T[], id: string): T | undefined {
+  return items.find(item => item.id === id); // item.id is allowed because of the constraint
+}
+```
+
+The return type is still the caller's full type `T`, not just `{ id: string }`. That's the key difference from writing `items: { id: string }[]`.
+
+## `keyof` and indexed access
+
+`keyof T` is the union of a type's keys. `T[K]` is the type of the value at key `K`. Together they make safe property helpers:
+
+```typescript
+function pluck<T, K extends keyof T>(items: T[], key: K): T[K][] {
+  return items.map(item => item[key]);
+}
+const names = pluck(services, 'name');   // string[]
+pluck(services, 'nmae');                 // error: typo caught
+```
+
+## Generic React components
+
+```tsx
+type ListProps<T> = {
+  items: T[];
+  getKey: (item: T) => string;
+  renderItem: (item: T) => React.ReactNode;
+};
+
+function List<T>({ items, getKey, renderItem }: ListProps<T>) {
+  return <ul>{items.map(item => <li key={getKey(item)}>{renderItem(item)}</li>)}</ul>;
+}
+
+<List items={services} getKey={s => s.id} renderItem={s => s.name} /> // s is typed as Service
+```
+
+## Generic types and defaults
+
+```typescript
+type ApiResponse<T> = { data: T; error: null } | { data: null; error: string };
+type Paginated<T, Cursor = string> = { items: T[]; nextCursor: Cursor | null };
+```
+
+**When not to use generics:** if a type parameter appears only once, you probably don't need it. `function log<T>(x: T): void` is no better than `function log(x: unknown): void`.
+
+## Exercises
+
+- **3.1** Write `groupBy<T, K extends string>(items: T[], getKey: (item: T) => K): Record<K, T[]>`. Test it by grouping services by `location: 'in_person' | 'online'`.
+- **3.2** Write `sortBy<T>(items: T[], key: keyof T)`. Then improve it so `key` only accepts keys whose values are `string` or `number`. (Hint: this one is hard. Try for 15 minutes, then ask for help.)
+- **3.3** Build a generic `Select<T>` React component with `options: T[]`, `value: T | null`, `onChange: (value: T) => void` and `getLabel: (item: T) => string`. Use it to pick a service.
+- **3.4** Write a generic `Result<T, E = Error>` type as a discriminated union (`ok: true` / `ok: false`) and a function `safeJsonParse(text: string): Result<unknown>`.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What are generics, and what does `extends` do in a generic?"**
+
+> "A generic is a type parameter, like a function argument but for types. It lets me write one function or component that keeps the exact type of whatever the caller passes in, instead of losing it to `any`. `extends` adds a constraint: for example `T extends { id: string }` means T can be any type, as long as it has an `id`."

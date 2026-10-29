@@ -1,0 +1,93 @@
+---
+title: "Lesson 5: Real-world patterns"
+description: "Validate at the edges with Zod, infer types from one source, and share them between NestJS and Next.js."
+---
+
+This lesson ties everything together into how a professional full-stack TypeScript codebase is typed: validate at the edges, infer types from one source, and share them between backend and frontend.
+
+## Principle: types don't exist at runtime
+
+TypeScript disappears after compiling. Data from an API, a form or a database is not checked by types alone, so you validate it at the boundary and get the type from the validator. Zod does both.
+
+## Zod: one schema, both validation and type
+
+```typescript
+import { z } from 'zod';
+
+export const BookingRequestSchema = z.object({
+  serviceId: z.string().uuid(),
+  customerEmail: z.string().email(),
+  startsAt: z.coerce.date(),
+});
+export type BookingRequest = z.infer<typeof BookingRequestSchema>;
+// { serviceId: string; customerEmail: string; startsAt: Date }
+
+export const BookingSchema = BookingRequestSchema.extend({ id: z.string().uuid() });
+export type Booking = z.infer<typeof BookingSchema>;
+
+const result = BookingRequestSchema.safeParse(untrustedData);
+if (!result.success) {
+  console.error(result.error.issues);
+} else {
+  result.data.startsAt; // fully typed and validated
+}
+```
+
+This replaces the hand-written type guard from [Lesson 2](/docs/typescript/lesson-2-narrowing).
+
+## Sharing types between NestJS and Next.js
+
+Put schemas in a shared package (`packages/shared` in a monorepo with pnpm workspaces or Turborepo). Both apps import from it:
+
+```text
+apps/
+  api/   (NestJS)  -> imports @booking/shared
+  web/   (Next.js) -> imports @booking/shared
+packages/
+  shared/          -> Zod schemas + inferred types
+```
+
+In NestJS, validate request bodies with a Zod pipe (for example the `nestjs-zod` package) instead of duplicating class-validator DTOs. In Next.js, validate API responses with the same schema. When you change a field, both sides show errors immediately.
+
+## A typed fetch helper
+
+```typescript
+export async function apiGet<S extends z.ZodType>(
+  path: string,
+  schema: S,
+): Promise<z.infer<S>> {
+  const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}${path}`);
+  if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`);
+  return schema.parse(await res.json());
+}
+
+const booking = await apiGet('/bookings/123', BookingSchema); // typed as Booking
+```
+
+## Environment variables, typed once
+
+```typescript
+const EnvSchema = z.object({
+  DATABASE_URL: z.string().url(),
+  JWT_SECRET: z.string().min(32),
+  PORT: z.coerce.number().default(3000),
+});
+export const env = EnvSchema.parse(process.env); // app fails fast at startup if misconfigured
+```
+
+## Exercises
+
+- **5.1** Write a `ServiceSchema` and `CreateServiceSchema` (derived with `.omit()`) in Zod, and infer both types. Compare with how you'd do it using `Omit` from [Lesson 4](/docs/typescript/lesson-4-utility-types).
+- **5.2** Add `apiPost(path, body, requestSchema, responseSchema)` next to `apiGet`, where `body` must match the request schema's type.
+- **5.3** Create the typed `env` file for the booking platform backend. Remove one variable from your `.env` and confirm the app refuses to start with a clear error.
+- **5.4** Explain in your own words, in English: why validate at runtime if TypeScript already checks types? (This is a real interview question.)
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"Why validate at runtime if TypeScript already checks types?"**
+
+> "TypeScript types are erased at compile time, so they only check the code I wrote. Data from the network, users or the database arrives at runtime and can be anything. Runtime validation enforces the contract at the boundary, so bad data fails early with a clear error instead of causing a crash deep in the app."

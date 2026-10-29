@@ -1,0 +1,57 @@
+---
+title: "Shared rules"
+description: "The TypeScript rules and settings that apply in every project, whatever the framework."
+---
+
+These rules apply to every project: React, Next.js, Angular and NestJS. The framework pages after this one only add what is special to each framework.
+
+## 1. A strict `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true
+  }
+}
+```
+
+`strict` is the minimum. `noUncheckedIndexedAccess` catches "array might be empty" bugs ([Lesson 1](/docs/typescript/lesson-1-strict-mode)). Some framework starters ship with weaker settings (NestJS especially), so always check.
+
+## 2. Lint with type information
+
+Use `typescript-eslint` with its type-checked configs (`strictTypeChecked` if the team agrees). The rules that catch the most real bugs:
+
+| Rule | What it stops |
+| --- | --- |
+| `no-explicit-any` | `any` sneaking into your code |
+| `no-floating-promises` | Forgetting `await`, so errors disappear |
+| `no-misused-promises` | Passing an async function where a normal one is expected |
+| `no-unsafe-assignment` / `no-unsafe-member-access` | `any` values spreading through the code |
+| `switch-exhaustiveness-check` | A `switch` that forgets a union member |
+| `no-non-null-assertion` | Overusing `!` |
+
+## 3. Type-check in CI
+
+The dev server and most bundlers **don't** stop on type errors. Add `tsc --noEmit` (or the framework's own check) to CI so a type error fails the pull request.
+
+## 4. The coding rules
+
+1. **No `any`.** Use `unknown` for outside data and narrow it.
+2. **Validate at every boundary.** API responses, request bodies, forms, env vars, URL params, `localStorage`, LLM output: parse with Zod. A generic like `get<User>()` is only a promise, not a check.
+3. **One source of truth.** Infer types from Zod schemas or the Prisma client. Derive the rest with `Pick`, `Omit` and `Partial` ([Lesson 4](/docs/typescript/lesson-4-utility-types)). Never type the same shape twice by hand.
+4. **Model states with discriminated unions,** not a bag of optional fields and booleans ([Lesson 2](/docs/typescript/lesson-2-narrowing)).
+5. **Avoid `as` and `!`.** Each one is a place where you tell the compiler "trust me". Narrow instead. If you must cast, leave a comment explaining why.
+6. **Let inference work inside functions; be explicit at the edges.** Type function parameters, and the return types of exported functions and public APIs.
+7. **Prefer `as const` arrays or string-literal unions over `enum`** in new code. They are plain JavaScript and work with type-stripping tools. (Enums are still common in Angular and NestJS codebases; follow the team's style there.)
+8. **Use `import type`** for imports that are only types, but read the [NestJS page](/docs/typescript/best-practices/nestjs) first: there is one important exception.
+9. **Use `readonly`** for props, config and anything that shouldn't change after creation.
+
+## Interview answer
+
+**"How do you keep a large TypeScript codebase type-safe?"**
+
+> "I start with strict mode and `noUncheckedIndexedAccess`, and add typescript-eslint rules like `no-floating-promises` and `no-explicit-any`. Type checking runs in CI. In the code, I validate all outside data with Zod at the boundary and infer types from those schemas, so there's one source of truth. I model state with discriminated unions, and I avoid `any`, `as` and `!` unless there's a clear reason."

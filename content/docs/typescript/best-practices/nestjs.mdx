@@ -1,0 +1,129 @@
+---
+title: "NestJS"
+description: "Strict settings, validated DTOs, typed config, typed request users, interface tokens and safe responses in NestJS."
+---
+
+NestJS relies on decorators and runtime metadata, so some TypeScript habits work differently here. The most important rule: **a TypeScript type on a controller parameter does not validate the request.** Something must check it at runtime.
+
+## Turn strict mode on (the default is weak)
+
+Projects created with `nest new` (without `--strict`) often have `strictNullChecks: false` and `noImplicitAny: false`. Fix this on day one:
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true
+  }
+}
+```
+
+Keep the two decorator options: Nest needs them for dependency injection.
+
+## Validate every request body
+
+**Option A: Zod** (shares schemas with the frontend, see [Lesson 5](/docs/typescript/lesson-5-real-world)):
+
+```typescript
+import { createZodDto } from 'nestjs-zod';
+import { BookingRequestSchema } from '@booking/shared';
+
+export class CreateBookingDto extends createZodDto(BookingRequestSchema) {}
+
+@Post()
+create(@Body() dto: CreateBookingDto) { /* dto is validated */ }
+```
+
+Register `ZodValidationPipe` globally.
+
+**Option B: class-validator** (the classic Nest style):
+
+```typescript
+export class CreateBookingDto {
+  @IsUUID() serviceId!: string;
+  @IsEmail() customerEmail!: string;
+  @Type(() => Date) @IsDate() startsAt!: Date;
+}
+```
+
+Here `!` is an accepted exception: the validation pipe fills the fields, not a constructor. Turn on `whitelist: true` and `forbidNonWhitelisted: true` in the global `ValidationPipe`, so unknown fields are rejected.
+
+## Typed config
+
+Validate env vars at startup, then read them with types:
+
+```typescript
+ConfigModule.forRoot({ validate: (raw) => EnvSchema.parse(raw) });
+
+// in a service
+constructor(private config: ConfigService<Env, true>) {}
+
+const port = this.config.get('PORT', { infer: true });   // number
+```
+
+## The logged-in user
+
+Don't read `req.user` as `any`. Make a typed decorator:
+
+```typescript
+export type AuthUser = { id: string; businessId: string; role: Role };
+
+export const CurrentUser = createParamDecorator(
+  (_data: unknown, ctx: ExecutionContext): AuthUser => {
+    const req = ctx.switchToHttp().getRequest<{ user: AuthUser }>();
+    return req.user;
+  },
+);
+
+@Get('me')
+me(@CurrentUser() user: AuthUser) { /* user.businessId is typed */ }
+```
+
+## Interfaces need tokens
+
+Interfaces and types are erased at runtime, so Nest can't inject by interface. Use a token:
+
+```typescript
+export interface PaymentGateway { charge(amountCents: number): Promise<string> }
+export const PAYMENT_GATEWAY = Symbol('PAYMENT_GATEWAY');
+
+// module
+providers: [{ provide: PAYMENT_GATEWAY, useClass: StripeGateway }]
+
+// service
+constructor(@Inject(PAYMENT_GATEWAY) private payments: PaymentGateway) {}
+```
+
+## Watch out: `import type` can break DI
+
+Nest finds what to inject from the **runtime** class. If you write `import type { BookingsService }` and inject it in a constructor, the import is removed during compile and DI fails. Use a normal import for any class you inject. (Set the `consistent-type-imports` lint rule carefully, or turn it off for these files.)
+
+## Never return database models directly
+
+Map to a response type, so secrets don't leak:
+
+```typescript
+type PublicUser = Omit<User, 'passwordHash'>;
+
+function toPublicUser({ passwordHash: _, ...rest }: User): PublicUser {
+  return rest;
+}
+```
+
+With Prisma, use its generated types (`Prisma.BookingGetPayload<{ include: { service: true } }>`) instead of writing model types by hand.
+
+## Common mistakes
+
+- Keeping the weak default `tsconfig` from `nest new`.
+- Thinking `@Body() dto: CreateBookingDto` validates anything without a pipe.
+- `import type` for an injected service.
+- Returning the full user entity, including `passwordHash`.
+- `async` methods called without `await` (lint with `no-floating-promises`).
+
+## Interview answer
+
+**"Why can't NestJS inject a dependency by its interface?"**
+
+> "TypeScript interfaces only exist at compile time. They're removed from the JavaScript output, so at runtime Nest has nothing to look up. Nest uses the class itself as the injection token. For an interface, I create a token, like a Symbol, register the implementation with `provide` and `useClass`, and inject it with `@Inject(TOKEN)`. This also makes it easy to swap in a fake in tests."

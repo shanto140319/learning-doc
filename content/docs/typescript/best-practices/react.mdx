@@ -1,0 +1,123 @@
+---
+title: "React"
+description: "Typing props, state, refs, events, context and reducers in React 19."
+---
+
+Most React typing is simple: type the props, and let inference do the rest. These are the patterns that come up every day.
+
+## Props
+
+Use a plain function and a `type` for props. `React.FC` is not wrong, but a plain function is clearer and is what most teams use now.
+
+```tsx
+type ServiceCardProps = {
+  service: Pick<Service, 'id' | 'name' | 'durationMinutes'>;
+  onBook: (serviceId: string) => void;
+  children?: React.ReactNode;   // anything React can render
+};
+
+export function ServiceCard({ service, onBook, children }: ServiceCardProps) {
+  return (
+    <article>
+      <h3>{service.name}</h3>
+      <p>{service.durationMinutes} min</p>
+      {children}
+      <button onClick={() => onBook(service.id)}>Book</button>
+    </article>
+  );
+}
+```
+
+Only ask for the fields you use (`Pick`). Then the component works with any object that has them, and tests need less fake data.
+
+## Wrapping native elements
+
+Reuse the element's own props with `ComponentProps`, so `disabled`, `type`, `aria-*` and the rest all work:
+
+```tsx
+type ButtonProps = React.ComponentProps<'button'> & {
+  variant?: 'primary' | 'ghost';
+};
+
+export function Button({ variant = 'primary', ...rest }: ButtonProps) {
+  return <button data-variant={variant} {...rest} />;
+}
+```
+
+In React 19, `ref` is a normal prop for function components, so you no longer need `forwardRef`.
+
+## State
+
+Inference works when the initial value shows the type. Give the type yourself when it starts as `null` or an empty array:
+
+```tsx
+const [count, setCount] = useState(0);                          // number: inferred
+const [selected, setSelected] = useState<Service | null>(null); // must be explicit
+const [slots, setSlots] = useState<Date[]>([]);                 // never[] without it
+```
+
+For complex state, use `useReducer` with a discriminated union of actions:
+
+```tsx
+type Action =
+  | { type: 'select_service'; serviceId: string }
+  | { type: 'select_slot'; startsAt: Date }
+  | { type: 'reset' };
+```
+
+## Refs and events
+
+```tsx
+const inputRef = useRef<HTMLInputElement>(null);
+inputRef.current?.focus();        // current can be null before mount
+
+function handleChange(e: React.ChangeEvent<HTMLInputElement>) {
+  setEmail(e.target.value);
+}
+function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+  e.preventDefault();
+}
+```
+
+Tip: write the handler inline first, hover over `e` in your editor, then copy the type.
+
+## Context without `!`
+
+Create the context with `null`, then wrap it in a hook that throws a clear error. Callers get a non-null type and never need `!`:
+
+```tsx
+type BookingFlow = { serviceId: string | null; setServiceId: (id: string) => void };
+
+const BookingFlowContext = createContext<BookingFlow | null>(null);
+
+export function useBookingFlow() {
+  const ctx = useContext(BookingFlowContext);
+  if (ctx === null) throw new Error('useBookingFlow must be used inside BookingFlowProvider');
+  return ctx;   // type: BookingFlow
+}
+```
+
+## Custom hooks that return a tuple
+
+Add `as const`, or TypeScript infers an array of mixed types:
+
+```tsx
+function useToggle(initial = false) {
+  const [on, setOn] = useState(initial);
+  const toggle = () => setOn(v => !v);
+  return [on, toggle] as const;   // readonly [boolean, () => void]
+}
+```
+
+## Common mistakes
+
+- Typing API data by hand in the component instead of using the shared Zod type.
+- `useState([])` with no type, which gives `never[]`.
+- Using `any` for event handlers instead of the proper event type.
+- Lots of optional props and booleans (`isLoading`, `isError`, `data?`) instead of one union.
+
+## Interview answer
+
+**"How do you type a React component that wraps a native button?"**
+
+> "I take the button's own props with `React.ComponentProps<'button'>` and add my custom props with an intersection. Then everything a normal button accepts, like `disabled` or `aria-label`, still works and is type-checked. I spread the rest of the props onto the real button element."

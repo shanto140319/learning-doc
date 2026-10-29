@@ -1,0 +1,100 @@
+---
+title: "Phase 1: Production backend"
+description: "Months 1–3: Node.js, NestJS, PostgreSQL, security, testing, DevOps and Project 1."
+---
+
+Goal: by the end of January you can design, build, secure, test and deploy a production-grade NestJS + PostgreSQL backend with a Next.js frontend, and explain every decision in English. Topics marked *(when needed)* are learned when a project requires them, not up front.
+
+## Month 1 — Foundations: Node.js, API design, NestJS, PostgreSQL
+
+### Node.js and HTTP
+
+- Event loop, async/await pitfalls, `Promise.all` vs sequential calls, error handling, streams for large files
+- REST API design: resource naming, status codes, consistent error format, pagination (offset vs cursor), filtering and sorting, versioning, idempotency keys
+
+### NestJS core
+
+- Modules, providers, dependency injection and scopes, lifecycle hooks
+- The request lifecycle in order: middleware → guards → interceptors → pipes → controller → interceptors → exception filters
+- Validation with DTOs (class-validator) or Zod pipes; ConfigModule with validated environment variables
+- Swagger/OpenAPI docs generated from code; custom decorators such as `@CurrentUser()`
+- Structured logging (Pino) and health checks (Terminus)
+
+### PostgreSQL
+
+- Data modelling: normalisation, one-to-many and many-to-many relations, constraints (foreign key, unique, check), soft deletes
+- Indexes: B-tree, composite, partial and GIN; reading `EXPLAIN ANALYZE`; fixing N+1 queries
+- Transactions, isolation levels, row locking (`SELECT … FOR UPDATE`) and optimistic locking
+- Migrations, seeding and connection pooling
+- CTEs, window functions, JSONB and full-text search *(when needed)*
+
+### ORM
+
+- Prisma as your main ORM; TypeORM basics, since many existing NestJS codebases use it; raw SQL whenever the ORM gets in the way
+
+**Mini-build A (2 weekends): URL shortener API.** Short codes, click analytics per day, Swagger docs and tests. Add Redis caching and rate limiting in Month 2. It is also a classic system design interview question, so you'll have built one for real.
+
+## Month 2 — Production concerns
+
+### Auth and security
+
+- Password hashing (argon2), sessions vs JWT, access and refresh token rotation, Google login (OAuth), email verification and password reset flows
+- Authorisation: role-based access (RBAC), resource ownership checks, multi-tenant data isolation (every query scoped to an organisation)
+- OWASP Top 10 basics: SQL injection, XSS, CSRF, CORS, security headers (Helmet), secrets handling, rate limiting
+
+### Testing
+
+- Unit tests with Jest and mocked providers, integration tests against a real Postgres in Docker (Testcontainers), e2e tests with Supertest, Playwright for critical user flows
+
+### Caching and background work
+
+- Redis: cache-aside pattern, TTLs, invalidation, rate limiting, pub/sub
+- BullMQ queues: retries with backoff, delayed and scheduled jobs, dead-letter handling, idempotent job handlers
+- Transactional email through a queue (Resend or AWS SES)
+
+### Docker
+
+- Multi-stage Dockerfile for NestJS; docker-compose with Postgres and Redis for local development
+
+**Mini-build B (2 weekends): webhook delivery service.** Accepts events and delivers them to subscriber URLs with HMAC signatures, retries with exponential backoff, a dead-letter queue and a dashboard of delivery attempts. It teaches the reliability patterns interviewers probe in system design rounds.
+
+## Month 3 — Shipping to production
+
+### Cloud and DevOps
+
+- AWS essentials: IAM, ECS Fargate (or EC2), RDS Postgres, S3 with signed URLs, CloudFront; Next.js on Vercel
+- CI/CD with GitHub Actions: lint, type-check, test, build and deploy on merge
+- Observability: structured logs, error tracking with Sentry, uptime alerts; OpenTelemetry tracing *(when needed)*
+
+### Features almost every SaaS has
+
+- Stripe in test mode: checkout, subscriptions, webhooks with signature checks and idempotent handling, customer portal
+- Real-time updates with WebSockets (NestJS gateways) or Server-Sent Events
+- Direct-to-S3 uploads with background processing
+
+### Frontend: keep sharp (about 1 hour a week)
+
+- Next.js App Router: Server Components, server actions, caching and revalidation, streaming with Suspense
+- TanStack Query for server state, React Hook Form + Zod, Tailwind + shadcn/ui
+- React rendering behaviour, memoisation trade-offs, Core Web Vitals, accessibility basics
+
+**Project 1 (Months 2–4): multi-tenant booking platform.** Think "Calendly for small businesses": clinics, salons and tutors sign up, set staff availability, and customers book and pay online. It is full of problems real SaaS teams solve every day:
+
+- Workspaces with owner, admin and staff roles; invite teammates by email
+- Availability rules, time zones, and no double-booking enforced in Postgres (transactions or an exclusion constraint), not just in code
+- Online payment per booking with Stripe, plus subscription plans for businesses
+- Email reminders 24 hours before each booking (scheduled jobs) and calendar invites (.ics files)
+- Live dashboard updates when a new booking arrives (WebSockets)
+- Audit log, rate limiting, Swagger docs, tests, CI/CD, deployed on AWS + Vercel
+
+How to learn it: [Frontend Masters](https://frontendmasters.com/join/) for Node.js, API design, SQL and testing courses; the official NestJS, PostgreSQL and Stripe docs; *Use The Index, Luke* (free) for SQL indexing; the OWASP Top 10 for security; and an AI assistant as your code reviewer. Rule of thumb: 30% watching or reading, 70% building.
+
+## Phase 1 deliverables
+
+- [ ] Mini-build A and Mini-build B on GitHub, each with tests and a clear README
+- [ ] Project 1 MVP live: sign-up, workspaces and roles, availability, booking without double-booking, email reminders
+- [ ] CI badge, test suite and live Swagger docs for Project 1
+- [ ] One technical blog post (LinkedIn or dev.to), for example "How I prevented double bookings in Postgres"
+- [ ] 25 DSA problems solved in TypeScript (arrays, strings, hashing, two pointers)
+
+Checkpoint, end of January: can you explain every part of your backend out loud, in English, in 10 minutes? If not, spend the first two weeks of Phase 2 closing the gap.
