@@ -1,0 +1,136 @@
+---
+title: "Practice project: the booking API in NestJS"
+description: "Rebuild the plain-Node booking API in NestJS with modules, guards, validation, one error format, idempotency, config, Swagger, logs, health checks and tests."
+---
+
+Rebuild your [Node.js practice project](/docs/node-http/practice-project) in NestJS. Same features, same behaviour, but each concern now lives in the right building block. When you finish, compare the two codebases side by side: that comparison is a great blog post and interview story.
+
+Time: one Friday block (about 4 hours) plus one or two weekday sessions. Data stays in memory; Prisma and PostgreSQL come next.
+
+## Requirements
+
+### Endpoints
+
+| Endpoint | Who | Notes |
+| --- | --- | --- |
+| `GET /v1/services` | Public | List |
+| `POST /v1/services` | owner, admin | `CreateServiceDto`, 201 + `Location` |
+| `PATCH /v1/services/:id` | owner, admin | `UpdateServiceDto` (`PartialType`) |
+| `DELETE /v1/services/:id` | owner | 204 |
+| `GET /v1/bookings` | Any logged-in user | `ListBookingsQuery`: cursor pagination, filters, sort allow-list. Scoped to the user's business |
+| `POST /v1/bookings` | Public (customers book) | `CreateBookingDto`, `Idempotency-Key` required, 409 `slot-taken` |
+| `GET /v1/bookings/:id` | Any logged-in user | 404 for other businesses' bookings |
+| `POST /v1/bookings/:id/cancel` | Any logged-in user | 409 `already-cancelled` |
+| `GET /v1/bookings/export` | owner, admin | CSV stream (`StreamableFile` or `@Res()` + `pipeline`) |
+| `GET /v1/audit-log` | owner | From Lesson 8 |
+| `GET /health/live`, `GET /health/ready` | Public | Terminus |
+| `GET /docs` | Public (dev) | Swagger |
+
+### Quality checklist
+
+- [ ] Feature modules: `services`, `bookings`, `audit`, `health`, plus `common/` and `config/`
+- [ ] Controller → service → repository in each feature; controllers have no business logic
+- [ ] `AuthGuard` and `RolesGuard` registered with `APP_GUARD`; `@Public()` and `@Auth(...)` decorators
+- [ ] Global `ValidationPipe` (`whitelist`, `forbidNonWhitelisted`, `transform`) with field errors
+- [ ] One global `ProblemDetailsFilter`: **every** error has the same shape and `application/problem+json`
+- [ ] Responses mapped with `toXResponse()` functions; no internal fields
+- [ ] `@CurrentUser('businessId')` passed into services; no cross-tenant access
+- [ ] Idempotency for `POST /v1/bookings` as an **interceptor** (see the scaffold below)
+- [ ] `ConfigModule` with Zod validation, `.env.example` committed
+- [ ] Swagger with the CLI plugin, success and error responses documented
+- [ ] nestjs-pino with request IDs and redaction; no `console.log`
+- [ ] `enableShutdownHooks()`, Helmet, CORS from config, URI versioning
+- [ ] Unit tests: `BookingsService` (create, cancel), `RolesGuard`, the idempotency interceptor
+- [ ] One e2e test with Supertest (the `test/app.e2e-spec.ts` file `nest new` created): create a booking, replay with the same key, get the same ID
+- [ ] `strict` TypeScript, no `any`
+
+## Scaffold: the idempotency interceptor
+
+You built this as a function in the Node project. As an interceptor, it applies to any route with one decorator. Fill in the `TODO`s:
+
+```typescript
+// src/common/idempotency/idempotency.interceptor.ts
+import { CallHandler, ExecutionContext, Injectable, NestInterceptor } from '@nestjs/common';
+import { Observable, of, tap } from 'rxjs';
+import { createHash } from 'node:crypto';
+import type { Request, Response } from 'express';
+import { IdempotencyStore } from './idempotency.store';
+
+@Injectable()
+export class IdempotencyInterceptor implements NestInterceptor {
+  constructor(private readonly store: IdempotencyStore) {}
+
+  async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<unknown>> {
+    const http = context.switchToHttp();
+    const req = http.getRequest<Request>();
+    const res = http.getResponse<Response>();
+
+    const key = req.headers['idempotency-key'];
+    // TODO 1: if the key is missing or invalid → throw BadRequestException
+
+    const requestHash = createHash('sha256').update(JSON.stringify(req.body)).digest('hex');
+    const scope = /* TODO 2: the tenant (business ID) or 'public' + the route, so keys can't clash */ '';
+
+    const existing = await this.store.get(scope, key as string);
+    if (existing) {
+      // TODO 3: different hash → 422; still processing → 409; completed → set res.status and return of(existing.body)
+    }
+
+    await this.store.start(scope, key as string, requestHash);   // TODO 4: what if two requests race here?
+
+    return next.handle().pipe(
+      tap({
+        next: (body) => {
+          // TODO 5: save status + body as completed
+        },
+        error: () => {
+          // TODO 6: delete the key so the client can retry
+        },
+      }),
+    );
+  }
+}
+
+// usage on the route:
+// @UseInterceptors(IdempotencyInterceptor)
+// @Post()
+// create(...) {}
+```
+
+Questions to answer in your README:
+
+- Why does the interceptor run **after** the guard but **before** the ValidationPipe, and does that matter here?
+- What changes when you move the store from a `Map` to PostgreSQL? (Hint: unique constraint, Node Lesson 7.)
+
+## Suggested order
+
+1. Project setup: strict, `main.ts`, config (Lessons 1, 6).
+2. Services module with CRUD and DTOs (Lessons 1, 2, 5).
+3. Global filter and validation errors (Lessons 4, 5). Do this **early**, so every later error is already in the right format.
+4. Guards and decorators (Lessons 4, 6).
+5. Bookings module with pagination and tenant scoping.
+6. Idempotency interceptor.
+7. Logging, request context, audit log, health (Lesson 8).
+8. Swagger (Lesson 7).
+9. Tests.
+
+## Test checklist
+
+Run the same 11 checks as the [Node practice project](/docs/node-http/practice-project#test-checklist), plus:
+
+1. No token on `POST /v1/services` → 401. `token-staff` → 403. `token-owner` → 201. All in problem+json.
+2. `token-owner` of `biz_1` asks for a `biz_2` booking → 404.
+3. `GET /v1/bookings?limit=abc` → field error for `limit`.
+4. Body with an extra `"status": "cancelled"` field → rejected.
+5. Every response has `X-Request-Id`, and the same ID is in the log line.
+6. Stop the fake database (`FAKE_DB_DOWN=true`) → `/health/ready` 503, `/health/live` 200.
+7. Swagger: you can authorise and run every endpoint from `/docs`.
+8. `npm test` and `npm run test:e2e` both pass.
+
+## When you're done
+
+1. Push to GitHub with a README: how to run, endpoint list, architecture diagram (modules and the request lifecycle), and the design decisions.
+2. Paste the filter, the guards, the interceptor and one service into Claude for a **scored code review**.
+3. Ask Claude for a **10-question NestJS quiz** with at least two "what runs first?" lifecycle questions and one "fix this DI error" question. **Score 8 or more** to move on to PostgreSQL and Prisma.
+4. Blog post idea: "The same API in plain Node.js and NestJS: what the framework actually does for you".
+5. Update the progress box on the [section home page](/docs/nestjs).

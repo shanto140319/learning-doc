@@ -1,0 +1,246 @@
+---
+title: "Lesson 6: Config and custom decorators"
+description: "Validated environment variables with ConfigModule, namespaced config, secrets handling, and custom parameter and composed decorators."
+---
+
+Two small topics that every production NestJS app has. **Config:** the app should refuse to start when an environment variable is missing or wrong, instead of crashing at 3 a.m. on the first payment. **Custom decorators:** they keep controllers short and readable, like `@CurrentUser()` and `@Auth('owner')`.
+
+## Part 1: Config
+
+```powershell
+npm i @nestjs/config zod
+```
+
+### Why validate at startup?
+
+Without validation, a typo in `DATABSE_URL` gives you `undefined`, and the app starts fine. The error appears later, deep inside a request, with a confusing message. With validation, the app **fails immediately at deploy**, the health check fails, and the old version keeps running. That's called **failing fast**.
+
+### The env schema
+
+```typescript
+// src/config/env.ts
+import { z } from 'zod';
+
+export const EnvSchema = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  PORT: z.coerce.number().int().default(3000),          // env vars are strings; coerce to number
+  DATABASE_URL: z.string().url(),
+  REDIS_URL: z.string().url(),
+  JWT_SECRET: z.string().min(32),
+  CORS_ORIGINS: z.string().transform((s) => s.split(',').map((o) => o.trim())),
+  STRIPE_SECRET_KEY: z.string().startsWith('sk_'),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+});
+
+export type Env = z.infer<typeof EnvSchema>;
+
+export function validateEnv(raw: Record<string, unknown>): Env {
+  const result = EnvSchema.safeParse(raw);
+  if (!result.success) {
+    // Print which variables are wrong, but never their values (they may be secrets)
+    const problems = result.error.issues.map((i) => `  - ${i.path.join('.')}: ${i.message}`).join('\n');
+    throw new Error(`Invalid environment variables:\n${problems}`);
+  }
+  return result.data;
+}
+```
+
+```typescript
+// src/app.module.ts
+@Module({
+  imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,            // inject ConfigService anywhere without importing ConfigModule
+      cache: true,               // read process.env once
+      validate: validateEnv,     // runs at startup; throwing stops the app
+      envFilePath: ['.env.local', '.env'],   // first file wins for duplicate keys
+    }),
+    // ...
+  ],
+})
+export class AppModule {}
+```
+
+### Reading config with types
+
+```typescript
+@Injectable()
+export class PaymentsService {
+  constructor(private readonly config: ConfigService<Env, true>) {}
+
+  private stripeKey(): string {
+    return this.config.get('STRIPE_SECRET_KEY', { infer: true });   // typed as string
+  }
+}
+```
+
+`ConfigService<Env, true>`: the second parameter `true` says "validation already happened, so values are never `undefined`". With `{ infer: true }`, TypeScript knows each key's type, and a typo in a key name is a compile error.
+
+In `main.ts`:
+
+```typescript
+const app = await NestFactory.create(AppModule);
+const config = app.get(ConfigService<Env, true>);
+app.enableCors({ origin: config.get('CORS_ORIGINS', { infer: true }), credentials: true });
+await app.listen(config.get('PORT', { infer: true }));
+```
+
+And in other modules' `forRootAsync` (Lesson 3):
+
+```typescript
+JwtModule.registerAsync({
+  inject: [ConfigService],
+  useFactory: (config: ConfigService<Env, true>) => ({
+    secret: config.get('JWT_SECRET', { infer: true }),
+    signOptions: { expiresIn: '15m' },
+  }),
+}),
+```
+
+### Namespaced config (for bigger apps)
+
+Group related settings, and inject only the group a module needs:
+
+```typescript
+// src/config/stripe.config.ts
+import { registerAs, ConfigType } from '@nestjs/config';
+
+export const stripeConfig = registerAs('stripe', () => ({
+  secretKey: process.env.STRIPE_SECRET_KEY!,       // already validated by validateEnv
+  webhookSecret: process.env.STRIPE_WEBHOOK_SECRET!,
+  currency: 'usd',
+}));
+
+// payments.module.ts
+imports: [ConfigModule.forFeature(stripeConfig)]
+
+// payments.service.ts
+constructor(
+  @Inject(stripeConfig.KEY) private readonly stripe: ConfigType<typeof stripeConfig>,
+) {}
+// this.stripe.secretKey is a string
+```
+
+Tests become easy: `{ provide: stripeConfig.KEY, useValue: { secretKey: 'sk_test_x', ... } }`.
+
+### Rules for env files and secrets
+
+- **Commit `.env.example`** with every variable name and fake values. **Never commit `.env`.** Check that `.env` is in `.gitignore` before your first commit.
+- In production, don't use `.env` files. Real environment variables come from the platform: ECS task definitions, AWS Secrets Manager or Parameter Store, Vercel settings (Month 3).
+- **Never log config objects**, and never send secrets to the frontend. Only values prefixed with `NEXT_PUBLIC_` belong in a Next.js browser bundle, and they're public by definition.
+- Don't read `process.env` all over your code. Read it in one place (the schema), then use `ConfigService`.
+- If a secret is ever committed or logged, **rotate it** (create a new one at the provider). Removing it from git history is not enough.
+
+## Part 2: Custom decorators
+
+### Parameter decorators
+
+The [best-practices page](/docs/typescript/best-practices/nestjs) showed a basic `@CurrentUser()`. Here's a version that can also pick one field:
+
+```typescript
+// src/common/auth/current-user.decorator.ts
+import { createParamDecorator, ExecutionContext, UnauthorizedException } from '@nestjs/common';
+import type { AuthUser } from './auth.guard';
+
+export const CurrentUser = createParamDecorator(
+  (field: keyof AuthUser | undefined, ctx: ExecutionContext) => {
+    const req = ctx.switchToHttp().getRequest<{ user?: AuthUser }>();
+    if (!req.user) throw new UnauthorizedException();   // used on a @Public() route by mistake
+    return field ? req.user[field] : req.user;
+  },
+);
+```
+
+```typescript
+@Get()
+list(@CurrentUser('businessId') businessId: string, @Query() query: ListBookingsQuery) {
+  return this.bookingsService.list(businessId, query);   // every query is scoped to the tenant
+}
+
+@Get('me')
+me(@CurrentUser() user: AuthUser) {
+  return user;
+}
+```
+
+Passing `businessId` from the controller into the service, as a normal argument, is the simplest way to do multi-tenancy without request-scoped providers (Lesson 3). The service can't "forget" the tenant, because the argument is required.
+
+A decorator for the idempotency key header:
+
+```typescript
+export const IdempotencyKey = createParamDecorator((_: unknown, ctx: ExecutionContext): string => {
+  const key = ctx.switchToHttp().getRequest<Request>().headers['idempotency-key'];
+  if (typeof key !== 'string' || key.length < 10 || key.length > 100) {
+    throw new BadRequestException('A valid Idempotency-Key header is required');
+  }
+  return key;
+});
+
+@Post()
+create(@Body() dto: CreateBookingDto, @IdempotencyKey() key: string) {}
+```
+
+### Composed decorators with `applyDecorators`
+
+Routes often need the same group of decorators. Combine them into one:
+
+```typescript
+// src/common/auth/auth.decorator.ts
+import { applyDecorators, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiForbiddenResponse, ApiUnauthorizedResponse } from '@nestjs/swagger';
+
+export function Auth(...roles: Role[]) {
+  return applyDecorators(
+    Roles(roles),                                       // metadata from Lesson 4
+    UseGuards(RolesGuard),
+    ApiBearerAuth(),                                    // Swagger: shows the lock icon (Lesson 7)
+    ApiUnauthorizedResponse({ description: 'Missing or invalid token' }),
+    ApiForbiddenResponse({ description: `Requires role: ${roles.join(' or ') || 'any'}` }),
+  );
+}
+```
+
+```typescript
+@Auth('owner', 'admin')
+@Post()
+create(@Body() dto: CreateServiceDto) {}
+```
+
+One line says who can call the route, enforces it, and documents it. (If `RolesGuard` is already global via `APP_GUARD`, leave `UseGuards(RolesGuard)` out.)
+
+### The three kinds of decorators, summarised
+
+| Kind | Made with | Example | Read by |
+| --- | --- | --- | --- |
+| Parameter | `createParamDecorator` | `@CurrentUser()`, `@IdempotencyKey()` | Nest, when calling your method |
+| Metadata | `Reflector.createDecorator` or `SetMetadata` | `@Roles(['owner'])`, `@Public()` | Guards and interceptors, via `Reflector` |
+| Composed | `applyDecorators` | `@Auth('owner')` | (Combines the others) |
+
+## Common mistakes
+
+- `process.env.X` scattered through the code, with no validation.
+- Committing `.env`, or printing config in logs.
+- `ConfigService` without the `Env` type: everything is `any`.
+- Business logic in decorators. They should only read from the request.
+- A `@CurrentUser()` that returns `undefined` silently on a public route.
+
+## Exercises
+
+- **6.1** 🟢 Add `ConfigModule` with the Zod schema (start with `PORT`, `NODE_ENV`, `CORS_ORIGINS`, `JWT_SECRET`). Create `.env` and `.env.example`. Start the app with `JWT_SECRET=short` and copy the error into your notes.
+- **6.2** 🟡 Use `ConfigService` in `main.ts` for the port and CORS origins. Move `BOOKING_RULES` (Lesson 3) into config with `registerAs('booking', ...)`, reading `BOOKING_MIN_NOTICE_MINUTES` from the env.
+- **6.3** 🟡 Write `@CurrentUser()` with the optional field argument, and change `BookingsService.list` and `create` to take `businessId` as their first argument. Make sure a booking from `biz_2` is never returned to a `biz_1` user (return 404, not 403).
+- **6.4** 🔴 Write the `@Auth(...roles)` composed decorator and use it on all write routes for services. Then write a unit test for `RolesGuard` using a fake `ExecutionContext` (hint: an object with `getHandler`, `getClass` and `switchToHttp: () => ({ getRequest: () => ({ user }) })`) and a real `Reflector`.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you manage configuration and secrets in NestJS?"**
+
+> "I use ConfigModule with a validation schema, usually Zod, so the app fails at startup if a variable is missing or has the wrong format, instead of failing later during a request. I read config through a typed ConfigService, never `process.env` directly in business code, and group settings with `registerAs` in bigger apps. Locally, values come from a `.env` file that's in `.gitignore`, with a committed `.env.example`. In production, they come from the platform, like AWS Secrets Manager or the ECS task definition. I never log secrets, and if one leaks, I rotate it."
+
+**"What are custom decorators useful for in NestJS?"**
+
+> "They remove repetition and make intent clear. A parameter decorator like `@CurrentUser()` reads the authenticated user from the request, so controllers don't touch the raw request. Metadata decorators like `@Roles('owner')` attach information that guards read with the Reflector. And `applyDecorators` combines several into one, so `@Auth('owner')` can set the roles, apply the guard and add the Swagger docs in a single line."

@@ -1,0 +1,218 @@
+---
+title: "Lesson 7: Swagger and OpenAPI"
+description: "Generate API docs from your code, document DTOs, responses, errors and auth, and generate typed clients for the Next.js frontend."
+---
+
+API documentation that's written by hand goes out of date in a week. With `@nestjs/swagger`, the docs are generated **from your code**: routes, DTOs, validation rules and responses. Reviewers of your portfolio projects will open `/docs` first, so it's worth doing well.
+
+## OpenAPI and Swagger: the words
+
+- **OpenAPI** is a standard JSON/YAML format that describes an HTTP API: endpoints, parameters, bodies, responses and auth.
+- **Swagger UI** is a web page that displays an OpenAPI document and lets you send requests from the browser.
+- `@nestjs/swagger` builds the OpenAPI document from your controllers and DTOs, and serves Swagger UI.
+
+Because OpenAPI is a standard, the same document can generate **typed frontend clients**, Postman collections and contract tests.
+
+## Setup
+
+```powershell
+npm i @nestjs/swagger
+```
+
+```typescript
+// src/main.ts (after creating the app)
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+
+const swaggerConfig = new DocumentBuilder()
+  .setTitle('Bookly API')
+  .setDescription('Multi-tenant booking platform for small businesses')
+  .setVersion('1.0')
+  .addBearerAuth()                       // the "Authorize" button for JWTs
+  .build();
+
+const document = SwaggerModule.createDocument(app, swaggerConfig);
+SwaggerModule.setup('docs', app, document);   // UI at /docs, JSON at /docs-json
+```
+
+Open http://localhost:3000/docs. You'll see your endpoints, but with empty bodies. The CLI plugin fixes that.
+
+## The CLI plugin: less decorator noise
+
+Without the plugin, you need `@ApiProperty()` on every DTO field. With it, Nest reads your TypeScript types and class-validator decorators at compile time:
+
+```json
+// nest-cli.json
+{
+  "compilerOptions": {
+    "plugins": [
+      {
+        "name": "@nestjs/swagger",
+        "options": { "classValidatorShim": true, "introspectComments": true }
+      }
+    ]
+  }
+}
+```
+
+- `classValidatorShim`: `@MaxLength(100)` shows up as `maxLength: 100` in the docs, `@IsOptional()` makes the field optional.
+- `introspectComments`: a `/** comment */` above a field becomes its description.
+
+The plugin only reads files ending in `.dto.ts` or `.entity.ts` by default, so name your DTO files that way (rename `list-bookings.query.ts` to `list-bookings-query.dto.ts`). Restart `npm run start:dev` after changing `nest-cli.json`.
+
+```typescript
+export class CreateBookingDto {
+  /** The service to book. */
+  @IsUUID()
+  serviceId!: string;
+
+  /**
+   * Start time in UTC, ISO 8601.
+   * @example "2026-11-03T10:00:00Z"
+   */
+  @Type(() => Date)
+  @IsDate()
+  startsAt!: Date;
+}
+```
+
+Add `@ApiProperty()` by hand only when you need more: an example, an enum name, or a format the plugin can't infer:
+
+```typescript
+@ApiProperty({ enum: ['confirmed', 'cancelled'], enumName: 'BookingStatus' })
+status!: 'confirmed' | 'cancelled';
+```
+
+## Documenting controllers
+
+```typescript
+@ApiTags('Bookings')                                // groups endpoints in the UI
+@Controller('bookings')
+export class BookingsController {
+  @Post()
+  @ApiOperation({ summary: 'Create a booking' })
+  @ApiHeader({ name: 'Idempotency-Key', required: true, description: 'A unique UUID per user action' })
+  @ApiCreatedResponse({ type: BookingResponseDto })
+  @ApiConflictResponse({ type: ProblemDto, description: 'Slot already booked (type: slot-taken)' })
+  @ApiUnprocessableEntityResponse({ type: ProblemDto, description: 'Validation failed' })
+  create(@Body() dto: CreateBookingDto, @IdempotencyKey() key: string) {}
+
+  @Get(':id')
+  @ApiOkResponse({ type: BookingResponseDto })
+  @ApiNotFoundResponse({ type: ProblemDto })
+  findOne(@Param('id', ParseUUIDPipe) id: string) {}
+}
+```
+
+### Response classes
+
+Swagger needs **classes** at runtime to describe responses (TypeScript types disappear, as you know). So for documented responses, write response DTO classes:
+
+```typescript
+// src/bookings/dto/booking-response.dto.ts
+export class BookingResponseDto {
+  id!: string;
+  serviceId!: string;
+  customerEmail!: string;
+  /** @example "2026-11-03T10:00:00Z" */
+  startsAt!: string;
+  @ApiProperty({ enum: ['confirmed', 'cancelled'], enumName: 'BookingStatus' })
+  status!: 'confirmed' | 'cancelled';
+}
+```
+
+Your `toBookingResponse()` mapper from Lesson 5 can return this type. Write one `ProblemDto` class matching `ApiError` and use it for all error responses.
+
+### Generic paginated responses
+
+`{ data: BookingResponseDto[], nextCursor: string | null }` is generic, and Swagger doesn't understand TypeScript generics. A common helper:
+
+```typescript
+// src/common/swagger/api-paginated-response.ts
+import { applyDecorators, Type } from '@nestjs/common';
+import { ApiExtraModels, ApiOkResponse, getSchemaPath } from '@nestjs/swagger';
+
+export function ApiPaginatedResponse<T extends Type<unknown>>(model: T) {
+  return applyDecorators(
+    ApiExtraModels(model),
+    ApiOkResponse({
+      schema: {
+        type: 'object',
+        required: ['data', 'nextCursor'],
+        properties: {
+          data: { type: 'array', items: { $ref: getSchemaPath(model) } },
+          nextCursor: { type: 'string', nullable: true },
+        },
+      },
+    }),
+  );
+}
+
+// usage
+@Get()
+@ApiPaginatedResponse(BookingResponseDto)
+list(@Query() query: ListBookingsQuery) {}
+```
+
+## Auth in Swagger
+
+`.addBearerAuth()` in `DocumentBuilder` plus `@ApiBearerAuth()` on routes (your `@Auth()` decorator from Lesson 6 adds it) shows a lock icon. Click **Authorize**, paste `token-owner`, and Swagger sends `Authorization: Bearer token-owner` with every request.
+
+## Protect or hide the docs in production
+
+Public API docs show attackers every endpoint. Options:
+
+- Serve `/docs` only when `NODE_ENV !== 'production'`.
+- Or protect it with basic auth or an IP allow-list.
+- For a public API (like Stripe's), publishing docs is the point, but then publish a reviewed, static copy.
+
+For your **portfolio**, keep docs public on the demo deployment. Reviewers want to click around.
+
+## Typed frontend clients from OpenAPI
+
+The OpenAPI JSON can generate TypeScript types for your Next.js app, so the frontend breaks at compile time when the API changes:
+
+```powershell
+# in the Next.js project
+npm i -D openapi-typescript
+npm i openapi-fetch
+npx openapi-typescript http://localhost:3000/docs-json -o src/lib/api-types.ts
+```
+
+```typescript
+// src/lib/api.ts (Next.js)
+import createClient from 'openapi-fetch';
+import type { paths } from './api-types';
+
+export const api = createClient<paths>({ baseUrl: process.env.NEXT_PUBLIC_API_URL });
+
+const { data, error } = await api.GET('/v1/bookings/{id}', {
+  params: { path: { id: bookingId } },
+});
+// data is typed as BookingResponseDto; error as ProblemDto
+```
+
+Typos in paths, wrong parameters or missing fields are now compile errors. This is an alternative to sharing Zod schemas in a monorepo (TypeScript Lesson 5); it also works when frontend and backend are in different repositories. Many teams run the generation step in CI and fail the build if the generated file changed but wasn't committed.
+
+## Common mistakes
+
+- DTO files not named `*.dto.ts`, so the CLI plugin ignores them and bodies show as empty.
+- Using TypeScript `type`s for responses: Swagger can't see them. Use classes.
+- Documenting only success responses. Interviewers and frontend developers care about errors too.
+- Docs that don't match reality because a route uses `@Res()` without types, or returns something different from `@ApiOkResponse`.
+
+## Exercises
+
+- **7.1** 🟢 Set up Swagger with the CLI plugin. Check that `CreateServiceDto` shows all fields with their limits, and that you can create a service from the UI.
+- **7.2** 🟡 Add `BookingResponseDto` and `ProblemDto`, and document every bookings route with success and error responses. Add `/** */` comments and examples to the DTO fields.
+- **7.3** 🟡 Add `ApiPaginatedResponse` to `GET /v1/bookings`, and make Swagger show the `status`, `from`, `to`, `limit`, `cursor` and `sort` query parameters with their allowed values.
+- **7.4** 🔴 Create a tiny Next.js page (or a plain TypeScript script) that uses `openapi-typescript` and `openapi-fetch` to list bookings. Then rename a field in `BookingResponseDto`, regenerate, and see the compile error. Write down what this would save you in a real team.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you document your APIs?"**
+
+> "I generate OpenAPI docs from the code with `@nestjs/swagger` and its CLI plugin, so DTOs and validation rules appear automatically and the docs can't drift from the implementation. I document error responses as well as success, with a shared problem-details schema, and use a small decorator for paginated responses. The OpenAPI JSON is also useful beyond docs: I generate typed clients for the frontend with openapi-typescript, so an API change that breaks the frontend fails at compile time instead of in production."

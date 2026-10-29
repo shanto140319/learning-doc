@@ -1,0 +1,399 @@
+---
+title: "Lesson 4: The request lifecycle"
+description: "Middleware, guards, interceptors, pipes and exception filters: what each one is for, the order they run in, and how to bind them."
+---
+
+This is the most important NestJS lesson, and the most common NestJS interview question: "What happens to a request, step by step?" Each building block has **one job**. Once you know which job goes where, NestJS code becomes easy to read and write.
+
+## The order
+
+```text
+Incoming request
+  │
+  ▼
+1. Middleware          global (app.use), then module middleware
+  │
+  ▼
+2. Guards              global → controller → route
+  │
+  ▼
+3. Interceptors (before)  global → controller → route
+  │
+  ▼
+4. Pipes               global → controller → route → each parameter
+  │
+  ▼
+5. Route handler       your controller method → service → …
+  │
+  ▼
+6. Interceptors (after)   route → controller → global   (reverse order)
+  │
+  ▼
+Response
+
+If anything throws (guard, interceptor, pipe, handler):
+  → 7. Exception filters   route → controller → global; the first matching filter handles it
+```
+
+A way to remember it: **"My Guard Is Pretty Cool, Finally"**: Middleware, Guards, Interceptors, Pipes, Controller, Filters.
+
+## What each one is for
+
+| Building block | Its one job | Knows which handler will run? | Booking platform examples |
+| --- | --- | --- | --- |
+| **Middleware** | Generic request/response work, before routing | ❌ No | Request ID, Helmet, CORS, raw body for webhooks |
+| **Guard** | **Can this request continue?** (true/false) | ✅ Yes | Is the user logged in? Do they have the `owner` role? |
+| **Interceptor** | Wrap the handler: run code before **and** after, change the result or error | ✅ Yes | Timing logs, timeouts, caching, idempotency replay |
+| **Pipe** | **Transform or validate** one input value | ✅ (per argument) | Validate DTOs, `ParseUUIDPipe`, parse a cursor |
+| **Exception filter** | **Turn an error into an HTTP response** | ✅ Yes | Your `ApiError` / problem+json format |
+
+The key difference between middleware and guards: middleware runs **before Nest knows which controller method will handle the request**, so it can't read decorators like `@Roles('owner')`. Guards can, through the `ExecutionContext`. So **authorisation belongs in guards**, not middleware.
+
+## The `ExecutionContext`
+
+Guards, interceptors and filters receive a context object that describes the current request:
+
+```typescript
+context.switchToHttp().getRequest<Request>();   // the Express request
+context.switchToHttp().getResponse<Response>();
+context.getHandler();                           // the controller method (to read its decorators)
+context.getClass();                             // the controller class
+context.getType();                              // 'http' | 'ws' | 'rpc' (WebSockets in Month 3)
+```
+
+Because it's generic, the same guard can protect HTTP routes and WebSocket gateways.
+
+## 1. Middleware: request ID
+
+```typescript
+// src/common/middleware/request-id.middleware.ts
+import { Injectable, NestMiddleware } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import type { Request, Response, NextFunction } from 'express';
+
+@Injectable()
+export class RequestIdMiddleware implements NestMiddleware {
+  use(req: Request, res: Response, next: NextFunction) {
+    const incoming = req.headers['x-request-id'];
+    const id = typeof incoming === 'string' && incoming.length <= 100 ? incoming : randomUUID();
+    req.headers['x-request-id'] = id;   // so later code can read it
+    res.setHeader('X-Request-Id', id);
+    next();                             // must call next(), or the request hangs
+  }
+}
+```
+
+Register it in a module:
+
+```typescript
+@Module({ /* ... */ })
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer.apply(RequestIdMiddleware).forRoutes(BookingsController, ServicesController);
+  }
+}
+```
+
+For middleware that must run on **every** route, a plain function in `main.ts` is simplest: `app.use(requestId)`. (Lesson 8 shows that `nestjs-pino` creates request IDs for you.)
+
+## 2. Guards: authentication and roles
+
+A guard returns `true` (continue) or `false` (stop with `403 Forbidden`). Or it throws a specific exception, such as `UnauthorizedException` (401).
+
+Real JWT authentication comes in Month 2. For now, a simple fake: the token is just a user ID.
+
+```typescript
+// src/common/auth/auth.guard.ts
+export type Role = 'owner' | 'admin' | 'staff';
+export type AuthUser = { id: string; businessId: string; role: Role };
+
+const FAKE_USERS: Record<string, AuthUser> = {
+  'token-owner': { id: 'u1', businessId: 'biz_1', role: 'owner' },
+  'token-staff': { id: 'u2', businessId: 'biz_1', role: 'staff' },
+};
+
+// Mark routes that skip auth. @Public() takes no argument, so store `true` with SetMetadata.
+export const IS_PUBLIC_KEY = 'isPublic';
+export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
+
+@Injectable()
+export class AuthGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [context.getHandler(), context.getClass()]);
+    if (isPublic) return true;
+
+    const req = context.switchToHttp().getRequest<Request & { user?: AuthUser }>();
+    const token = req.headers.authorization?.replace(/^Bearer /, '');
+    const user = token ? FAKE_USERS[token] : undefined;
+    if (!user) throw new UnauthorizedException('Missing or invalid token');
+
+    req.user = user;          // later steps (guards, decorators, handlers) can read it
+    return true;
+  }
+}
+```
+
+```typescript
+// src/common/auth/roles.guard.ts
+export const Roles = Reflector.createDecorator<Role[]>();
+
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    // Method decorator wins over class decorator
+    const required = this.reflector.getAllAndOverride(Roles, [context.getHandler(), context.getClass()]);
+    if (!required || required.length === 0) return true;     // no @Roles → any logged-in user
+
+    const { user } = context.switchToHttp().getRequest<{ user: AuthUser }>();
+    return required.includes(user.role);                     // false → 403
+  }
+}
+```
+
+Using them:
+
+```typescript
+@Controller('services')
+export class ServicesController {
+  @Public()
+  @Get()
+  findAll() { /* anyone can see the price list */ }
+
+  @Roles(['owner', 'admin'])
+  @Post()
+  create(@Body() dto: CreateServiceDto) { /* staff can't create services */ }
+}
+```
+
+Two ways to make metadata decorators:
+
+- `Reflector.createDecorator<Role[]>()` creates a typed decorator and its key in one line. It stores **the argument you pass**, so it suits decorators with a value: `@Roles(['owner'])`.
+- `SetMetadata(KEY, value)` stores a fixed value under a key you choose. Use it for flag decorators with no argument, like `@Public()`. (With `createDecorator`, `@Public()` would store `undefined`, and the route would not be public.)
+
+Guards answer "may this user call this route?". Checks that need data, like "does this booking belong to the user's business?", usually go in the service, because the service loads the booking anyway.
+
+## 3. Interceptors: code around the handler
+
+An interceptor wraps the handler. Code before `next.handle()` runs before the handler; operators on the result run after.
+
+Nest uses **RxJS** here. You only need a few pieces:
+
+- `next.handle()` returns an **Observable**: think of it as a promise of the handler's result.
+- `.pipe(...)` adds steps to run on the result.
+- `tap(fn)`: do something with the result without changing it (logging).
+- `map(fn)`: change the result.
+- `catchError(fn)`: handle an error.
+- `timeout(ms)`: fail if it takes too long.
+
+### Timing log
+
+```typescript
+@Injectable()
+export class TimingInterceptor implements NestInterceptor {
+  private readonly logger = new Logger('HTTP');
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const req = context.switchToHttp().getRequest<Request>();
+    const started = performance.now();
+    const handler = `${context.getClass().name}.${context.getHandler().name}`;
+
+    return next.handle().pipe(
+      tap(() => this.logger.log(`${req.method} ${req.url} → ${handler} ${(performance.now() - started).toFixed(1)}ms`)),
+    );
+  }
+}
+```
+
+### Timeout
+
+```typescript
+@Injectable()
+export class TimeoutInterceptor implements NestInterceptor {
+  intercept(_context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    return next.handle().pipe(
+      timeout(10_000),
+      catchError((err) =>
+        throwError(() => (err instanceof TimeoutError ? new RequestTimeoutException() : err)),
+      ),
+    );
+  }
+}
+```
+
+Note: like `Promise.race` in Node Lesson 2, this stops **waiting**, but the handler's work keeps running. For outgoing calls, still use `AbortSignal.timeout`.
+
+### Short-circuit: return without calling the handler
+
+If an interceptor doesn't call `next.handle()`, the handler never runs. Return `of(value)` instead. That's how caching and **idempotency replay** work:
+
+```typescript
+const saved = await this.store.get(idempotencyKey);
+if (saved) return of(saved.body);       // replay the saved response; the handler doesn't run
+return next.handle().pipe(tap((body) => this.store.save(idempotencyKey, body)));
+```
+
+(`intercept` can be `async` and return a `Promise<Observable>`.) You'll build the full version in the practice project.
+
+## 4. Pipes: transform and validate input
+
+A pipe receives **one value** (a param, the query or the body) and returns the transformed value, or throws.
+
+Built-in pipes: `ValidationPipe` (Lesson 5), `ParseIntPipe`, `ParseUUIDPipe`, `ParseBoolPipe`, `ParseArrayPipe`, `ParseEnumPipe`, `ParseDatePipe`, `DefaultValuePipe`.
+
+```typescript
+@Get()
+list(
+  @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit: number,   // "20" → 20
+) {}
+```
+
+A custom pipe that decodes the pagination cursor (Node Lesson 7):
+
+```typescript
+@Injectable()
+export class ParseCursorPipe implements PipeTransform<string | undefined, CursorData | undefined> {
+  transform(value: string | undefined): CursorData | undefined {
+    if (value === undefined || value === '') return undefined;
+    try {
+      const parsed: unknown = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
+      if (isCursorData(parsed)) return parsed;   // your type guard
+    } catch {
+      // fall through
+    }
+    throw new BadRequestException('Invalid cursor');
+  }
+}
+
+@Get()
+list(@Query('cursor', ParseCursorPipe) cursor: CursorData | undefined) {}
+```
+
+Pipes run **after** guards. So an unauthenticated request with a bad body gets `401`, not `400`. That's correct: don't tell strangers about your validation rules.
+
+## 5. Exception filters: one error format
+
+Without a filter, Nest's default error body is:
+
+```json
+{ "statusCode": 404, "message": "Service 123 not found", "error": "Not Found" }
+```
+
+You want your **`ApiError`** format from Node Lesson 6 everywhere. One global filter does it:
+
+```typescript
+// src/common/filters/problem-details.filter.ts
+import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import type { Request, Response } from 'express';
+import { AppError } from '../errors';            // your error classes from Node Lesson 3
+import type { ApiError } from '../api-error';
+
+@Catch()                                          // no argument: catch everything
+export class ProblemDetailsFilter implements ExceptionFilter {
+  private readonly logger = new Logger(ProblemDetailsFilter.name);
+
+  catch(exception: unknown, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const req = ctx.getRequest<Request>();
+    const res = ctx.getResponse<Response>();
+    const requestId = String(req.headers['x-request-id'] ?? '');
+
+    const problem = this.toProblem(exception, req.originalUrl, requestId);
+    if (problem.status >= 500) {
+      this.logger.error({ err: exception, requestId }, 'Unhandled error');
+    }
+    res.status(problem.status).type('application/problem+json').json(problem);
+  }
+
+  private toProblem(exception: unknown, instance: string, requestId: string): ApiError {
+    // Your own domain errors (services can throw these without importing Nest)
+    if (exception instanceof AppError) {
+      return { type: exception.code.toLowerCase().replaceAll('_', '-'), title: exception.message, status: exception.statusCode, instance, requestId };
+    }
+    // Nest's built-in exceptions: NotFoundException, ForbiddenException, ...
+    if (exception instanceof HttpException) {
+      const status = exception.getStatus();
+      const body = exception.getResponse();     // string or object
+      const title = typeof body === 'string' ? body : String((body as { message?: unknown }).message ?? exception.message);
+      return { type: HttpStatus[status]?.toLowerCase().replaceAll('_', '-') ?? 'error', title, status, instance, requestId };
+    }
+    // Anything else is a bug: hide the details
+    return { type: 'internal', title: 'Something went wrong', status: 500, instance, requestId };
+  }
+}
+```
+
+`HttpStatus[404]` is `'NOT_FOUND'`, so the type becomes `not-found`. Lesson 5 adds validation errors (the `errors` array) to this filter.
+
+Filters at the **route** or **controller** level (`@UseFilters(...)`) run before global ones, and **only one filter handles each exception**: the first one whose `@Catch(...)` matches. Most apps need just this one global filter.
+
+<Callout title="Domain errors or Nest exceptions?">
+Both work. Throwing `NotFoundException` in services is quick and common. Throwing your own `AppError` classes keeps services free of HTTP concepts, so the same service works from a queue worker or a WebSocket gateway. A good middle ground: your own errors for business rules (`SlotTakenError`), Nest exceptions in controllers and guards.
+</Callout>
+
+## Binding: route, controller or global
+
+```typescript
+@UseGuards(RolesGuard)                    // controller level: every route in this controller
+@UseInterceptors(TimingInterceptor)
+@Controller('bookings')
+export class BookingsController {
+  @UseGuards(SomeExtraGuard)              // route level
+  @Post()
+  create() {}
+}
+```
+
+**Global** binding: two ways, and the difference matters:
+
+```typescript
+// ❌ Outside DI: you create the instance, so it can't inject Reflector, ConfigService, etc.
+app.useGlobalGuards(new AuthGuard(/* ??? */));
+
+// ✅ Inside DI: register in any module (usually AppModule)
+@Module({
+  providers: [
+    { provide: APP_GUARD, useClass: AuthGuard },          // runs first
+    { provide: APP_GUARD, useClass: RolesGuard },         // then this
+    { provide: APP_INTERCEPTOR, useClass: TimingInterceptor },
+    { provide: APP_FILTER, useClass: ProblemDetailsFilter },
+    // APP_PIPE for the global ValidationPipe (Lesson 5)
+  ],
+})
+export class AppModule {}
+```
+
+With `APP_GUARD`, `AuthGuard` runs on every route by default. That's the safe choice: a **new route is protected unless you mark it `@Public()`**. Forgetting a decorator then fails safe (401), not open.
+
+## Common mistakes
+
+- Authorisation in middleware: it can't see `@Roles()`.
+- Forgetting `next()` in middleware: the request hangs.
+- Using `app.useGlobalGuards(new X())` for guards that need DI.
+- Expecting validation errors before auth errors. Guards run before pipes.
+- Two different error shapes because some errors skip your filter (for example, a filter with `@Catch(HttpException)` only; unknown errors still use Nest's default 500 body).
+- Business logic in interceptors. They're for cross-cutting concerns that apply to many routes.
+
+## Exercises
+
+- **4.1** 🟢 Without looking, write the lifecycle order. Then for each, say which building block you'd use: (a) reject requests without a token, (b) add `X-Response-Time`, (c) convert `"2026-11-03"` into a `Date`, (d) turn `SlotTakenError` into a 409 response, (e) log the raw body of Stripe webhooks before parsing.
+- **4.2** 🟡 Add the `AuthGuard` and `RolesGuard` globally with `APP_GUARD`. Make `GET /v1/services` public. Only `owner` and `admin` can create or delete services. Test with no token (401), `token-staff` (403) and `token-owner` (201).
+- **4.3** 🟡 Add the `ProblemDetailsFilter` globally. Check that a 404 from `NotFoundException`, a 409 from your `ConflictError`, a 401 from the guard, and a thrown `new Error('boom')` all return the same shape, with the right status and `Content-Type: application/problem+json`.
+- **4.4** 🔴 Write an interceptor that adds a header `X-Response-Time: 12.3ms` to every response. Then add a `console.log` to each building block (middleware, guard, interceptor before/after, a custom pipe, handler, filter), make one request that succeeds and one that fails in the pipe, and write down the printed order for both.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"Explain the NestJS request lifecycle."**
+
+> "A request first goes through middleware, which does generic work like adding a request ID, before Nest knows which handler will run. Then guards decide if the request may continue, for example checking authentication and roles. Then interceptors run code before the handler, then pipes validate and transform the parameters, like the DTO body. Then the controller method runs, usually calling a service. On the way back, interceptors can change the result or log timing. If anything throws along the way, exception filters turn the error into an HTTP response. I bind most of these globally with `APP_GUARD`, `APP_PIPE` and `APP_FILTER`, so they get dependency injection and every route is protected by default."
+
+**"What's the difference between middleware and a guard?"**
+
+> "Middleware runs before routing finishes, so it doesn't know which controller method will handle the request. It's good for generic things like request IDs or CORS. A guard runs after routing and gets the execution context, so it can read metadata like a `@Roles` decorator on the handler. That's why authentication and authorisation belong in guards."

@@ -1,0 +1,534 @@
+---
+title: "Solutions"
+description: "Model answers for every exercise in the NestJS section. Try the exercises first."
+---
+
+<Callout type="warn" title="Try first">
+Do each exercise yourself and get it reviewed before reading the answer. If your solution is different, it may still be right: ask "Is my version correct? Is it better or worse, and why?"
+</Callout>
+
+Imports are left out when they're obvious (`@nestjs/common`, `class-validator`, `class-transformer`).
+
+## Lesson 1: First app and controllers
+
+**1.1**
+
+```powershell
+nest new booking-api --strict --package-manager npm
+cd booking-api
+npm i helmet
+nest g module services
+nest g controller services --no-spec
+nest g service services --no-spec
+```
+
+Delete `app.controller.ts`, `app.service.ts` and `app.controller.spec.ts`, and remove them from `AppModule`. Use the `main.ts` from the lesson. In `ServicesService`, seed two services with `randomUUID()` IDs. `nest g module` already added `ServicesModule` to `AppModule`'s imports.
+
+**1.2** Valid and existing → 200. Valid UUID that doesn't exist → 404 from `NotFoundException`. `abc` → 400 "Validation failed (uuid is expected)" from `ParseUUIDPipe`, and your method never runs.
+
+**1.3**
+
+```typescript
+@Post()
+create(@Body() body: { name: string; durationMinutes: number; priceCents: number }, @Res({ passthrough: true }) res: Response) {
+  const service = this.servicesService.create(body);
+  res.location(`/v1/services/${service.id}`);
+  return service;
+}
+
+@Delete(':id')
+@HttpCode(HttpStatus.NO_CONTENT)
+remove(@Param('id', ParseUUIDPipe) id: string): void {
+  this.servicesService.remove(id);
+}
+```
+
+`"priceCents": "free"` is **accepted** and stored as a string. The TypeScript type on `@Body()` only exists at compile time; nothing checks the JSON at runtime. Lesson 5 fixes this with a DTO and the ValidationPipe.
+
+**1.4** `typeof maxPrice` is `'string'` (`"200000"`), or `'undefined'` when missing, even though you wrote `number`. Query strings are always text. So `maxPrice > price` compares a string with a number, which "works" by accident through type conversion and fails in surprising ways. Fixes: `@Query('maxPrice', new ParseIntPipe({ optional: true })) maxPrice?: number`, or a query DTO with `@Type(() => Number)` (Lesson 5).
+
+## Lesson 2: Modules and DI
+
+**2.1**
+
+```text
+AppModule
+ ├── ServicesModule
+ │     controllers: ServicesController → ServicesService
+ │     providers:   ServicesService
+ │     exports:     ServicesService          ← needed by BookingsService
+ └── BookingsModule  (imports ServicesModule)
+       controllers: BookingsController → BookingsService
+       providers:   BookingsService → BookingsRepository, ServicesService
+                    BookingsRepository
+```
+
+**2.2**
+
+```typescript
+@Module({
+  controllers: [ServicesController],
+  providers: [ServicesService],
+  exports: [ServicesService],
+})
+export class ServicesModule {}
+
+@Module({
+  imports: [ServicesModule],
+  controllers: [BookingsController],
+  providers: [BookingsService, BookingsRepository],
+})
+export class BookingsModule {}
+```
+
+**2.3** The error is:
+
+```text
+Nest can't resolve dependencies of the BookingsService (BookingsRepository, ?).
+Please make sure that the argument ServicesService at index [1] is available in the BookingsModule context.
+```
+
+- `BookingsService`: the class Nest was trying to create.
+- `(BookingsRepository, ?)`: its constructor arguments; the first was found, the `?` wasn't.
+- `index [1]`: the second argument, `ServicesService`.
+- `BookingsModule context`: Nest only looks at `BookingsModule`'s own providers and the **exports** of the modules it imports. `ServicesModule` is imported, but no longer exports `ServicesService`, so it's invisible.
+
+**2.4**
+
+```typescript
+describe('BookingsService.cancel', () => {
+  let service: BookingsService;
+  const repo = { findById: jest.fn(), update: jest.fn() };
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        BookingsService,
+        { provide: BookingsRepository, useValue: repo },
+        { provide: ServicesService, useValue: {} },
+      ],
+    }).compile();
+    service = moduleRef.get(BookingsService);
+  });
+
+  it('throws 404 when the booking does not exist', async () => {
+    repo.findById.mockResolvedValue(undefined);
+    await expect(service.cancel('b1')).rejects.toThrow(NotFoundException);
+  });
+
+  it('throws 409 when already cancelled', async () => {
+    repo.findById.mockResolvedValue({ id: 'b1', status: 'cancelled' });
+    await expect(service.cancel('b1')).rejects.toThrow(ConflictException);
+    expect(repo.update).not.toHaveBeenCalled();
+  });
+
+  it('cancels a confirmed booking', async () => {
+    repo.findById.mockResolvedValue({ id: 'b1', status: 'confirmed' });
+    repo.update.mockResolvedValue({ id: 'b1', status: 'cancelled' });
+    await expect(service.cancel('b1')).resolves.toMatchObject({ status: 'cancelled' });
+    expect(repo.update).toHaveBeenCalledWith('b1', { status: 'cancelled' });
+  });
+});
+```
+
+## Lesson 3: Advanced providers
+
+**3.1**
+
+```typescript
+export type BookingRules = { minNoticeMinutes: number };
+export const BOOKING_RULES = Symbol('BOOKING_RULES');
+
+// bookings.module.ts
+providers: [{ provide: BOOKING_RULES, useValue: { minNoticeMinutes: 60 } satisfies BookingRules }]
+
+// bookings.service.ts
+constructor(
+  private readonly repo: BookingsRepository,
+  private readonly servicesService: ServicesService,
+  @Inject(BOOKING_RULES) private readonly rules: BookingRules,
+) {}
+
+// in create()
+const earliest = Date.now() + this.rules.minNoticeMinutes * 60_000;
+if (startsAt.getTime() < earliest) {
+  throw new UnprocessableEntityException(`Bookings need at least ${this.rules.minNoticeMinutes} minutes' notice`);
+}
+```
+
+**3.2**
+
+```typescript
+@Injectable()
+export class FakePaymentGateway implements PaymentGateway {
+  private readonly logger = new Logger(FakePaymentGateway.name);
+  async charge(amountCents: number, currency: string, idempotencyKey: string) {
+    this.logger.log(`Fake charge ${amountCents} ${currency} (key ${idempotencyKey})`);
+    return { paymentId: `fake_${randomUUID()}` };
+  }
+}
+
+@Injectable()
+export class StripePaymentGateway implements PaymentGateway {
+  async charge(): Promise<{ paymentId: string }> {
+    throw new Error('Stripe is not implemented yet');
+  }
+}
+
+@Module({
+  providers: [
+    FakePaymentGateway,
+    StripePaymentGateway,
+    {
+      provide: PAYMENT_GATEWAY,
+      inject: [FakePaymentGateway, StripePaymentGateway],
+      useFactory: (fake: FakePaymentGateway, stripe: StripePaymentGateway) =>
+        process.env.PAYMENTS_MODE === 'stripe' ? stripe : fake,
+    },
+  ],
+  exports: [PAYMENT_GATEWAY],
+})
+export class PaymentsModule {}
+```
+
+Injecting both classes into the factory lets them use DI themselves. In Lesson 6, replace `process.env` with `ConfigService`.
+
+**3.3**
+
+```typescript
+export type EmailModuleOptions = { from: string };
+export const EMAIL_OPTIONS = Symbol('EMAIL_OPTIONS');
+
+@Injectable()
+export class EmailService {
+  private readonly logger = new Logger(EmailService.name);
+  constructor(@Inject(EMAIL_OPTIONS) private readonly options: EmailModuleOptions) {}
+
+  async send(to: string, subject: string): Promise<void> {
+    this.logger.log(`From ${this.options.from} to ${to}: ${subject}`);
+  }
+}
+```
+
+The module is the `forRoot` / `forRootAsync` code from the lesson, with `EmailModuleOptions = { from: string }`. Use it as `EmailModule.forRoot({ from: 'Bookly <noreply@bookly.dev>' })`.
+
+**3.4** The error says a module in `imports` is `undefined`, or Nest can't resolve a dependency at some index, because each module needs the other one to exist first.
+
+A fix with events (`npm i @nestjs/event-emitter`, add `EventEmitterModule.forRoot()` to `AppModule`):
+
+```typescript
+// payments.service.ts: no dependency on BookingsService
+constructor(private readonly events: EventEmitter2, @Inject(PAYMENT_GATEWAY) private readonly gateway: PaymentGateway) {}
+
+async payForBooking(bookingId: string, amountCents: number) {
+  const { paymentId } = await this.gateway.charge(amountCents, 'usd', `booking-${bookingId}`);
+  this.events.emit('payment.succeeded', { bookingId, paymentId });
+}
+
+// bookings.service.ts: depends on PaymentsService, listens for the event
+@OnEvent('payment.succeeded')
+async onPaymentSucceeded(event: { bookingId: string; paymentId: string }) {
+  await this.repo.update(event.bookingId, { status: 'confirmed' });
+}
+```
+
+Why: payments is a lower-level, reusable capability, and bookings is a feature that uses it. Dependencies should point one way, from feature to capability. Events let payments report what happened without knowing who cares, so the circle disappears and payments can be reused for subscriptions later.
+
+## Lesson 4: The request lifecycle
+
+**4.1** Order: middleware → guards → interceptors (before) → pipes → handler → interceptors (after) → exception filters (on error).
+
+- (a) Reject requests without a token: **guard**.
+- (b) Add `X-Response-Time`: **interceptor** (it needs the time before and after).
+- (c) Convert `"2026-11-03"` to a `Date`: **pipe**.
+- (d) `SlotTakenError` → 409: **exception filter**.
+- (e) Log the raw body of Stripe webhooks: **middleware** (before the JSON body parser runs; you'll use `rawBody: true` in `NestFactory.create` for Stripe signatures in Month 3).
+
+**4.2**
+
+```typescript
+// app.module.ts
+providers: [
+  { provide: APP_GUARD, useClass: AuthGuard },
+  { provide: APP_GUARD, useClass: RolesGuard },
+]
+
+// services.controller.ts
+@Public() @Get() findAll() {}
+@Roles(['owner', 'admin']) @Post() create() {}
+@Roles(['owner', 'admin']) @Delete(':id') remove() {}
+```
+
+Order matters: `AuthGuard` must be registered first, because `RolesGuard` reads `req.user`. Results: no token → 401, `token-staff` → 403 (the guard returned `false`), `token-owner` → 201.
+
+**4.3** All four responses look like `{ type, title, status, instance, requestId }` with the right status code: `not-found` (404), `slot-taken` or `conflict` (409), `unauthorized` (401), and `internal` (500) with "Something went wrong". Only the 500 is logged with its stack trace; `boom` never reaches the client. If the 401 still looks like Nest's default, check that the filter is registered with `APP_FILTER` and uses `@Catch()` with no arguments.
+
+**4.4**
+
+```typescript
+@Injectable()
+export class ResponseTimeInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const started = performance.now();
+    const res = context.switchToHttp().getResponse<Response>();
+    return next.handle().pipe(
+      tap(() => res.setHeader('X-Response-Time', `${(performance.now() - started).toFixed(1)}ms`)),
+    );
+  }
+}
+```
+
+Printed order for a successful request:
+
+```text
+middleware → guard → interceptor (before) → pipe → handler → interceptor (after)
+```
+
+When the pipe throws:
+
+```text
+middleware → guard → interceptor (before) → pipe (throws) → exception filter
+```
+
+The handler and the interceptor's `tap` never run. `tap(fn)` only runs on success; to run code on errors, use `tap({ error: … })` or `catchError`. One more detail: `setHeader` in `tap` works because Nest hasn't sent the response yet when the interceptor's "after" code runs.
+
+## Lesson 5: Validation and DTOs
+
+**5.1**
+
+```typescript
+export class CreateServiceDto {
+  @IsString() @MinLength(2) @MaxLength(100) name!: string;
+  @IsInt() @Min(5) @Max(480) durationMinutes!: number;
+  @IsInt() @Min(0) @Max(100_000_000) priceCents!: number;
+}
+export class UpdateServiceDto extends PartialType(CreateServiceDto) {}
+
+@Patch(':id')
+update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateServiceDto) {
+  return this.servicesService.update(id, dto);
+}
+```
+
+Missing name → "name must be a string" (plus the length messages). `12.5` → "priceCents must be an integer number". `businessId` → "property businessId should not exist" (from `forbidNonWhitelisted`).
+
+**5.2** `typeof query.limit` is `'number'` and `query.from instanceof Date` is `true`, thanks to `transform: true` and `@Type()`. `?limit=500` → "limit must not be greater than 100". `?sort=password` → "sort must be one of the following values: startsAt, -startsAt, createdAt, -createdAt".
+
+**5.3** With the lesson's `toFieldErrors`, a bad `start` in the **second** item is `hours.1.start` (array indexes count from 0; class-validator uses the index as the child's `property`). The frontend can map `hours.1.start` to the right input field.
+
+**5.4**
+
+```typescript
+@ValidatorConstraint({ name: 'isBeforeField' })
+export class IsBeforeFieldConstraint implements ValidatorConstraintInterface {
+  validate(value: unknown, args: ValidationArguments): boolean {
+    const otherField = args.constraints[0] as string;
+    const other = (args.object as Record<string, unknown>)[otherField];
+    if (!(value instanceof Date) || !(other instanceof Date)) return true;   // let @IsDate report type errors
+    return value.getTime() < other.getTime();
+  }
+  defaultMessage(args: ValidationArguments): string {
+    return `${args.property} must be before ${String(args.constraints[0])}`;
+  }
+}
+
+export function IsBeforeField(field: string, options?: ValidationOptions) {
+  return (object: object, propertyName: string) =>
+    registerDecorator({
+      target: object.constructor,
+      propertyName,
+      options,
+      constraints: [field],
+      validator: IsBeforeFieldConstraint,
+    });
+}
+
+// in ListBookingsQuery
+@IsOptional() @Type(() => Date) @IsDate() @IsBeforeField('to')
+from?: Date;
+```
+
+Returning `true` when either value is missing keeps each validator focused on one rule; `@IsOptional` and `@IsDate` handle the rest.
+
+## Lesson 6: Config and custom decorators
+
+**6.1** With `JWT_SECRET=short` the app stops at startup with something like:
+
+```text
+Error: Invalid environment variables:
+  - JWT_SECRET: String must contain at least 32 character(s)
+```
+
+(The exact wording depends on your Zod version.) The value itself isn't printed, which is on purpose. `.env.example`:
+
+```text
+NODE_ENV=development
+PORT=3000
+CORS_ORIGINS=http://localhost:3001
+JWT_SECRET=replace-with-at-least-32-random-characters
+```
+
+**6.2**
+
+```typescript
+// env.ts: add
+BOOKING_MIN_NOTICE_MINUTES: z.coerce.number().int().min(0).default(60),
+
+// booking.config.ts
+export const bookingConfig = registerAs('booking', () => ({
+  minNoticeMinutes: Number(process.env.BOOKING_MIN_NOTICE_MINUTES ?? 60),
+}));
+
+// bookings.module.ts
+imports: [ConfigModule.forFeature(bookingConfig), ServicesModule]
+
+// bookings.service.ts
+@Inject(bookingConfig.KEY) private readonly rules: ConfigType<typeof bookingConfig>
+```
+
+And in `main.ts`: `app.enableCors({ origin: config.get('CORS_ORIGINS', { infer: true }), credentials: true })` and `app.listen(config.get('PORT', { infer: true }))`.
+
+**6.3** Every repository method takes `businessId`, and every query filters by it:
+
+```typescript
+// repository
+async findById(businessId: string, id: string) {
+  const b = this.bookings.get(id);
+  return b && b.businessId === businessId ? b : undefined;   // other tenant → "not found"
+}
+
+// service
+async findOne(businessId: string, id: string) {
+  const booking = await this.repo.findById(businessId, id);
+  if (!booking) throw new NotFoundException(`Booking ${id} not found`);
+  return booking;
+}
+
+// controller
+@Get(':id')
+findOne(@CurrentUser('businessId') businessId: string, @Param('id', ParseUUIDPipe) id: string) {
+  return this.bookingsService.findOne(businessId, id);
+}
+```
+
+Putting the tenant filter in the **repository** means no service method can forget it.
+
+**6.4**
+
+```typescript
+describe('RolesGuard', () => {
+  const reflector = new Reflector();
+  const guard = new RolesGuard(reflector);
+
+  function contextFor(user: AuthUser, handler: () => void): ExecutionContext {
+    return {
+      getHandler: () => handler,
+      getClass: () => class {},
+      switchToHttp: () => ({ getRequest: () => ({ user }) }),
+    } as unknown as ExecutionContext;
+  }
+
+  class TestController {
+    @Roles(['owner']) ownerOnly() {}
+    open() {}
+  }
+  const proto = TestController.prototype;
+
+  it('allows the right role', () => {
+    expect(guard.canActivate(contextFor({ id: 'u1', businessId: 'b', role: 'owner' }, proto.ownerOnly))).toBe(true);
+  });
+  it('blocks the wrong role', () => {
+    expect(guard.canActivate(contextFor({ id: 'u2', businessId: 'b', role: 'staff' }, proto.ownerOnly))).toBe(false);
+  });
+  it('allows any role when no @Roles is set', () => {
+    expect(guard.canActivate(contextFor({ id: 'u2', businessId: 'b', role: 'staff' }, proto.open))).toBe(true);
+  });
+});
+```
+
+Using real decorators on a small test class means the test checks the real metadata, not a mocked `Reflector`. `as unknown as ExecutionContext` is acceptable in tests for a partial fake.
+
+## Lesson 7: Swagger
+
+**7.1** If `CreateServiceDto` shows no fields: check that the file is named `create-service.dto.ts`, that the plugin is in `nest-cli.json` under `compilerOptions.plugins`, and that you restarted the dev server. With `classValidatorShim`, the docs show `maxLength: 100`, `minimum: 0` and so on.
+
+**7.2**
+
+```typescript
+export class FieldErrorDto {
+  field!: string;
+  message!: string;
+}
+
+export class ProblemDto {
+  /** @example "slot-taken" */
+  type!: string;
+  /** @example "This time slot is already booked" */
+  title!: string;
+  /** @example 409 */
+  status!: number;
+  detail?: string;
+  instance?: string;
+  requestId?: string;
+  errors?: FieldErrorDto[];
+}
+```
+
+Then add `@ApiOkResponse` / `@ApiCreatedResponse` with `BookingResponseDto`, and `@ApiNotFoundResponse`, `@ApiConflictResponse` and `@ApiUnprocessableEntityResponse` with `ProblemDto`, on each route.
+
+**7.3** With the CLI plugin and a file named `list-bookings-query.dto.ts`, `@Query() query: ListBookingsQuery` already lists each field as a query parameter. `@IsIn([...])` shows as an enum when you add `@ApiPropertyOptional({ enum: ['confirmed', 'cancelled'] })` (the shim doesn't turn `@IsIn` into an enum in every version, so add it by hand for clarity).
+
+**7.4** The compile error appears where your page reads the renamed field, for example `Property 'startsAt' does not exist on type …`. In a team, this catches the break **before merge**. Without it, the frontend shows "Invalid Date" in production, and someone finds out from a customer.
+
+## Lesson 8: Logging and health
+
+**8.1** In development, pino-pretty prints something like `INFO: request completed {"req":{"id":"…","method":"GET","url":"/v1/services"},"res":{"statusCode":200},"responseTime":4}`. With `curl -H "X-Request-Id: test-123"`, both the log and the response header show `test-123`.
+
+**8.2** For example `this.logger.info({ businessId, bookingId: booking.id }, 'Booking cancelled')`. Send `Authorization: Bearer token-owner` and the request log shows `"authorization":"[Redacted]"`.
+
+**8.3**
+
+```typescript
+type AuditEntry = { action: string; details: Record<string, unknown>; userId?: string; businessId?: string; requestId?: string; at: Date };
+
+@Injectable()
+export class AuditLogService {
+  private readonly entries: AuditEntry[] = [];
+
+  record(action: string, details: Record<string, unknown>): void {
+    const ctx = currentContext();
+    this.entries.push({ action, details, userId: ctx?.userId, businessId: ctx?.businessId, requestId: ctx?.requestId, at: new Date() });
+  }
+
+  list(businessId: string): AuditEntry[] {
+    return this.entries.filter((e) => e.businessId === businessId);
+  }
+}
+
+@Controller('audit-log')
+export class AuditLogController {
+  constructor(private readonly audit: AuditLogService) {}
+
+  @Roles(['owner'])
+  @Get()
+  list(@CurrentUser('businessId') businessId: string) {
+    return { data: this.audit.list(businessId) };
+  }
+}
+```
+
+Export `AuditLogService` from an `AuditModule`, import it in `BookingsModule`, and call `this.audit.record('booking.created', { bookingId })` in the service. Note: for **public** booking creation (no logged-in user), `userId` and `businessId` in the context are empty. Pass `businessId` explicitly in that case, which shows why explicit arguments are safer for tenant data.
+
+**8.4**
+
+```typescript
+@Injectable()
+export class DatabaseService {
+  async ping(): Promise<void> {
+    if (process.env.FAKE_DB_DOWN === 'true') throw new Error('connect ECONNREFUSED');
+  }
+}
+```
+
+With `FAKE_DB_DOWN=true`, `/health/live` returns 200 and `/health/ready` returns 503. What ECS does: when **readiness** fails, the load balancer marks the task unhealthy and stops sending it requests, but the container keeps running and gets traffic again when the database comes back. If **liveness** failed, ECS would stop the task and start a new one, which doesn't help when the problem is the database, and restarting every task at once makes recovery slower. (On ECS, the load balancer's target group health check usually plays the readiness role, and the container health check the liveness role.)

@@ -1,0 +1,299 @@
+---
+title: "Lesson 1: First app and controllers"
+description: "Project structure, main.ts production setup, controllers, routes, params, query, body, status codes and headers."
+---
+
+This lesson creates the booking API project, sets up `main.ts` the way production apps do, and writes your first controller. By the end, you'll have the same `GET` and `POST` endpoints as your plain-Node server, in about a quarter of the code.
+
+## Why NestJS?
+
+Express is a small library: it gives you routing and middleware, and every team invents its own structure. NestJS is a **framework**: it decides the structure for you.
+
+| Plain Node / Express | NestJS |
+| --- | --- |
+| You choose folder structure | Feature **modules** |
+| You create and pass dependencies by hand | **Dependency injection** container |
+| Validation, auth, errors: your own middleware | **Pipes, guards, exception filters**, each with a clear job |
+| Docs written by hand | Swagger generated from code |
+
+Underneath, Nest still uses Express by default (or Fastify, if you choose). Your `req` and `res` are Express objects. That's why the Node.js section matters.
+
+The trade-off: more concepts and some "magic" (decorators). The payoff: a 50-person team can work in the same codebase, and every NestJS project looks familiar. That's why companies like it.
+
+## The project structure
+
+After `nest new booking-api --strict`:
+
+```text
+src/
+  main.ts                 ← starts the app (bootstrap)
+  app.module.ts           ← the root module
+  app.controller.ts       ← example controller (delete it)
+  app.service.ts          ← example service (delete it)
+test/
+  app.e2e-spec.ts         ← example end-to-end test
+nest-cli.json             ← CLI settings (Swagger plugin goes here, Lesson 7)
+```
+
+Organise by **feature**, not by type. Each feature gets its own folder and module:
+
+```text
+src/
+  main.ts
+  app.module.ts
+  common/                 ← shared: filters, guards, interceptors, decorators, errors
+  config/                 ← env validation
+  services/
+    services.module.ts
+    services.controller.ts
+    services.service.ts
+    dto/
+  bookings/
+    bookings.module.ts
+    bookings.controller.ts
+    bookings.service.ts
+    bookings.repository.ts
+    dto/
+    bookings.service.spec.ts
+```
+
+❌ Avoid one big `controllers/`, `services/`, `dtos/` folder for the whole app. When you change "bookings", everything you need should be in one folder.
+
+The CLI generates files for you:
+
+```powershell
+nest g resource bookings --no-spec   # module + controller + service + DTOs, asks REST or GraphQL
+nest g module services
+nest g controller services
+nest g service services
+```
+
+## `main.ts`: production setup
+
+The generated `main.ts` is two lines. A real one looks like this:
+
+```typescript
+// src/main.ts
+import { NestFactory } from '@nestjs/core';
+import { VersioningType } from '@nestjs/common';
+import helmet from 'helmet';
+import { AppModule } from './app.module';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  app.use(helmet());                         // security headers (npm i helmet)
+  app.enableCors({
+    origin: ['http://localhost:3001', 'https://app.bookly.dev'], // your Next.js app, never '*' with cookies
+    credentials: true,
+  });
+  app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' }); // → /v1/...
+  app.enableShutdownHooks();                 // handle SIGTERM gracefully (Node Lesson 3)
+
+  const port = Number(process.env.PORT ?? 3000);
+  await app.listen(port);
+}
+
+void bootstrap();
+```
+
+What each line replaces from your Node server:
+
+- `enableVersioning` with `URI`: every route gets the `/v1` prefix (Node Lesson 6 versioning), and you can later mark a single controller `@Controller({ path: 'bookings', version: '2' })`.
+- `enableShutdownHooks`: listens for `SIGTERM` and runs your shutdown hooks (Lesson 3), like your manual `server.close()` code.
+- `helmet()`: adds headers like `X-Content-Type-Options` and `Strict-Transport-Security`. Covered in Month 2 security.
+
+Some teams also use `app.setGlobalPrefix('api')` for `/api/v1/...`. Pick one style.
+
+Validation, logging, Swagger and error filters are added to this file in later lessons.
+
+## Controllers: routes
+
+A **controller** handles HTTP requests for one resource. It should be thin: read the request, call a service, return the result. No business logic.
+
+```typescript
+// src/services/services.controller.ts
+import { Controller, Get, Param, ParseUUIDPipe } from '@nestjs/common';
+import { ServicesService } from './services.service';
+
+@Controller('services')                      // base path: /v1/services
+export class ServicesController {
+  constructor(private readonly servicesService: ServicesService) {}   // injected (Lesson 2)
+
+  @Get()                                     // GET /v1/services
+  findAll() {
+    return this.servicesService.findAll();   // returned objects become JSON, status 200
+  }
+
+  @Get(':id')                                // GET /v1/services/:id
+  findOne(@Param('id', ParseUUIDPipe) id: string) {
+    return this.servicesService.findOne(id);
+  }
+}
+```
+
+Key points:
+
+- **Return a value, and Nest sends it as JSON.** You don't call `res.json()`. Returning a `Promise` works too; Nest awaits it.
+- Default status: `200`, and `201` for `@Post()`.
+- `ParseUUIDPipe` checks that `id` is a UUID. If not, Nest returns `400` **before** your method runs. (Pipes: Lesson 4.)
+- The controller must be listed in its module's `controllers` array, and that module imported by `AppModule`. `nest g` does this for you.
+
+## Reading the request
+
+| Decorator | Reads | Example |
+| --- | --- | --- |
+| `@Param('id')` | A path parameter | `/bookings/:id` |
+| `@Query()` / `@Query('status')` | The query string, all or one | `?status=confirmed&limit=20` |
+| `@Body()` | The parsed JSON body | `POST` / `PATCH` data |
+| `@Headers('idempotency-key')` | One header (lowercase name) | `Idempotency-Key: ...` |
+| `@Ip()` | Client IP | For rate limiting, audit logs |
+| `@Req()` / `@Res()` | The raw Express objects | Use rarely (see below) |
+
+```typescript
+// src/bookings/bookings.controller.ts
+import {
+  Body, Controller, Get, Headers, HttpCode, HttpStatus, Param, ParseUUIDPipe,
+  Post, Query, Res, BadRequestException,
+} from '@nestjs/common';
+import type { Response } from 'express';
+import { BookingsService } from './bookings.service';
+import { CreateBookingDto } from './dto/create-booking.dto';
+import { ListBookingsQuery } from './dto/list-bookings.query';
+
+@Controller('bookings')
+export class BookingsController {
+  constructor(private readonly bookingsService: BookingsService) {}
+
+  @Get()
+  list(@Query() query: ListBookingsQuery) {
+    return this.bookingsService.list(query);           // { data, nextCursor }
+  }
+
+  @Get(':id')
+  findOne(@Param('id', ParseUUIDPipe) id: string) {
+    return this.bookingsService.findOne(id);
+  }
+
+  @Post()
+  async create(
+    @Body() dto: CreateBookingDto,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    if (!idempotencyKey) throw new BadRequestException('Idempotency-Key header is required');
+    // Using the key to replay saved responses comes in the practice project (an interceptor).
+    const booking = await this.bookingsService.create(dto);
+    res.location(`/v1/bookings/${booking.id}`);        // 201 + Location (Node Lesson 6)
+    return booking;
+  }
+
+  @Post(':id/cancel')
+  @HttpCode(HttpStatus.OK)                             // POST defaults to 201; an action returns 200
+  cancel(@Param('id', ParseUUIDPipe) id: string) {
+    return this.bookingsService.cancel(id);
+  }
+}
+```
+
+The DTO classes (`CreateBookingDto`, `ListBookingsQuery`) are covered in Lesson 5. For now, a DTO ("data transfer object") is a class that describes the shape of incoming data.
+
+<Callout type="warn" title="@Body() alone doesn't validate">
+The type `CreateBookingDto` on `@Body()` is only a TypeScript type. Without a validation pipe (Lesson 5), anything the client sends reaches your method. Remember the best-practices rule: types don't check requests.
+</Callout>
+
+### `@Res()`: use `passthrough: true`
+
+If you inject `@Res()` **without** `passthrough: true`, Nest stops handling the response for you: you must call `res.json()` yourself, and interceptors and some features stop working for that route. With `passthrough: true`, you can set headers or cookies and still just `return` the value. Use plain `@Res()` only for streaming (for example, the CSV export: `pipeline(stream, res)`), or better, return a `StreamableFile`.
+
+Note: `import type { Response } from 'express'` is fine here, because Nest doesn't inject `Response` by class. Only **injected classes** need a normal import (see the best-practices page).
+
+### Status codes and headers
+
+```typescript
+@Delete(':id')
+@HttpCode(HttpStatus.NO_CONTENT)                 // 204
+remove(@Param('id', ParseUUIDPipe) id: string) {
+  return this.servicesService.remove(id);        // return nothing (or void)
+}
+
+@Get('export')
+@Header('Content-Type', 'text/csv; charset=utf-8')   // a fixed header
+export() { /* ... */ }
+```
+
+For errors, **throw**, don't return: `throw new NotFoundException('Service not found')` becomes a `404`. Nest has a class for each common status: `BadRequestException` (400), `UnauthorizedException` (401), `ForbiddenException` (403), `NotFoundException` (404), `ConflictException` (409), `UnprocessableEntityException` (422). Lesson 4 replaces Nest's default error body with your `ApiError` format.
+
+### Route order matters
+
+Routes are matched in the order they appear. Put fixed paths **before** parameter paths:
+
+```typescript
+@Get('export')   // ✅ first
+export() {}
+
+@Get(':id')      // after; otherwise "export" is treated as an id
+findOne() {}
+```
+
+(With `ParseUUIDPipe`, you'd get a `400` for "export", which is a confusing bug to debug.)
+
+## A service
+
+The controller calls a **service**, which holds the business logic:
+
+```typescript
+// src/services/services.service.ts
+import { Injectable, NotFoundException } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+
+export type Service = { id: string; name: string; durationMinutes: number; priceCents: number };
+
+@Injectable()
+export class ServicesService {
+  private readonly services: Service[] = [
+    { id: randomUUID(), name: 'Check-up', durationMinutes: 30, priceCents: 150000 },
+  ];
+
+  findAll(): { data: Service[] } {
+    return { data: this.services };
+  }
+
+  findOne(id: string): Service {
+    const service = this.services.find((s) => s.id === id);
+    if (!service) throw new NotFoundException(`Service ${id} not found`);
+    return service;
+  }
+}
+```
+
+`@Injectable()` marks the class so Nest's DI container can create and inject it. Lesson 2 explains this in depth.
+
+## Express or Fastify?
+
+`NestFactory.create(AppModule)` uses Express. You can switch to Fastify (`@nestjs/platform-fastify`), which is faster in benchmarks. In real apps, the database is almost always the bottleneck, not the HTTP layer, and Express has more middleware and examples. **Use Express** unless a job's codebase uses Fastify. Write code that doesn't touch `req`/`res` directly, and switching later is easy.
+
+## Common mistakes
+
+- Business logic in controllers. Controllers translate HTTP to a service call and back; nothing else.
+- Forgetting to register a controller or provider in a module. Error: "Nest can't resolve dependencies…" (Lesson 2 shows how to read it).
+- Using `@Res()` without `passthrough: true` and wondering why the request hangs (you never called `res.json()`).
+- `@Get(':id')` above `@Get('export')`.
+- Returning `{ error: '...' }` with status 200 instead of throwing an exception.
+
+## Exercises
+
+- **1.1** 🟢 Create the project with `--strict`, delete the example controller and service, and set up `main.ts` as above. Generate a `services` module, controller and service with the CLI. `GET /v1/services` should return two services.
+- **1.2** 🟢 Add `GET /v1/services/:id` with `ParseUUIDPipe`. Test with a valid ID, a valid-looking UUID that doesn't exist (404), and `abc` (400).
+- **1.3** 🟡 Add `POST /v1/services` (returns 201 with a `Location` header) and `DELETE /v1/services/:id` (returns 204). For now, read the body with `@Body() body: { name: string; durationMinutes: number; priceCents: number }`. Send a body with `"priceCents": "free"`: what happens, and why?
+- **1.4** 🟡 Add `GET /v1/services?maxPrice=200000`. Read it with `@Query('maxPrice')`. What type is the value at runtime, even if you write `maxPrice: number`? Prove it with `console.log(typeof maxPrice)`.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"Why would you choose NestJS over Express?"**
+
+> "Express is minimal, so every team invents its own structure for validation, auth, errors and dependencies. NestJS gives a standard architecture: feature modules, dependency injection, and clear building blocks like guards for auth, pipes for validation and exception filters for errors. That makes large codebases consistent and easy to test, because dependencies can be swapped for fakes. It still runs on Express underneath, so the Express ecosystem is available. For a tiny service, Express or Fastify alone can be enough; for a team-sized product, I prefer NestJS."

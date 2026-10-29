@@ -1,0 +1,110 @@
+---
+title: "Cheat sheet"
+description: "One page to revise the whole NestJS section before an interview."
+---
+
+## The request lifecycle
+
+```text
+Middleware → Guards → Interceptors (before) → Pipes → Handler → Interceptors (after)
+                                  any error → Exception filter → Response
+```
+
+"My Guard Is Pretty Cool, Finally."
+
+| Block | Job | Example |
+| --- | --- | --- |
+| Middleware | Generic, before routing | Request ID, Helmet, raw body |
+| Guard | Allow or deny | `AuthGuard`, `RolesGuard` |
+| Interceptor | Around the handler | Timing, timeout, cache, idempotency |
+| Pipe | Transform or validate one input | `ValidationPipe`, `ParseUUIDPipe` |
+| Filter | Error → HTTP response | `ProblemDetailsFilter` |
+
+Bind globally inside DI with `APP_GUARD`, `APP_INTERCEPTOR`, `APP_PIPE`, `APP_FILTER`.
+
+## Modules and DI
+
+- `@Injectable()` + `providers: [X]` = singleton by default
+- Use another module's provider: **it exports, you import**. Never re-add it to your `providers`
+- `@Global()` only for config, logging, database
+- Non-class dependency: Symbol token + `@Inject(TOKEN)`
+- Providers: `useClass`, `useValue`, `useFactory` (+ `inject`), `useExisting`
+- Dynamic modules: `forRoot` / `forRootAsync` (app-wide), `register` (per import), `forFeature`
+- Scopes: DEFAULT, REQUEST (bubbles up, slow), TRANSIENT
+- Never store request data on a singleton
+- Circular dependency: `forwardRef` works, but redesign (extract a provider, or events)
+- Lifecycle: `onModuleInit` → `onApplicationBootstrap` … `onModuleDestroy` → `beforeApplicationShutdown` → `onApplicationShutdown` (needs `enableShutdownHooks()`)
+
+**"Nest can't resolve dependencies of X (A, ?)"**: the `?` is missing in that module's context. Check exports/imports, `import type`, interface without a token, circular file imports.
+
+## Testing
+
+```typescript
+await Test.createTestingModule({
+  providers: [BookingsService, { provide: BookingsRepository, useValue: fakeRepo }],
+}).compile();
+// or: .overrideProvider(EmailService).useValue(fake)
+```
+
+## Controllers
+
+- `@Param`, `@Query`, `@Body`, `@Headers('name')`, `@Ip()`
+- Return values become JSON; throw `NotFoundException` etc. for errors
+- `@HttpCode(204)`, `@Header(...)`, `@Res({ passthrough: true })` for dynamic headers
+- Fixed routes before `:id` routes
+
+## Validation
+
+```typescript
+new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true, exceptionFactory })
+```
+
+- `@Type(() => Number | Date | NestedDto)` for conversion and nested validation
+- Booleans in query: `@Transform`, not `@Type(() => Boolean)`
+- `PartialType`, `PickType`, `OmitType` from `@nestjs/swagger`
+- Max lengths everywhere
+- Shape in DTOs; business rules in services
+- Map responses explicitly: `toBookingResponse()`
+
+## Config
+
+- `ConfigModule.forRoot({ isGlobal: true, cache: true, validate })` with a Zod schema → fail fast
+- `ConfigService<Env, true>` + `get('KEY', { infer: true })`
+- `registerAs` + `@Inject(cfg.KEY)` for namespaces
+- Commit `.env.example`, never `.env`; production values from the platform
+
+## Decorators
+
+| Kind | Made with | Example |
+| --- | --- | --- |
+| Parameter | `createParamDecorator` | `@CurrentUser('businessId')` |
+| Metadata | `Reflector.createDecorator`, `SetMetadata` | `@Roles(['owner'])`, `@Public()` |
+| Composed | `applyDecorators` | `@Auth('owner')` |
+
+## Swagger
+
+- `DocumentBuilder` + `SwaggerModule.setup('docs', app, document)` → `/docs`, `/docs-json`
+- CLI plugin in `nest-cli.json`, files named `*.dto.ts`
+- Response DTO **classes**, a shared `ProblemDto`, `ApiPaginatedResponse` helper
+- `openapi-typescript` + `openapi-fetch` for typed frontend clients
+
+## Logging and health
+
+- nestjs-pino: JSON logs, `genReqId`, `redact`, `bufferLogs` + `app.useLogger`
+- Fixed message, data in fields: `logger.info({ bookingId }, 'Booking created')`
+- AsyncLocalStorage (`nestjs-cls`) for request context; explicit args for tenant data
+- Liveness: process only → restart. Readiness: dependencies → stop traffic
+- `VERSION_NEUTRAL` + `@Public()` on the health controller
+
+## Interview answers to practise
+
+1. **Why NestJS over Express?** Standard architecture (modules, DI, guards, pipes, filters), consistent and testable for teams; Express underneath.
+2. **What is DI?** Classes declare dependencies, the container provides them; singletons by default; easy fakes in tests.
+3. **`providers` vs `exports`?** Private by default; export to share; import the module to use.
+4. **Injection scopes?** Singleton default; request scope bubbles up and costs performance; use AsyncLocalStorage.
+5. **Circular dependencies?** `forwardRef` on both sides, but prefer a third provider or events.
+6. **Request lifecycle?** Middleware, guards, interceptors, pipes, handler, interceptors, filters.
+7. **Middleware vs guard?** Guards know the handler and read metadata, so auth goes in guards.
+8. **How do you validate?** Global ValidationPipe with whitelist and transform, DTOs, custom error format, response mapping.
+9. **Config and secrets?** Validated at startup, typed ConfigService, never logged, platform secrets in production.
+10. **Logging and health?** Structured Pino logs with request IDs and redaction; liveness vs readiness.

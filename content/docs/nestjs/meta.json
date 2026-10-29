@@ -1,0 +1,17 @@
+{
+  "title": "NestJS",
+  "pages": [
+    "index",
+    "lesson-1-first-app",
+    "lesson-2-modules-and-di",
+    "lesson-3-advanced-providers",
+    "lesson-4-request-lifecycle",
+    "lesson-5-validation",
+    "lesson-6-config-and-decorators",
+    "lesson-7-swagger",
+    "lesson-8-logging-and-health",
+    "practice-project",
+    "solutions",
+    "cheat-sheet"
+  ]
+}

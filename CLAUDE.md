@@ -54,6 +54,7 @@ Content conventions:
 - Each topic page: plain-English explanation, my own code example, mistakes I made, then a short interview-style answer.
 - Planned sections after the roadmap: TypeScript, NestJS, PostgreSQL, AI engineering, system design.
 - **Node.js and HTTP** section added (Oct 28, 2026) in `content/docs/node-http/`: 7 lessons (event loop, async patterns, error handling, streams, HTTP basics, REST design, pagination and idempotency keys), a practice project (plain `node:http` booking API + Mini-build A design), solutions and a cheat sheet. Progress: not started. Next after it: NestJS and PostgreSQL.
+- **NestJS** section added (Oct 29, 2026) in `content/docs/nestjs/`: 8 lessons (first app and controllers, modules and DI, advanced providers, request lifecycle, validation, config and decorators, Swagger, logging and health), a practice project (rebuild the Node booking API in NestJS), solutions and a cheat sheet. Includes extra topics beyond the roadmap (exception filters, dynamic modules, scopes, circular deps, testing with DI, AsyncLocalStorage, response mapping). Progress: not started. Next topic to write: PostgreSQL.
 
 ## TypeScript study (in progress)
 

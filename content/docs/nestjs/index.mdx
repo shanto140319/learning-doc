@@ -1,0 +1,89 @@
+---
+title: "NestJS"
+description: "NestJS in depth: modules, dependency injection, the request lifecycle, validation, config, Swagger, logging and health checks. Phase 1, Month 1."
+---
+
+NestJS is the most popular structured backend framework for Node.js, and it's in a large share of remote TypeScript job ads. It gives you what you built by hand in the [Node.js and HTTP](/docs/node-http) section (routing, body parsing, validation, error mapping, shutdown) plus a strong structure for big codebases: **modules and dependency injection**.
+
+All examples build the **booking platform API**. By the end, you'll have rewritten your plain-Node practice project in NestJS, and you'll know exactly what each part of Nest replaces.
+
+<Callout title="My progress">
+- Lesson 1 (first app): not started
+- Lesson 2 (modules and DI): not started
+- Lesson 3 (advanced providers): not started
+- Lesson 4 (request lifecycle): not started
+- Lesson 5 (validation): not started
+- Lesson 6 (config and decorators): not started
+- Lesson 7 (Swagger): not started
+- Lesson 8 (logging and health): not started
+- Practice project: not started
+</Callout>
+
+## Before you start
+
+Finish at least Lessons 3, 5 and 6 of [Node.js and HTTP](/docs/node-http) first. NestJS makes much more sense when you know what it does for you. Also read [TypeScript best practices for NestJS](/docs/typescript/best-practices/nestjs); this section builds on it.
+
+## What you will learn
+
+| Lessons | Topic | You will be able to… |
+| --- | --- | --- |
+| 1 | First app | Create a strict project, write controllers, read params, query and body, set status codes |
+| 2–3 | Modules and DI | Structure an app in feature modules, inject dependencies, write custom and dynamic providers, test with fakes |
+| 4 | Request lifecycle | Explain and use middleware, guards, interceptors, pipes and exception filters, in the right order |
+| 5 | Validation | Validate bodies and queries, return your `ApiError` format, never leak private fields |
+| 6 | Config and decorators | Validate env vars at startup, write `@CurrentUser()` and `@Auth()` decorators |
+| 7 | Swagger | Generate API docs from code, and typed clients for the frontend |
+| 8 | Logging and health | Structured JSON logs with request IDs, request context, liveness and readiness checks |
+
+### Topics added beyond the roadmap
+
+The roadmap lists the core topics. These are added because jobs and interviews expect them:
+
+- Controllers and routing details (Lesson 1)
+- Testing with dependency injection (Lesson 2), the basics before Month 2's full testing topic
+- Dynamic modules, circular dependencies, injection scopes (Lesson 3)
+- Exception filters that produce one error format (Lesson 4)
+- Response serialisation, so `passwordHash` never leaks (Lesson 5)
+- Request context with `AsyncLocalStorage` (Lesson 8)
+- `main.ts` production setup: CORS, Helmet, versioning, shutdown hooks (Lesson 1)
+
+### Topics left for later (on purpose)
+
+| Topic | When |
+| --- | --- |
+| Prisma and database modules | PostgreSQL / ORM topics, Month 1 |
+| Auth with JWT and Passport, rate limiting (`@nestjs/throttler`), Helmet details | Month 2, auth and security |
+| Testing in depth (Testcontainers, Supertest) | Month 2 |
+| BullMQ queues and scheduled jobs | Month 2 |
+| WebSocket gateways | Month 3 |
+| GraphQL, microservices, CQRS | Not needed for your target jobs; learn only if a job asks |
+
+## Setup
+
+You need Node.js 22+ and the Nest CLI:
+
+```powershell
+npm i -g @nestjs/cli
+nest new booking-api --strict --package-manager npm
+cd booking-api
+npm run start:dev
+```
+
+Open http://localhost:3000. You should see "Hello World!". `--strict` turns on TypeScript strict mode; add `"noUncheckedIndexedAccess": true` to `tsconfig.json` yourself.
+
+## How each lesson works
+
+Same as before: type the examples yourself, do the exercises without help, send them to Claude for a scored review, then check the [Solutions](/docs/nestjs/solutions). Write your mistakes in each page's notes box and practise the interview answers out loud.
+
+## Schedule (about 2.5 weeks)
+
+| When | What |
+| --- | --- |
+| Week 1 | Lessons 1, 2 and 3 |
+| Week 2 | Lesson 4 (the most important; take two sessions), Lesson 5 |
+| Week 3 | Lessons 6, 7, 8 |
+| Week 3, Friday block | [Practice project](/docs/nestjs/practice-project) |
+
+Then: PostgreSQL and Prisma, and Mini-build A (URL shortener).
+
+**Done means:** you can draw the request lifecycle from memory, explain dependency injection and why it helps testing, and build a validated, documented, logged CRUD module in under an hour without looking things up.

@@ -1,0 +1,276 @@
+---
+title: "Lesson 3: Advanced providers"
+description: "Custom providers and tokens, dynamic modules with forRoot, injection scopes, circular dependencies and lifecycle hooks."
+---
+
+Lesson 2 used class providers. Real apps also need to inject config values, third-party clients (Stripe, Redis), and interfaces with swappable implementations. This lesson covers the four provider types, dynamic modules (`forRoot`), scopes, circular dependencies and lifecycle hooks.
+
+## Four kinds of custom providers
+
+| Type | What it does | Typical use |
+| --- | --- | --- |
+| `useClass` | Create an instance of a class | Swap implementations: `StripeGateway` in production, `FakeGateway` in tests |
+| `useValue` | Use a ready-made value | Constants, fakes in tests |
+| `useFactory` | Call a function (can be `async`, can inject other providers) | Third-party clients built from config |
+| `useExisting` | Make one token an alias of another | Expose one provider under two names |
+
+### Tokens other than classes
+
+A token can be a class, a string or a **Symbol**. Prefer Symbols or classes: string tokens can clash by accident.
+
+```typescript
+// src/payments/payment-gateway.ts
+export interface PaymentGateway {
+  charge(amountCents: number, currency: string, idempotencyKey: string): Promise<{ paymentId: string }>;
+}
+export const PAYMENT_GATEWAY = Symbol('PAYMENT_GATEWAY');
+```
+
+```typescript
+// src/payments/payments.module.ts
+@Module({
+  providers: [
+    {
+      provide: PAYMENT_GATEWAY,
+      useClass: process.env.NODE_ENV === 'test' ? FakePaymentGateway : StripePaymentGateway,
+    },
+  ],
+  exports: [PAYMENT_GATEWAY],
+})
+export class PaymentsModule {}
+```
+
+```typescript
+// anywhere that imports PaymentsModule
+constructor(@Inject(PAYMENT_GATEWAY) private readonly payments: PaymentGateway) {}
+```
+
+`@Inject(TOKEN)` is required whenever the type isn't a class, because interfaces don't exist at runtime.
+
+### `useValue`
+
+```typescript
+export const BOOKING_RULES = Symbol('BOOKING_RULES');
+
+providers: [
+  { provide: BOOKING_RULES, useValue: { minNoticeMinutes: 60, maxDaysAhead: 90 } },
+]
+```
+
+### `useFactory`: build a client from config
+
+```typescript
+// src/redis/redis.module.ts
+import Redis from 'ioredis';
+
+export const REDIS = Symbol('REDIS');
+
+@Module({
+  providers: [
+    {
+      provide: REDIS,
+      inject: [ConfigService],                           // dependencies passed to the factory, in order
+      useFactory: (config: ConfigService) => new Redis(config.getOrThrow<string>('REDIS_URL')),
+    },
+  ],
+  exports: [REDIS],
+})
+export class RedisModule {}
+```
+
+Factories can be `async`: Nest waits for the promise **before starting the app**. Useful for "connect first, then accept traffic".
+
+### `useExisting`
+
+```typescript
+providers: [
+  StripePaymentGateway,
+  { provide: PAYMENT_GATEWAY, useExisting: StripePaymentGateway },  // same instance, two tokens
+]
+```
+
+## Dynamic modules: `forRoot` and `forRootAsync`
+
+You've seen `ConfigModule.forRoot({...})` and you'll see `JwtModule.register({...})`, `BullModule.forRoot({...})`. These are **dynamic modules**: modules configured when you import them.
+
+A normal module is fixed. A dynamic module is a **static method that returns a module definition**, built from options:
+
+```typescript
+// src/email/email.module.ts
+export type EmailModuleOptions = { apiKey: string; from: string };
+export const EMAIL_OPTIONS = Symbol('EMAIL_OPTIONS');
+
+@Module({})
+export class EmailModule {
+  static forRoot(options: EmailModuleOptions): DynamicModule {
+    return {
+      module: EmailModule,
+      providers: [
+        { provide: EMAIL_OPTIONS, useValue: options },
+        EmailService,                       // EmailService injects EMAIL_OPTIONS
+      ],
+      exports: [EmailService],
+    };
+  }
+
+  static forRootAsync(options: {
+    imports?: ModuleMetadata['imports'];
+    inject?: FactoryProvider['inject'];
+    useFactory: (...args: any[]) => EmailModuleOptions | Promise<EmailModuleOptions>;
+  }): DynamicModule {
+    return {
+      module: EmailModule,
+      imports: options.imports ?? [],
+      providers: [
+        { provide: EMAIL_OPTIONS, inject: options.inject ?? [], useFactory: options.useFactory },
+        EmailService,
+      ],
+      exports: [EmailService],
+    };
+  }
+}
+```
+
+```typescript
+// app.module.ts
+imports: [
+  EmailModule.forRootAsync({
+    inject: [ConfigService],
+    useFactory: (config: ConfigService) => ({
+      apiKey: config.getOrThrow('RESEND_API_KEY'),
+      from: 'Bookly <noreply@bookly.dev>',
+    }),
+  }),
+]
+```
+
+Why `forRootAsync`? Because the options come from `ConfigService`, which is itself a provider. The plain `forRoot` would need the values at import time, before DI is ready.
+
+Naming convention you'll see in libraries:
+
+| Method | Meaning |
+| --- | --- |
+| `forRoot` / `forRootAsync` | Configure once, in `AppModule`, shared by the whole app |
+| `register` / `registerAsync` | Configure for this import (can differ per module) |
+| `forFeature` | Add feature-specific parts (for example, one queue or one config namespace) to an already configured module |
+
+Nest also has `ConfigurableModuleBuilder`, which generates `forRoot`/`forRootAsync` for you. Use it when you build reusable modules; writing one by hand first (as above) shows you what it does.
+
+## Injection scopes
+
+By default, every provider is a **singleton**: one instance for the whole app. That's fast, and it's what you want 95% of the time.
+
+| Scope | One instance per… | Use |
+| --- | --- | --- |
+| `DEFAULT` (singleton) | App | Almost everything |
+| `REQUEST` | Request | Data tied to one request (but see below) |
+| `TRANSIENT` | Each class that injects it | A provider with per-consumer state, such as a logger with its own context name |
+
+```typescript
+@Injectable({ scope: Scope.REQUEST })
+export class TenantContext {
+  constructor(@Inject(REQUEST) private readonly req: Request) {}
+  get businessId(): string {
+    return (this.req as Request & { user: AuthUser }).user.businessId;
+  }
+}
+```
+
+**The catch: scope bubbles up.** If `BookingsService` injects a request-scoped provider, `BookingsService` becomes request-scoped too, and so does `BookingsController`. Now Nest creates new instances of the whole chain **for every request**. That costs performance and surprises people.
+
+**Better option:** keep providers as singletons and store per-request data in `AsyncLocalStorage` (Lesson 8, or the `nestjs-cls` package). Or simply pass `businessId` as a method argument from the controller. In an interview, knowing *why* you avoid request scope scores points.
+
+<Callout type="warn" title="Singletons and state">
+A singleton is shared by all requests at the same time. Never store request data in a singleton's properties (`this.currentUser = user`). Two requests running at once will overwrite each other's data, and one customer may see another's bookings.
+</Callout>
+
+## Circular dependencies
+
+`BookingsService` needs `PaymentsService` (to charge), and `PaymentsService` needs `BookingsService` (to confirm the booking after payment). Nest can't create either first:
+
+```text
+Nest cannot create the BookingsModule instance.
+The module at index [1] of the BookingsModule "imports" array is undefined.
+... A circular dependency between modules. Use forwardRef() to avoid it.
+```
+
+The quick fix is `forwardRef`, on **both** sides:
+
+```typescript
+// modules
+@Module({ imports: [forwardRef(() => PaymentsModule)] })
+export class BookingsModule {}
+
+// services
+constructor(@Inject(forwardRef(() => PaymentsService)) private readonly payments: PaymentsService) {}
+```
+
+**The better fix is to redesign**, because a circle usually means responsibilities are mixed:
+
+1. **Extract a third provider** that both use (for example, `BookingPaymentFlow` depends on both; neither depends on the other).
+2. **Use events:** `PaymentsService` emits `payment.succeeded`, and `BookingsService` listens (`@nestjs/event-emitter`; later, a BullMQ queue). Now payments doesn't know bookings exists.
+3. **Pass data, not services:** maybe payments only needs a booking ID and amount, not the whole service.
+
+Also check for **file-level** circular imports (barrel `index.ts` files that import each other). They make a class `undefined` at import time, which gives confusing errors.
+
+## Lifecycle hooks
+
+Providers and modules can run code at startup and shutdown:
+
+| Hook | When |
+| --- | --- |
+| `onModuleInit()` | After the module's dependencies are resolved |
+| `onApplicationBootstrap()` | After all modules are initialised, before listening for connections |
+| `onModuleDestroy()` | After a shutdown signal is received |
+| `beforeApplicationShutdown(signal)` | After all `onModuleDestroy` handlers finish; connections still open |
+| `onApplicationShutdown(signal)` | After connections are closed |
+
+Startup hooks can be `async`; Nest waits for them. Shutdown hooks only run if you called `app.enableShutdownHooks()` in `main.ts`.
+
+```typescript
+@Injectable()
+export class RedisService implements OnModuleInit, OnApplicationShutdown {
+  private client!: Redis;
+
+  async onModuleInit() {
+    this.client = new Redis(process.env.REDIS_URL!);
+    await this.client.ping();           // fail fast at startup if Redis is down
+  }
+
+  async onApplicationShutdown(signal?: string) {
+    await this.client.quit();           // close cleanly on SIGTERM (Node Lesson 3)
+  }
+}
+```
+
+Prisma's `PrismaService` uses exactly this pattern: `$connect()` in `onModuleInit`, `$disconnect()` on shutdown. You'll write it in the Prisma topic.
+
+## Common mistakes
+
+- Injecting an interface without `@Inject(TOKEN)`.
+- Using string tokens like `'CONFIG'` everywhere: easy typos, no type safety. Use Symbols or classes.
+- `Scope.REQUEST` on a service "to get the current user", making half the app request-scoped.
+- Storing request data on a singleton (`this.user = …`).
+- Using `forwardRef` as a permanent solution instead of fixing the design.
+- Forgetting `enableShutdownHooks()` and wondering why `onApplicationShutdown` never runs.
+
+## Exercises
+
+- **3.1** 🟢 Create a `BOOKING_RULES` value provider (`minNoticeMinutes: 60`) and use it in `BookingsService.create` to reject bookings less than 60 minutes ahead (throw `UnprocessableEntityException`).
+- **3.2** 🟡 Create a `PaymentGateway` interface and token with two implementations: `FakePaymentGateway` (logs and returns a random ID) and `StripePaymentGateway` (throws "not implemented" for now). Choose between them with `useFactory` based on an env var `PAYMENTS_MODE=fake|stripe`.
+- **3.3** 🟡 Write `EmailModule.forRoot({ from })` and `forRootAsync`. `EmailService.send(to, subject)` should just log for now, including the `from` address.
+- **3.4** 🔴 Make `BookingsService` and `PaymentsService` depend on each other, and read the error. Then fix it **without** `forwardRef` using one of the redesign options. Explain your choice in three sentences.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What are injection scopes in NestJS?"**
+
+> "By default, providers are singletons: one instance shared by the whole app, which is fast and fits most cases. Request scope creates a new instance for every request, and transient scope gives each consumer its own instance. The catch with request scope is that it bubbles up: anything that injects a request-scoped provider becomes request-scoped too, so the whole chain is rebuilt on every request. So I keep providers as singletons, never store request data on them, and use AsyncLocalStorage, for example through nestjs-cls, when I need request context like the tenant ID."
+
+**"How do you handle circular dependencies in NestJS?"**
+
+> "`forwardRef` on both sides fixes it technically, but I see a circular dependency as a design smell. Usually I extract the shared logic into a third provider, or decouple with events: for example, the payments module emits a 'payment succeeded' event, and the bookings module listens, so payments doesn't need to know about bookings at all."

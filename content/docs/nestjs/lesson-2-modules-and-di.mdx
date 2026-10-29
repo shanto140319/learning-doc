@@ -1,0 +1,305 @@
+---
+title: "Lesson 2: Modules and dependency injection"
+description: "What dependency injection is, providers, modules, imports and exports, layered architecture, and testing with fakes."
+---
+
+Dependency injection (DI) is the heart of NestJS and one of the most common NestJS interview topics. Once you understand it, the "Nest can't resolve dependencies" error stops being scary, and testing becomes easy.
+
+## The problem DI solves
+
+Without DI, a class creates its own dependencies:
+
+```typescript
+class BookingsService {
+  private repo = new BookingsRepository(new DatabaseConnection('postgres://...'));
+  private email = new ResendEmailClient(process.env.RESEND_KEY!);
+}
+```
+
+Problems:
+
+- **Hard to test:** every test of `BookingsService` needs a real database and sends real emails.
+- **Hard to change:** switching from Resend to AWS SES means editing every class that sends email.
+- **Wasteful:** each class creates its own database connection.
+
+With DI, a class **asks for** what it needs, and something else provides it:
+
+```typescript
+@Injectable()
+class BookingsService {
+  constructor(
+    private readonly repo: BookingsRepository,
+    private readonly email: EmailService,
+  ) {}
+}
+```
+
+`BookingsService` doesn't know how to create a repository or an email client, or which one it gets. In tests, you give it fakes. In production, Nest gives it the real ones.
+
+This idea is called **Inversion of Control (IoC)**: the class gives up control of creating its dependencies. The thing that creates and wires everything is the **IoC container**. In Nest, that's built in.
+
+## How Nest's DI works
+
+1. `@Injectable()` marks a class as a **provider**: something the container can create.
+2. You register it in a module: `providers: [BookingsService]`.
+3. When Nest creates `BookingsController`, it reads the constructor's parameter types (thanks to `emitDecoratorMetadata`), finds a provider for each one, creates them if needed, and passes them in.
+4. By default, each provider is a **singleton**: created once and shared by everyone in the app.
+
+```text
+BookingsController
+   └── needs BookingsService
+          ├── needs BookingsRepository
+          └── needs EmailService
+```
+
+Nest builds this tree at startup, from the bottom up. If anything is missing, the app **fails at startup**, not when the first request arrives. That's a good thing.
+
+`providers: [BookingsService]` is short for:
+
+```typescript
+providers: [{ provide: BookingsService, useClass: BookingsService }]
+// "when someone asks for BookingsService (the token), create a BookingsService"
+```
+
+The `provide` value is the **token**: the key the container uses to find a provider. For classes, the token is the class itself. Lesson 3 shows other tokens.
+
+## Modules
+
+A **module** is a box that groups related controllers and providers, and decides what other modules can use.
+
+```typescript
+// src/bookings/bookings.module.ts
+import { Module } from '@nestjs/common';
+import { BookingsController } from './bookings.controller';
+import { BookingsService } from './bookings.service';
+import { BookingsRepository } from './bookings.repository';
+import { ServicesModule } from '../services/services.module';
+import { EmailModule } from '../email/email.module';
+
+@Module({
+  imports: [ServicesModule, EmailModule],     // modules whose exported providers I need
+  controllers: [BookingsController],
+  providers: [BookingsService, BookingsRepository],
+  exports: [BookingsService],                 // what other modules may use
+})
+export class BookingsModule {}
+```
+
+| Property | Meaning |
+| --- | --- |
+| `imports` | Other modules this module needs |
+| `controllers` | Controllers in this module |
+| `providers` | Providers created by this module |
+| `exports` | Providers this module shares with modules that import it |
+
+The rule that confuses everyone at first: **providers are private to their module unless exported.** If `BookingsService` needs `ServicesService`:
+
+1. `ServicesModule` must have `exports: [ServicesService]`.
+2. `BookingsModule` must have `imports: [ServicesModule]`.
+
+Both steps. **Don't** add `ServicesService` to `BookingsModule`'s `providers` to "fix" an error. That creates a **second, separate instance**, which breaks anything with state (caches, connections) and is a classic bug.
+
+The root module imports the feature modules:
+
+```typescript
+// src/app.module.ts
+@Module({
+  imports: [ServicesModule, BookingsModule],
+})
+export class AppModule {}
+```
+
+### Global modules
+
+`@Global()` makes a module's exports available everywhere without importing it. Use it only for things nearly every module needs (config, logging, database). Overusing it hides dependencies, which defeats the purpose of modules.
+
+```typescript
+@Global()
+@Module({ providers: [PrismaService], exports: [PrismaService] })
+export class DatabaseModule {}   // imported once, in AppModule
+```
+
+## Reading "Nest can't resolve dependencies"
+
+You will see this error often:
+
+```text
+Nest can't resolve dependencies of the BookingsService (BookingsRepository, ?).
+Please make sure that the argument ServicesService at index [1] is available in the BookingsModule context.
+```
+
+Read it like this:
+
+- **Who** is failing: `BookingsService`.
+- **Which** argument: the `?` at index `[1]`, which is `ServicesService`.
+- **Where** Nest looked: `BookingsModule`.
+
+The fixes, in order of likelihood:
+
+1. The provider isn't exported from its module, or that module isn't imported.
+2. The class is imported with `import type` (removed at runtime; see the best-practices page).
+3. It's an interface or type, not a class: it needs a token (Lesson 3).
+4. A circular import between files makes the class `undefined` at that moment (Lesson 3).
+
+## Layered architecture: controller → service → repository
+
+A clean, common structure for each feature:
+
+| Layer | Job | Knows about |
+| --- | --- | --- |
+| **Controller** | HTTP: read params and body, call the service, return the result | HTTP, DTOs |
+| **Service** | Business rules: "a slot can't be double-booked", "only cancel before the start time" | Domain logic, other services, repository |
+| **Repository** | Data access: queries | The database (Prisma, SQL) |
+
+```typescript
+// src/bookings/bookings.repository.ts
+// In-memory for now. When you learn Prisma, only this file changes.
+@Injectable()
+export class BookingsRepository {
+  private readonly bookings = new Map<string, Booking>();
+
+  async findById(id: string): Promise<Booking | undefined> {
+    return this.bookings.get(id);
+  }
+  async findAt(serviceId: string, startsAt: Date): Promise<Booking | undefined> {
+    return [...this.bookings.values()].find(
+      (b) => b.serviceId === serviceId && b.startsAt.getTime() === startsAt.getTime() && b.status === 'confirmed',
+    );
+  }
+  async insert(booking: Booking): Promise<Booking> {
+    this.bookings.set(booking.id, booking);
+    return booking;
+  }
+  async update(id: string, changes: Partial<Booking>): Promise<Booking> {
+    const updated = { ...this.bookings.get(id)!, ...changes };
+    this.bookings.set(id, updated);
+    return updated;
+  }
+}
+```
+
+```typescript
+// src/bookings/bookings.service.ts
+@Injectable()
+export class BookingsService {
+  constructor(
+    private readonly repo: BookingsRepository,
+    private readonly servicesService: ServicesService,   // from ServicesModule (exported)
+  ) {}
+
+  async create(dto: CreateBookingDto): Promise<Booking> {
+    this.servicesService.findOne(dto.serviceId);         // throws 404 if the service doesn't exist
+    const startsAt = new Date(dto.startsAt);
+    if (await this.repo.findAt(dto.serviceId, startsAt)) {
+      throw new ConflictException('This time slot is already booked');
+    }
+    return this.repo.insert({
+      id: randomUUID(), serviceId: dto.serviceId, customerEmail: dto.customerEmail,
+      startsAt, status: 'confirmed', createdAt: new Date(),
+    });
+  }
+
+  async cancel(id: string): Promise<Booking> {
+    const booking = await this.repo.findById(id);
+    if (!booking) throw new NotFoundException(`Booking ${id} not found`);
+    if (booking.status === 'cancelled') throw new ConflictException('Booking is already cancelled');
+    return this.repo.update(id, { status: 'cancelled' });
+  }
+}
+```
+
+Is a separate repository always needed? With Prisma, many teams call Prisma directly from services, and that's fine for small apps. A repository layer pays off when queries get complex, or when you want to test services without a database. For learning, keep it: it makes DI and testing clear.
+
+## Testing with DI
+
+This is the main reason DI exists. Nest's `Test.createTestingModule` builds a small container where you choose what each token resolves to:
+
+```typescript
+// src/bookings/bookings.service.spec.ts
+import { Test } from '@nestjs/testing';
+import { ConflictException } from '@nestjs/common';
+import { BookingsService } from './bookings.service';
+import { BookingsRepository } from './bookings.repository';
+import { ServicesService } from '../services/services.service';
+
+describe('BookingsService', () => {
+  let service: BookingsService;
+  const repo = {
+    findAt: jest.fn(),
+    insert: jest.fn(async (b) => b),
+  };
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        BookingsService,                                           // the real class under test
+        { provide: BookingsRepository, useValue: repo },           // a fake
+        { provide: ServicesService, useValue: { findOne: jest.fn() } },
+      ],
+    }).compile();
+
+    service = moduleRef.get(BookingsService);
+  });
+
+  it('rejects a slot that is already booked', async () => {
+    repo.findAt.mockResolvedValue({ id: 'existing' });
+
+    await expect(
+      service.create({ serviceId: 's1', customerEmail: 'a@b.com', startsAt: '2026-11-03T10:00:00Z' }),
+    ).rejects.toThrow(ConflictException);
+    expect(repo.insert).not.toHaveBeenCalled();
+  });
+
+  it('creates a booking when the slot is free', async () => {
+    repo.findAt.mockResolvedValue(undefined);
+
+    const booking = await service.create({ serviceId: 's1', customerEmail: 'a@b.com', startsAt: '2026-11-03T10:00:00Z' });
+
+    expect(booking.status).toBe('confirmed');
+    expect(repo.insert).toHaveBeenCalledTimes(1);
+  });
+});
+```
+
+Run with `npm test`. No database, no network, and each test runs in milliseconds.
+
+For a whole app test, you can import the real `AppModule` and replace one provider:
+
+```typescript
+const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+  .overrideProvider(EmailService)
+  .useValue({ send: jest.fn() })           // never send real emails in tests
+  .compile();
+```
+
+Month 2's testing topic goes much further (real Postgres with Testcontainers, HTTP tests with Supertest).
+
+## Common mistakes
+
+- Adding another module's provider to your own `providers` instead of importing its module (creates a second instance).
+- Forgetting `exports`.
+- Making everything `@Global()`.
+- Putting database queries in controllers.
+- Creating dependencies with `new` inside a provider (`new EmailService()`): it bypasses DI and can't be replaced in tests.
+
+## Exercises
+
+- **2.1** 🟢 Draw the dependency tree for your app (controllers, services, repositories, modules) on paper. Mark which providers must be exported.
+- **2.2** 🟡 Create `BookingsModule` with a controller, service and in-memory repository as above. `BookingsService` must use `ServicesService` to check the service exists. Get it working without adding `ServicesService` to `BookingsModule`'s providers.
+- **2.3** 🟡 Break it on purpose: remove `exports: [ServicesService]`. Copy the error message into your notes and explain each part of it.
+- **2.4** 🔴 Write unit tests for `BookingsService.cancel`: booking not found (404), already cancelled (409), success. Use `useValue` fakes for the repository.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What is dependency injection, and why does NestJS use it?"**
+
+> "Dependency injection means a class doesn't create its own dependencies; it declares them in its constructor, and a container provides them. In NestJS, I mark classes as providers with `@Injectable()`, register them in a module, and Nest builds the whole dependency tree at startup, sharing one instance of each by default. The big benefits are testing and flexibility: in a unit test I can swap the repository or the email service for a fake, and in production I can switch implementations, for example from one email provider to another, by changing one line in a module."
+
+**"What's the difference between `providers` and `exports` in a module?"**
+
+> "`providers` are the classes the module creates and can inject internally. They're private by default. `exports` lists which of those providers other modules can use when they import this module. So to use a service from another module, that module must export it and my module must import that module. Adding the service to my own providers instead would create a second instance."

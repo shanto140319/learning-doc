@@ -1,0 +1,372 @@
+---
+title: "Lesson 5: Validation and DTOs"
+description: "ValidationPipe, class-validator DTOs, query DTOs, mapped types, your ApiError format for validation, Zod as an alternative, and safe responses."
+---
+
+Every value from outside your app is untrusted: bodies, query strings, params and headers. This lesson validates all of them at the edge, turns failures into your `ApiError` format with field-level messages, and makes sure responses never leak private fields.
+
+Install:
+
+```powershell
+npm i class-validator class-transformer
+```
+
+## The global ValidationPipe
+
+Register it once, inside DI:
+
+```typescript
+// src/app.module.ts
+import { APP_PIPE } from '@nestjs/core';
+import { ValidationPipe } from '@nestjs/common';
+
+@Module({
+  providers: [
+    {
+      provide: APP_PIPE,
+      useValue: new ValidationPipe({
+        whitelist: true,              // remove properties without decorators
+        forbidNonWhitelisted: true,   // …or better: reject them with an error
+        transform: true,              // turn plain JSON into DTO class instances, apply types
+      }),
+    },
+  ],
+})
+export class AppModule {}
+```
+
+Why each option matters:
+
+- **`whitelist` + `forbidNonWhitelisted`:** stops **mass assignment** attacks. Without them, a client can send `{"name":"Cut","businessId":"someone-else"}` or `{"role":"owner"}`, and if your code spreads the DTO into a database update, the attacker changes fields they shouldn't. This is an OWASP Top 10 issue.
+- **`transform`:** without it, your "DTO" is still a plain object, `@Type()` conversions don't apply, and default values in the class are ignored.
+
+## Body DTOs with class-validator
+
+```typescript
+// src/bookings/dto/create-booking.dto.ts
+import { IsEmail, IsUUID, IsDate, IsOptional, IsString, MaxLength, Validate } from 'class-validator';
+import { Type } from 'class-transformer';
+import { IsFutureDate } from '../../common/validators/is-future-date';
+
+export class CreateBookingDto {
+  @IsUUID()
+  serviceId!: string;
+
+  @IsEmail()
+  @MaxLength(254)
+  customerEmail!: string;
+
+  @Type(() => Date)                    // JSON has strings; convert "2026-11-03T10:00:00Z" → Date
+  @IsDate()
+  @Validate(IsFutureDate)
+  startsAt!: Date;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  note?: string;
+}
+```
+
+The `!` tells TypeScript "this is set by someone else" (the validation pipe). It's the one accepted use of `!` in Nest code.
+
+Common decorators:
+
+| Decorator | Checks |
+| --- | --- |
+| `@IsString()`, `@IsInt()`, `@IsNumber()`, `@IsBoolean()` | Type |
+| `@IsEmail()`, `@IsUUID()`, `@IsUrl()`, `@IsISO8601()` | Format |
+| `@MinLength(n)`, `@MaxLength(n)`, `@Min(n)`, `@Max(n)` | Size |
+| `@IsIn(['a','b'])`, `@IsEnum(MyEnum)` | One of a list |
+| `@IsOptional()` | Skip the other checks if the value is `undefined` or `null` |
+| `@ValidateNested()` + `@Type(() => X)` | Validate a nested object or array of objects |
+| `@ArrayMinSize(n)`, `@ArrayMaxSize(n)` | Array length |
+
+Always add **maximum lengths** on strings and arrays. Without them, someone sends a 10 MB "note".
+
+### Money and numbers
+
+```typescript
+@IsInt()
+@Min(0)
+@Max(100_000_000)
+priceCents!: number;               // integer cents, never floats (Node Lesson 6)
+```
+
+### Nested objects
+
+```typescript
+class WorkingHoursDto {
+  @IsIn(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']) day!: string;
+  @Matches(/^([01]\d|2[0-3]):[0-5]\d$/) start!: string;   // "09:00"
+  @Matches(/^([01]\d|2[0-3]):[0-5]\d$/) end!: string;
+}
+
+export class SetAvailabilityDto {
+  @ValidateNested({ each: true })
+  @Type(() => WorkingHoursDto)        // without @Type, nested objects are NOT validated
+  @ArrayMaxSize(50)
+  hours!: WorkingHoursDto[];
+}
+```
+
+### A custom validator
+
+```typescript
+// src/common/validators/is-future-date.ts
+import { ValidatorConstraint, ValidatorConstraintInterface } from 'class-validator';
+
+@ValidatorConstraint({ name: 'isFutureDate' })
+export class IsFutureDate implements ValidatorConstraintInterface {
+  validate(value: unknown): boolean {
+    return value instanceof Date && value.getTime() > Date.now();
+  }
+  defaultMessage(): string {
+    return '$property must be in the future';
+  }
+}
+```
+
+Rule of thumb: **DTO validation checks shape and format** ("is this a valid future date?"). **Business rules that need data** ("is this slot free?", "is it inside opening hours?") belong in the service.
+
+## Query DTOs
+
+Query strings are **always strings** (you saw this in Lesson 1, exercise 1.4). Use `@Type(() => Number)` to convert:
+
+```typescript
+// src/bookings/dto/list-bookings.query.ts
+export class ListBookingsQuery {
+  @IsOptional()
+  @IsIn(['confirmed', 'cancelled'])
+  status?: 'confirmed' | 'cancelled';
+
+  @IsOptional()
+  @Type(() => Date)
+  @IsDate()
+  from?: Date;
+
+  @IsOptional()
+  @Type(() => Date)
+  @IsDate()
+  to?: Date;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit: number = 20;                 // default (needs transform: true)
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  cursor?: string;
+
+  @IsOptional()
+  @IsIn(['startsAt', '-startsAt', 'createdAt', '-createdAt'])   // the allow-list from Node Lesson 7
+  sort: string = '-startsAt';
+}
+```
+
+```typescript
+@Get()
+list(@Query() query: ListBookingsQuery) {
+  // query.limit is a number, query.from is a Date
+}
+```
+
+<Callout type="warn" title="Booleans in query strings">
+`@Type(() => Boolean)` turns **any** non-empty string into `true`, including `"false"`. For a boolean query parameter, use `@Transform(({ value }) => value === 'true')` from class-transformer, or `@IsIn(['true', 'false'])` and compare yourself.
+</Callout>
+
+## Mapped types: don't repeat yourself
+
+Update DTOs are almost the same as create DTOs. Derive them:
+
+```typescript
+import { PartialType, PickType, OmitType, IntersectionType } from '@nestjs/swagger';
+// (use @nestjs/swagger's versions so Swagger docs stay correct; install it now: npm i @nestjs/swagger)
+
+export class CreateServiceDto {
+  @IsString() @MaxLength(100) name!: string;
+  @IsInt() @Min(5) @Max(480) durationMinutes!: number;
+  @IsInt() @Min(0) priceCents!: number;
+}
+
+export class UpdateServiceDto extends PartialType(CreateServiceDto) {}          // all optional
+export class RenameServiceDto extends PickType(CreateServiceDto, ['name']) {}   // only name
+```
+
+These copy the validation decorators too. They're the runtime versions of TypeScript's `Partial`, `Pick` and `Omit` from TypeScript Lesson 4.
+
+## Validation errors in your `ApiError` format
+
+By default, ValidationPipe returns `400` with an array of message strings:
+
+```json
+{ "statusCode": 400, "message": ["startsAt must be in the future", "customerEmail must be an email"], "error": "Bad Request" }
+```
+
+You want field-level errors in your format (Node Lesson 6). Use `exceptionFactory`:
+
+```typescript
+// src/common/errors/request-validation.exception.ts
+import { UnprocessableEntityException } from '@nestjs/common';
+import type { ValidationError as ClassValidatorError } from 'class-validator';
+
+export type FieldError = { field: string; message: string };
+
+export class RequestValidationException extends UnprocessableEntityException {
+  constructor(public readonly errors: FieldError[]) {
+    super('Your request has invalid fields');
+  }
+}
+
+// Flatten nested errors: hours[0].start → "hours.0.start"
+export function toFieldErrors(errors: ClassValidatorError[], parent = ''): FieldError[] {
+  return errors.flatMap((e) => {
+    const field = parent ? `${parent}.${e.property}` : e.property;
+    const own = Object.values(e.constraints ?? {}).map((message) => ({ field, message }));
+    return [...own, ...toFieldErrors(e.children ?? [], field)];
+  });
+}
+```
+
+```typescript
+new ValidationPipe({
+  whitelist: true,
+  forbidNonWhitelisted: true,
+  transform: true,
+  exceptionFactory: (errors) => new RequestValidationException(toFieldErrors(errors)),
+})
+```
+
+And one branch in your `ProblemDetailsFilter` (Lesson 4), **before** the general `HttpException` branch:
+
+```typescript
+if (exception instanceof RequestValidationException) {
+  return {
+    type: 'validation-failed',
+    title: exception.message,
+    status: 422,
+    instance,
+    requestId,
+    errors: exception.errors,
+  };
+}
+```
+
+Result:
+
+```json
+{
+  "type": "validation-failed",
+  "title": "Your request has invalid fields",
+  "status": 422,
+  "instance": "/v1/bookings",
+  "requestId": "3f1c…",
+  "errors": [
+    { "field": "startsAt", "message": "startsAt must be in the future" },
+    { "field": "customerEmail", "message": "customerEmail must be an email" }
+  ]
+}
+```
+
+Whether you use `400` or `422` is a team choice (Node Lesson 6). Just be consistent.
+
+## Option B: Zod
+
+If your frontend and backend share Zod schemas ([TypeScript Lesson 5](/docs/typescript/lesson-5-real-world)), use the `nestjs-zod` package instead of class-validator:
+
+```typescript
+import { createZodDto, ZodValidationPipe } from 'nestjs-zod';
+import { z } from 'zod';
+
+export const CreateBookingSchema = z.object({
+  serviceId: z.string().uuid(),
+  customerEmail: z.string().email().max(254),
+  startsAt: z.coerce.date().refine((d) => d.getTime() > Date.now(), 'Must be in the future'),
+  note: z.string().max(500).optional(),
+}).strict();                          // reject unknown keys, like forbidNonWhitelisted
+
+export class CreateBookingDto extends createZodDto(CreateBookingSchema) {}
+
+// app.module.ts
+providers: [{ provide: APP_PIPE, useClass: ZodValidationPipe }]
+```
+
+| | class-validator | Zod |
+| --- | --- | --- |
+| Style | Decorators on classes | Schema objects |
+| Share with Next.js | Awkward | Easy: same schema validates forms |
+| In existing NestJS codebases | Very common | Growing |
+| Swagger | Built-in with the CLI plugin | Needs `nestjs-zod`'s Swagger support (setup differs between versions) |
+
+**Learn class-validator well** (most job codebases use it), and use Zod in your own projects if you prefer. Don't mix both in one app.
+
+## Responses: never return private fields
+
+Validation protects what comes **in**. Also control what goes **out**. A service that returns a database row will one day include `passwordHash`, `stripeCustomerId` or another tenant's internal note.
+
+**Recommended: map to a response type explicitly.**
+
+```typescript
+// src/bookings/bookings.mapper.ts
+export type BookingResponse = {
+  id: string;
+  serviceId: string;
+  customerEmail: string;
+  startsAt: string;        // ISO string in UTC
+  status: 'confirmed' | 'cancelled';
+};
+
+export function toBookingResponse(b: Booking): BookingResponse {
+  return {
+    id: b.id,
+    serviceId: b.serviceId,
+    customerEmail: b.customerEmail,
+    startsAt: b.startsAt.toISOString(),
+    status: b.status,
+  };
+}
+```
+
+When a new database column is added, it **isn't exposed** until you add it here on purpose. Safe by default.
+
+**Alternative: `ClassSerializerInterceptor`** with `@Exclude()` / `@Expose()` on classes. It only works when you return **class instances** (not plain objects, and not Prisma results), which is easy to get wrong. You'll see it in older codebases:
+
+```typescript
+class UserEntity {
+  id!: string;
+  email!: string;
+  @Exclude() passwordHash!: string;
+  constructor(partial: Partial<UserEntity>) { Object.assign(this, partial); }
+}
+// register ClassSerializerInterceptor globally, then: return new UserEntity(user);
+```
+
+## Common mistakes
+
+- No global ValidationPipe, or one without `whitelist`.
+- Nested objects without `@Type(() => X)`: they're silently not validated.
+- `@Type(() => Boolean)` for query strings.
+- Strings and arrays with no maximum length.
+- Business rules (slot availability) inside DTO validators.
+- Returning database objects directly.
+
+## Exercises
+
+- **5.1** 🟢 Write `CreateServiceDto` and `UpdateServiceDto` (with `PartialType`) and use them in `POST` and `PATCH /v1/services/:id`. Test: missing name, `"priceCents": 12.5`, an extra field `"businessId"`.
+- **5.2** 🟡 Write `ListBookingsQuery` as above and use it on `GET /v1/bookings`. Log `typeof query.limit` and `query.from instanceof Date`. Test `?limit=500` and `?sort=password`.
+- **5.3** 🟡 Add `exceptionFactory` and the filter branch so validation errors return your `ApiError` format with field paths. Test with a nested `SetAvailabilityDto` error: what is the `field` for a bad `start` in the second item?
+- **5.4** 🔴 Write an `@IsBeforeField('to')` custom validator for `from`, so `?from=2026-12-01&to=2026-11-01` fails. (Hint: in `validate(value, args)`, `args.object` is the whole DTO and `args.constraints[0]` is `'to'`; use `@ValidatorConstraint` and `@Validate(IsBeforeField, ['to'])`, or `registerDecorator` for a nicer decorator.)
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you validate requests in NestJS?"**
+
+> "I register a global ValidationPipe with `whitelist`, `forbidNonWhitelisted` and `transform`. Every body and query has a DTO class with class-validator decorators, or a Zod schema if the types are shared with the frontend. `whitelist` strips or rejects unknown fields, which prevents mass-assignment attacks, and `transform` converts query strings and dates into real types. I use a custom exception factory so validation errors come back in our standard error format, with one entry per field. DTOs only check shape and format; business rules like slot availability stay in the service. And on the way out, I map entities to response types, so private fields never leak."

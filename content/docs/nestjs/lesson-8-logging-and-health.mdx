@@ -1,0 +1,310 @@
+---
+title: "Lesson 8: Logging, request context and health checks"
+description: "Structured JSON logs with Pino and request IDs, request context with AsyncLocalStorage, and liveness and readiness checks with Terminus."
+---
+
+When something breaks in production, you have only two tools: **logs** and **health checks**. This lesson sets up logs that you can actually search ("show me everything for request `3f1c…`"), shows how to carry request data like the tenant ID without passing it everywhere, and adds the health endpoints that AWS and Docker use to decide if your app is alive.
+
+## Structured logging
+
+`console.log('Booking created for ' + email)` is fine on your laptop. In production, with 20 containers writing thousands of lines a minute, you need to **filter and search**. That needs **structured logs**: one JSON object per line.
+
+```json
+{"level":"info","time":1793865600000,"reqId":"3f1c9a2e","businessId":"biz_1","bookingId":"b_8f2k","msg":"Booking created"}
+```
+
+Now your log tool (CloudWatch, Datadog, Grafana Loki) can answer "all errors for `biz_1` in the last hour" or "every line for request `3f1c9a2e`".
+
+### Pino with nestjs-pino
+
+**Pino** is the fastest common Node.js logger and writes JSON by default. `nestjs-pino` connects it to Nest and logs every request automatically.
+
+```powershell
+npm i nestjs-pino pino-http pino
+npm i -D pino-pretty
+```
+
+```typescript
+// src/app.module.ts
+import { LoggerModule } from 'nestjs-pino';
+import { randomUUID } from 'node:crypto';
+
+LoggerModule.forRootAsync({
+  inject: [ConfigService],
+  useFactory: (config: ConfigService<Env, true>) => ({
+    pinoHttp: {
+      level: config.get('LOG_LEVEL', { infer: true }),
+      // Readable output locally, JSON in production
+      transport: config.get('NODE_ENV', { infer: true }) === 'development'
+        ? { target: 'pino-pretty', options: { singleLine: true } }
+        : undefined,
+      // One ID per request: reuse the client's, or create one
+      genReqId: (req, res) => {
+        const incoming = req.headers['x-request-id'];
+        const id = typeof incoming === 'string' && incoming.length <= 100 ? incoming : randomUUID();
+        req.headers['x-request-id'] = id;     // so the exception filter can read it (Lesson 4)
+        res.setHeader('X-Request-Id', id);
+        return id;
+      },
+      // Never log secrets or personal data
+      redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers["set-cookie"]'],
+      // Don't fill logs with health checks
+      autoLogging: { ignore: (req) => req.url?.startsWith('/health') ?? false },
+    },
+  }),
+}),
+```
+
+```typescript
+// src/main.ts
+import { Logger } from 'nestjs-pino';
+
+const app = await NestFactory.create(AppModule, { bufferLogs: true });  // hold startup logs until Pino is ready
+app.useLogger(app.get(Logger));
+```
+
+This replaces your `RequestIdMiddleware` from Lesson 4, so remove it. Every request now produces one "request completed" line with method, URL, status, response time and `reqId`.
+
+### Logging in your own code
+
+```typescript
+import { InjectPinoLogger, PinoLogger } from 'nestjs-pino';
+
+@Injectable()
+export class BookingsService {
+  constructor(
+    @InjectPinoLogger(BookingsService.name) private readonly logger: PinoLogger,
+    private readonly repo: BookingsRepository,
+  ) {}
+
+  async create(businessId: string, dto: CreateBookingDto) {
+    const booking = await this.repo.insert(/* ... */);
+    this.logger.info({ businessId, bookingId: booking.id, serviceId: dto.serviceId }, 'Booking created');
+    return booking;
+  }
+}
+```
+
+Put **data in the object** and keep the **message fixed**. `'Booking created'` is easy to search; `` `Booking ${id} created for ${email}` `` isn't.
+
+You never pass `reqId`, but it's in the log line anyway. nestjs-pino uses `AsyncLocalStorage` (next section) to attach the request's logger automatically.
+
+Nest's own `Logger` (`new Logger(BookingsService.name)`) also goes to Pino after `app.useLogger(...)`, so code that already uses it keeps working.
+
+### Log levels and what to log
+
+| Level | Use for | Example |
+| --- | --- | --- |
+| `error` | Something failed and needs attention | Unhandled exception, payment provider down |
+| `warn` | Unusual, handled, may need attention | Retry, rate limit hit, slow query |
+| `info` | Important business events | Booking created, payment succeeded, user signed up |
+| `debug` | Details for debugging, off in production | Query parameters, cache hit or miss |
+
+**Never log:** passwords, tokens, API keys, full card numbers, and avoid personal data (emails, phone numbers) unless you need them and your privacy policy allows it. Log IDs instead: `customerId`, not the customer's email. Logs are often kept for months and read by many people.
+
+## Request context with AsyncLocalStorage
+
+You need the request ID, user ID and tenant ID in logs, audit records and database queries, deep inside services. Options:
+
+1. Pass them as arguments everywhere: clear, but noisy.
+2. Request-scoped providers: slow, and the scope bubbles up (Lesson 3).
+3. **`AsyncLocalStorage`**: a Node.js built-in that keeps a value available for everything that happens **during one async flow**, like a "global variable per request".
+
+```typescript
+// src/common/context/request-context.ts
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+export type RequestContext = { requestId: string; userId?: string; businessId?: string };
+
+export const requestContext = new AsyncLocalStorage<RequestContext>();
+
+export function currentContext(): RequestContext | undefined {
+  return requestContext.getStore();
+}
+```
+
+Start a context for each request, as early as possible:
+
+```typescript
+// src/main.ts
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  const requestId = String(req.headers['x-request-id'] ?? randomUUID());
+  requestContext.run({ requestId }, () => next());   // everything after next() sees this store
+});
+```
+
+Fill in the user after authentication:
+
+```typescript
+// in AuthGuard.canActivate, after finding the user
+const ctx = currentContext();
+if (ctx) {
+  ctx.userId = user.id;
+  ctx.businessId = user.businessId;
+}
+```
+
+Read it anywhere, even in a singleton:
+
+```typescript
+@Injectable()
+export class AuditLogService {
+  async record(action: string, details: Record<string, unknown>) {
+    const ctx = currentContext();
+    await this.repo.insert({
+      action,
+      details,
+      userId: ctx?.userId,
+      businessId: ctx?.businessId,
+      requestId: ctx?.requestId,
+      at: new Date(),
+    });
+  }
+}
+```
+
+Each request has **its own store**, even when 100 requests run at the same time on one thread. Node tracks which async work belongs to which `run()` call.
+
+The `nestjs-cls` package wraps this with a nicer API (`ClsService.get('businessId')`) and Nest integration. It's popular in real codebases; now you know what it does underneath.
+
+<Callout title="Explicit beats magic for tenant scoping">
+For **security-critical** values like `businessId` in database queries, many teams still prefer passing it as an explicit argument (Lesson 6), so a missing tenant is a compile error, not a silent `undefined`. Use AsyncLocalStorage for logging, audit and tracing; consider explicit arguments for data access. In Month 2 you'll also see PostgreSQL Row-Level Security as a database-level safety net.
+</Callout>
+
+## Health checks with Terminus
+
+Platforms like AWS ECS, Kubernetes and Docker call an HTTP endpoint every few seconds to decide what to do with your container. There are two different questions:
+
+| Check | Question | If it fails, the platform… | Should check |
+| --- | --- | --- | --- |
+| **Liveness** | "Is the process stuck or dead?" | **Restarts** the container | Only the process itself. Never the database |
+| **Readiness** | "Can it handle traffic right now?" | **Stops sending traffic** to it (no restart) | Dependencies: database, Redis |
+
+Why must liveness **not** check the database? If the database goes down for a minute, every container's liveness fails, the platform restarts all of them, and they all reconnect at once when it comes back. You've turned a small outage into a big one. Readiness is the right place: the containers stay alive and just stop getting traffic until the database is back.
+
+```powershell
+npm i @nestjs/terminus
+```
+
+```typescript
+// src/health/database.health.ts
+import { Injectable } from '@nestjs/common';
+import { HealthIndicatorService } from '@nestjs/terminus';
+
+@Injectable()
+export class DatabaseHealthIndicator {
+  constructor(
+    private readonly healthIndicatorService: HealthIndicatorService,
+    private readonly db: DatabaseService,          // later: PrismaService
+  ) {}
+
+  async isHealthy(key: string) {
+    const indicator = this.healthIndicatorService.check(key);
+    try {
+      await this.db.ping();                        // e.g. SELECT 1, with a short timeout
+      return indicator.up();
+    } catch (err) {
+      return indicator.down({ message: err instanceof Error ? err.message : 'unreachable' });
+    }
+  }
+}
+```
+
+```typescript
+// src/health/health.controller.ts
+import { Controller, Get, VERSION_NEUTRAL } from '@nestjs/common';
+import { HealthCheck, HealthCheckService, MemoryHealthIndicator } from '@nestjs/terminus';
+
+@Public()                                              // no auth for health checks
+@Controller({ path: 'health', version: VERSION_NEUTRAL })  // /health, not /v1/health
+export class HealthController {
+  constructor(
+    private readonly health: HealthCheckService,
+    private readonly memory: MemoryHealthIndicator,
+    private readonly database: DatabaseHealthIndicator,
+  ) {}
+
+  @Get('live')
+  live() {
+    return { status: 'ok' };                            // the process answers: it's alive
+  }
+
+  @Get('ready')
+  @HealthCheck()
+  ready() {
+    return this.health.check([
+      () => this.database.isHealthy('database'),
+      () => this.memory.checkHeap('memory_heap', 512 * 1024 * 1024),   // fail above 512 MB
+    ]);
+  }
+}
+```
+
+```typescript
+// src/health/health.module.ts
+@Module({
+  imports: [TerminusModule],
+  controllers: [HealthController],
+  providers: [DatabaseHealthIndicator],
+})
+export class HealthModule {}
+```
+
+`GET /health/ready` returns `200` when everything is up, and `503` when any check fails:
+
+```json
+{
+  "status": "error",
+  "info": { "memory_heap": { "status": "up" } },
+  "error": { "database": { "status": "down", "message": "connect ECONNREFUSED" } },
+  "details": { "database": { "status": "down", "message": "connect ECONNREFUSED" }, "memory_heap": { "status": "up" } }
+}
+```
+
+Terminus also has ready-made indicators: `PrismaHealthIndicator`, `TypeOrmHealthIndicator`, `HttpHealthIndicator`, `DiskHealthIndicator`. (Older Terminus versions write custom indicators by extending a `HealthIndicator` class; the `HealthIndicatorService` style above is the current one.)
+
+Keep health endpoints **fast and cheap**. They're called every few seconds by every load balancer. Don't put detailed internal information in public health responses.
+
+## Putting it together: shutdown and deploys
+
+During a deploy, the platform sends `SIGTERM` to old containers:
+
+1. `app.enableShutdownHooks()` (Lesson 1) starts Nest's shutdown.
+2. Readiness starts failing (or the load balancer has already removed the container), so new traffic goes elsewhere.
+3. Requests in progress finish.
+4. `onModuleDestroy` / `onApplicationShutdown` hooks close the database and Redis (Lesson 3).
+5. The process exits.
+
+`TerminusModule.forRoot({ gracefulShutdownTimeoutMs: 5000 })` adds a delay before Nest closes the server, giving the load balancer time to notice. That's the same graceful shutdown you wrote by hand in Node Lesson 3.
+
+Error tracking (Sentry) and tracing (OpenTelemetry) come in Month 3's observability topic.
+
+## Common mistakes
+
+- `console.log` in production code.
+- Building messages with string concatenation instead of putting data in the log object.
+- Logging tokens, cookies or full request bodies.
+- Checking the database in the liveness probe.
+- Health endpoints behind auth, or versioned (`/v1/health`) while the load balancer calls `/health`.
+- Storing request data in a module-level variable instead of AsyncLocalStorage.
+
+## Exercises
+
+- **8.1** 🟢 Set up nestjs-pino. Make a request and find the `reqId` in the log line and in the `X-Request-Id` response header. Send your own `X-Request-Id: test-123` and check it's reused.
+- **8.2** 🟡 Replace every `console.log` with `PinoLogger`. Log `Booking created` and `Booking cancelled` with IDs only (no email). Check that `Authorization` headers appear as `[Redacted]`.
+- **8.3** 🟡 Add the `requestContext` with AsyncLocalStorage. Fill `userId` and `businessId` in the `AuthGuard`, and write an `AuditLogService` that stores (in memory) every booking creation and cancellation with the context. Add `GET /v1/audit-log` (owner only) to see it.
+- **8.4** 🔴 Add `/health/live` and `/health/ready`. Write a fake `DatabaseService` with a `ping()` that fails when an env var `FAKE_DB_DOWN=true` is set. Show that `/health/live` stays `200` while `/health/ready` returns `503`. Explain in three sentences what ECS would do in each case.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you approach logging in a Node.js service?"**
+
+> "I use structured JSON logging with Pino, through nestjs-pino in Nest. Every request gets a request ID, which is returned in a response header and attached to every log line, so I can trace one request across the system. I log events with a fixed message and the data as fields, so they're easy to search: IDs, not personal data, and secrets like tokens and cookies are redacted. Log levels separate business events at info from debugging details, which are off in production. For context like the tenant or user ID, I use AsyncLocalStorage, so services don't need it passed everywhere."
+
+**"What's the difference between liveness and readiness checks?"**
+
+> "Liveness asks if the process is alive; if it fails, the orchestrator restarts the container, so it should only check the process itself. Readiness asks if the instance can serve traffic right now; if it fails, the load balancer stops routing to it but doesn't restart it. So database and Redis checks go in readiness. If you put the database in liveness, a short database outage makes the platform restart every container, which makes the outage worse."
