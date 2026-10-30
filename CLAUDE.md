@@ -45,6 +45,7 @@ Current state:
 - `learning-docs-content.zip` holds the roadmap as MDX: `content/docs/index.mdx`, `content/docs/meta.json` and `content/docs/roadmap/` (12 pages + `meta.json`).
 - `setup.ps1` unzips it, runs `npm create fumadocs-app@latest learning-docs`, copies the content into `learning-docs/content/docs` and starts the dev server.
 - The project **is created** in `learning-docs/` (Oct 27, 2026): Next.js 16.4, Fumadocs 16.17, fumadocs-mdx 15.4. `npm run build` passes and `npm run dev` serves all 13 roadmap pages at http://localhost:3000/docs. Don't run `setup.ps1` again: it would overwrite `content/docs`.
+- "Continue reading" is stored on the backend (Oct 30, 2026): `app/api/last-read/route.ts` (`GET`, `PUT`, problem+json errors) with SQLite via Node's built-in `node:sqlite` in `lib/last-read-db.ts` (file `data/learning-docs.db`, gitignored). `components/last-read.tsx` keeps localStorage as a fast local copy; the newer one wins. Works locally (`npm run dev` / `npm start`), not on Vercel; to deploy, swap `lib/last-read-db.ts` for Postgres.
 - Known harmless build warning: `'highlight' is not recognized as a valid pseudo-element`. It comes from Fumadocs' own CSS, not our content.
 
 Content conventions:
