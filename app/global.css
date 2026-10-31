@@ -2,6 +2,17 @@
 @import 'fumadocs-ui/css/neutral.css';
 @import 'fumadocs-ui/css/preset.css';
 
+/* Use Fira Code for all code (code blocks and inline `code`) */
+@theme {
+  --font-mono: var(--font-fira-code), ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* Turn on Fira Code ligatures (=> !== >= look like single symbols) */
+code,
+pre {
+  font-variant-ligatures: contextual;
+}
+
 html {
   scrollbar-gutter: stable;
 }
