@@ -1,0 +1,575 @@
+---
+title: "Lesson 8: Prisma (and TypeORM basics)"
+description: "Prisma 7 in NestJS: schema, migrations with custom SQL, PrismaService, queries without N+1, keyset pagination, transactions, optimistic locking, safe raw SQL, mapping database errors to HTTP, and reading TypeORM code."
+---
+
+You now know what the database can do. An ORM is how you'll use it day to day in TypeScript. **Prisma** is the most popular ORM in new NestJS and Next.js codebases, so it's your main tool. Many existing NestJS codebases use **TypeORM**, so the end of this lesson covers enough to read and change them.
+
+The golden rule: **the ORM is a tool, not a cage.** Use it for 90% of queries, and use raw SQL (safely) for the 10% it can't express well: exclusion constraints, availability slots, analytics.
+
+<Callout title="Prisma 7">
+This lesson uses **Prisma 7** (7.10 when written). Version 7 changed setup a lot: the new `prisma-client` generator with a required `output` path, **driver adapters** (`@prisma/adapter-pg`), and a `prisma.config.ts` file for the database URL. Many tutorials and AI answers still show the Prisma 5 or 6 style (`url = env("DATABASE_URL")` in the schema, `import { PrismaClient } from '@prisma/client'`). If something doesn't match, check the [official upgrade guide](https://www.prisma.io/docs/orm/more/upgrade-guides).
+</Callout>
+
+## ORM, query builder or raw SQL?
+
+| Tool | Style | Strengths | Weaknesses |
+| --- | --- | --- | --- |
+| **Prisma** | Schema file → generated, fully typed client | Excellent types and DX, migrations, popular | Some Postgres features need raw SQL; its own query style |
+| **TypeORM** | Decorated entity classes | Common in older NestJS apps, Active Record or Repository styles | Weaker type safety, more surprises (lazy relations, `synchronize`) |
+| **Drizzle** | SQL-like TypeScript | Close to SQL, light, fast-growing | Younger ecosystem |
+| **Kysely** | Typed query builder | Write SQL in TypeScript with full types | Not an ORM: no relations or migrations generation |
+| Raw `pg` | Plain SQL | Full power | You write the types and mapping |
+
+## Setup in the booking API
+
+Use your NestJS practice project. Create a **separate database** so Prisma owns it (the lesson tables stay in `booking`):
+
+```sql
+create database booking_api;
+```
+
+```powershell
+npm i -D prisma@7 tsx
+npm i @prisma/client@7 @prisma/adapter-pg pg dotenv
+npx prisma init
+```
+
+`.env` (and `.env.example` without the password):
+
+```text
+DATABASE_URL="postgresql://postgres:postgres@localhost:5432/booking_api"
+```
+
+`prisma.config.ts` in the project root:
+
+```typescript
+import 'dotenv/config';
+import { defineConfig, env } from 'prisma/config';
+
+export default defineConfig({
+  schema: 'prisma/schema.prisma',
+  migrations: {
+    path: 'prisma/migrations',
+    seed: 'tsx prisma/seed.ts',
+  },
+  datasource: {
+    url: env('DATABASE_URL'),
+  },
+});
+```
+
+## The schema
+
+`prisma/schema.prisma`, the Lesson 2 schema in Prisma form (users and memberships come with auth in Month 2):
+
+```prisma
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"            // NestJS compiles to CommonJS by default
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum BookingStatus {
+  pending
+  confirmed
+  cancelled
+
+  @@map("booking_status")
+}
+
+model Business {
+  id        String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  name      String
+  slug      String   @unique
+  timeZone  String   @default("UTC") @map("time_zone")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  staff     Staff[]
+  services  Service[]
+  customers Customer[]
+  bookings  Booking[]
+
+  @@map("businesses")
+}
+
+model Staff {
+  id         String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  businessId String    @map("business_id") @db.Uuid
+  name       String
+  deletedAt  DateTime? @map("deleted_at") @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  business Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  services StaffService[]
+  bookings Booking[]
+
+  @@unique([businessId, id])
+  @@map("staff")
+}
+
+model Service {
+  id              String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  businessId      String    @map("business_id") @db.Uuid
+  name            String
+  durationMinutes Int       @map("duration_minutes")
+  priceCents      Int       @map("price_cents")
+  currency        String    @default("USD") @db.Char(3)
+  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz(3)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  business Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  staff    StaffService[]
+  bookings Booking[]
+
+  @@unique([businessId, id])
+  @@map("services")
+}
+
+model StaffService {
+  businessId String @map("business_id") @db.Uuid
+  staffId    String @map("staff_id") @db.Uuid
+  serviceId  String @map("service_id") @db.Uuid
+
+  staff   Staff   @relation(fields: [businessId, staffId], references: [businessId, id], onDelete: Cascade)
+  service Service @relation(fields: [businessId, serviceId], references: [businessId, id], onDelete: Cascade)
+
+  @@id([staffId, serviceId])
+  @@index([serviceId])
+  @@map("staff_services")
+}
+
+model Customer {
+  id         String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  businessId String   @map("business_id") @db.Uuid
+  email      String                     // stored lowercase (see below)
+  name       String
+  phone      String?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  bookings Booking[]
+
+  @@unique([businessId, id])
+  @@unique([businessId, email])
+  @@map("customers")
+}
+
+model Booking {
+  id          String        @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  businessId  String        @map("business_id") @db.Uuid
+  serviceId   String        @map("service_id") @db.Uuid
+  staffId     String        @map("staff_id") @db.Uuid
+  customerId  String        @map("customer_id") @db.Uuid
+  startsAt    DateTime      @map("starts_at") @db.Timestamptz(3)
+  endsAt      DateTime      @map("ends_at") @db.Timestamptz(3)
+  status      BookingStatus @default(confirmed)
+  priceCents  Int           @map("price_cents")
+  notes       String?
+  version     Int           @default(1)
+  cancelledAt DateTime?     @map("cancelled_at") @db.Timestamptz(3)
+  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  service  Service  @relation(fields: [businessId, serviceId], references: [businessId, id], onDelete: NoAction)
+  staff    Staff    @relation(fields: [businessId, staffId], references: [businessId, id], onDelete: NoAction)
+  customer Customer @relation(fields: [businessId, customerId], references: [businessId, id], onDelete: NoAction)
+
+  @@index([businessId, startsAt(sort: Desc), id(sort: Desc)])
+  @@index([businessId, customerId])
+  @@index([businessId, serviceId])
+  @@map("bookings")
+}
+
+model IdempotencyKey {
+  scope          String
+  key            String
+  requestHash    String   @map("request_hash")
+  status         String
+  responseStatus Int?     @map("response_status")
+  responseBody   Json?    @map("response_body")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@id([scope, key])
+  @@map("idempotency_keys")
+}
+
+model OutboxEvent {
+  id          BigInt    @id @default(autoincrement())
+  topic       String
+  payload     Json
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  publishedAt DateTime? @map("published_at") @db.Timestamptz(3)
+
+  @@map("outbox")
+}
+```
+
+Things to notice:
+
+- **`@db.Timestamptz(3)` on every `DateTime`.** Prisma's default for `DateTime` on Postgres is `timestamp(3)` **without** time zone. This is a very common, silent mistake.
+- `@map` / `@@map` keep `snake_case` in the database and `camelCase` in TypeScript.
+- `@default(dbgenerated("uuidv7()"))` lets Postgres create the ID, so raw SQL inserts get one too.
+- Prisma can't express a `lower(email)` unique index, so the app stores emails in lowercase (a `Transform` in the DTO) and the schema uses a normal unique. A `check` in SQL makes sure of it.
+- `onDelete: NoAction` on the composite relations: you can't delete a service that has bookings (Lesson 2).
+
+## Migrations, including custom SQL
+
+```powershell
+npx prisma migrate dev --name init     # create SQL from the schema and apply it
+npx prisma generate                    # generate the typed client (Prisma 7 doesn't do it automatically)
+```
+
+Look at `prisma/migrations/<timestamp>_init/migration.sql`. **Always read the generated SQL**: it's what runs in production.
+
+Prisma can't express check constraints, exclusion constraints, partial indexes or expression indexes. Add them in a migration you write yourself:
+
+```powershell
+npx prisma migrate dev --create-only --name booking_rules
+```
+
+Edit the new, empty `migration.sql`:
+
+```sql
+create extension if not exists btree_gist;
+
+alter table bookings
+  add constraint bookings_time_order check (ends_at > starts_at),
+  add constraint bookings_cancelled_consistent
+    check ((status = 'cancelled') = (cancelled_at is not null)),
+  add constraint bookings_price_check check (price_cents >= 0),
+  add constraint bookings_no_overlap
+    exclude using gist (staff_id with =, tstzrange(starts_at, ends_at, '[)') with &&)
+    where (status <> 'cancelled');
+
+alter table services
+  add constraint services_duration_check check (duration_minutes between 5 and 480),
+  add constraint services_price_check check (price_cents >= 0);
+
+alter table customers
+  add constraint customers_email_lowercase check (email = lower(email));
+
+create unique index services_business_name_key
+  on services (business_id, lower(name)) where deleted_at is null;
+```
+
+Then `npx prisma migrate dev` applies it.
+
+<Callout type="warn" title="Check every later migration">
+Prisma doesn't know about the objects you added by hand. After each future `migrate dev --create-only`, read the SQL and make sure it doesn't try to drop or change your custom constraints and indexes. If it does, delete those lines before applying.
+</Callout>
+
+| Command | Where | What |
+| --- | --- | --- |
+| `prisma migrate dev` | Your laptop | Create and apply migrations; may reset the dev database |
+| `prisma migrate deploy` | CI / production | Apply pending migrations only. Never creates or resets |
+| `prisma migrate status` | Anywhere | What's applied, what's pending |
+| `prisma migrate reset` | Your laptop only | Drop everything, re-apply, seed |
+| `prisma db seed` | Your laptop, test | Run the seed script |
+| `prisma studio` | Your laptop | A GUI to browse data |
+
+Lesson 9 covers migrations in production.
+
+## PrismaService in NestJS
+
+```typescript
+// src/database/prisma.service.ts
+import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { PrismaPg } from '@prisma/adapter-pg';
+import { PrismaClient } from '../generated/prisma/client';
+
+@Injectable()
+export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
+  constructor(config: ConfigService) {
+    const adapter = new PrismaPg({
+      connectionString: config.getOrThrow<string>('DATABASE_URL'),
+      max: 10,                         // pool size lives on the driver adapter (Lesson 9)
+    });
+    super({ adapter, log: config.get('NODE_ENV') === 'development' ? ['query', 'warn', 'error'] : ['warn', 'error'] });
+  }
+
+  async onModuleInit(): Promise<void> {
+    await this.$connect();
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.$disconnect();          // runs on shutdown thanks to enableShutdownHooks()
+  }
+}
+
+// src/database/database.module.ts
+@Global()
+@Module({ providers: [PrismaService], exports: [PrismaService] })
+export class DatabaseModule {}
+```
+
+This is one of the few good uses of `@Global()` ([NestJS Lesson 2](/docs/nestjs/lesson-2-modules-and-di)). For the readiness check, run ``await this.prisma.$queryRaw`select 1` `` in your Terminus health indicator.
+
+## Queries
+
+The repository is the only layer that talks to Prisma ([NestJS Lesson 2](/docs/nestjs/lesson-2-modules-and-di): controller → service → repository).
+
+```typescript
+@Injectable()
+export class BookingsRepository {
+  constructor(private readonly prisma: PrismaService) {}
+
+  findById(businessId: string, id: string) {
+    // findFirst, not findUnique: we filter by tenant too
+    return this.prisma.booking.findFirst({ where: { id, businessId } });
+  }
+
+  list(businessId: string, limit: number, after?: { startsAt: Date; id: string }) {
+    return this.prisma.booking.findMany({
+      where: {
+        businessId,
+        ...(after && {
+          OR: [
+            { startsAt: { lt: after.startsAt } },
+            { startsAt: after.startsAt, id: { lt: after.id } },
+          ],
+        }),
+      },
+      orderBy: [{ startsAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,                          // one extra to know if there's a next page
+      select: {
+        id: true, startsAt: true, endsAt: true, status: true, version: true,
+        customer: { select: { id: true, name: true } },
+        service: { select: { id: true, name: true } },
+      },
+    });
+  }
+}
+```
+
+- **`select` vs `include`:** `include` adds relations to **all** columns; `select` picks exactly what you need. Use `select` for lists and API responses: less data, no accidental leaks. (`omit: { passwordHash: true }` also exists, even globally on the client.)
+- The `OR` condition is the keyset cursor from Node Lesson 7, written in Prisma. Prisma also has a built-in `cursor: { id }, skip: 1`, which works when you sort by a unique column; the manual version works with any sort.
+- The return type is inferred from your `select`. Hover over it in VS Code.
+
+### N+1 in Prisma
+
+```typescript
+// N+1: 1 + 20 queries
+const bookings = await prisma.booking.findMany({ where: { businessId }, take: 20 });
+for (const b of bookings) {
+  const customer = await prisma.customer.findUnique({ where: { id: b.customerId } });
+}
+
+// 2 queries: Prisma loads all customers with one "where id in (...)"
+const bookings = await prisma.booking.findMany({
+  where: { businessId }, take: 20,
+  select: { id: true, customer: { select: { name: true } } },
+});
+```
+
+With `log: ['query']` on, you can see the exact SQL and count the queries.
+
+## Transactions
+
+```typescript
+// 1. Batch: independent writes, all or nothing
+await prisma.$transaction([
+  prisma.booking.update({ where: { id }, data: { status: 'cancelled', cancelledAt: new Date() } }),
+  prisma.outboxEvent.create({ data: { topic: 'booking.cancelled', payload: { bookingId: id } } }),
+]);
+
+// 2. Interactive: logic between queries. Use `tx`, never `prisma`, inside!
+const booking = await prisma.$transaction(
+  async (tx) => {
+    const service = await tx.service.findFirst({ where: { id: input.serviceId, businessId, deletedAt: null } });
+    if (!service) throw new NotFoundError('service', input.serviceId);
+
+    const customer = await tx.customer.upsert({
+      where: { businessId_email: { businessId, email: input.customerEmail } },
+      create: { businessId, email: input.customerEmail, name: input.customerName },
+      update: {},
+    });
+
+    const startsAt = new Date(input.startsAt);
+    const created = await tx.booking.create({
+      data: {
+        businessId, serviceId: service.id, staffId: input.staffId, customerId: customer.id,
+        startsAt, endsAt: new Date(startsAt.getTime() + service.durationMinutes * 60_000),
+        priceCents: service.priceCents,
+      },
+    });
+
+    await tx.outboxEvent.create({
+      data: { topic: 'booking.created', payload: { bookingId: created.id, businessId } },
+    });
+    return created;
+  },
+  { timeout: 5000, isolationLevel: 'ReadCommitted' },   // or 'Serializable' + retry on P2034
+);
+```
+
+The same rules as Lesson 6: keep it short, no external calls inside, and if you throw, everything rolls back.
+
+### Optimistic locking
+
+```typescript
+const { count } = await prisma.booking.updateMany({
+  where: { id, businessId, version: expectedVersion },
+  data: { startsAt, endsAt, version: { increment: 1 } },
+});
+if (count === 0) throw new VersionConflictError();   // → 409, or 412 with If-Match
+```
+
+`updateMany` returns a count instead of throwing when nothing matches, which is exactly what you need here.
+
+## Raw SQL, safely
+
+```typescript
+import { Prisma } from '../generated/prisma/client';
+
+// tagged template: values become parameters ($1, $2). SAFE
+const slots = await prisma.$queryRaw<{ starts_at: Date; ends_at: Date }[]>`
+  select s as starts_at, s + interval '30 minutes' as ends_at
+  from generate_series(
+    (${date}::date + time '09:00') at time zone ${timeZone},
+    (${date}::date + time '17:00') at time zone ${timeZone} - interval '30 minutes',
+    interval '30 minutes') as s
+  where not exists (
+    select 1 from bookings b
+    where b.staff_id = ${staffId}::uuid and b.status <> 'cancelled'
+      and tstzrange(b.starts_at, b.ends_at, '[)') && tstzrange(s, s + interval '30 minutes', '[)')
+  )
+  order by s`;
+
+// building dynamic SQL from pieces, still safe
+const ids = ['...', '...'];
+await prisma.$queryRaw`select * from bookings where id in (${Prisma.join(ids)})`;
+
+// DANGEROUS: string in, SQL injection out. Avoid
+await prisma.$queryRawUnsafe(`select * from bookings where status = '${status}'`);
+```
+
+Raw queries return column names as written in SQL (`starts_at`), and you provide the type yourself. For bigger raw queries, look at Prisma's **TypedSQL**: you write `.sql` files in `prisma/sql/`, and `prisma generate --sql` creates fully typed functions for them.
+
+## Mapping database errors to HTTP
+
+Do this in one place: the repository (turning them into your domain errors) or the global exception filter from [NestJS Lesson 4](/docs/nestjs/lesson-4-request-lifecycle).
+
+| Prisma code | Meaning | HTTP |
+| --- | --- | --- |
+| `P2002` | Unique constraint failed (`meta` says which fields) | 409 |
+| `P2003` | Foreign key failed | 422 or 409 |
+| `P2025` | Record to update/delete not found | 404 |
+| `P2034` | Write conflict or deadlock: retry the transaction | Retry, then 409 / 503 |
+
+```typescript
+import { Prisma } from '../generated/prisma/client';
+
+export function isPrismaError(err: unknown, code: string): err is Prisma.PrismaClientKnownRequestError {
+  return err instanceof Prisma.PrismaClientKnownRequestError && err.code === code;
+}
+
+// Prisma has no special code for exclusion constraints, so check the constraint name.
+export function isOverlapViolation(err: unknown): boolean {
+  return err instanceof Error && err.message.includes('bookings_no_overlap');
+}
+```
+
+Trigger an overlap once and `console.dir(err, { depth: 5 })` it, to see exactly what your Prisma version returns (the code and where the constraint name appears). Then make the check as specific as you can.
+
+## TypeORM basics
+
+Enough to work in an existing TypeORM codebase:
+
+```typescript
+// entity: a class with decorators = a table
+@Entity({ name: 'bookings' })
+export class BookingEntity {
+  @PrimaryGeneratedColumn('uuid') id!: string;
+  @Column({ name: 'business_id', type: 'uuid' }) businessId!: string;
+  @Column({ name: 'starts_at', type: 'timestamptz' }) startsAt!: Date;
+  @Column({ type: 'text', default: 'confirmed' }) status!: 'pending' | 'confirmed' | 'cancelled';
+  @VersionColumn() version!: number;                         // optimistic locking built in
+
+  @ManyToOne(() => CustomerEntity, (c) => c.bookings)
+  @JoinColumn({ name: 'customer_id' })
+  customer!: CustomerEntity;
+}
+
+// module and service
+@Module({ imports: [TypeOrmModule.forFeature([BookingEntity])], providers: [BookingsService] })
+export class BookingsModule {}
+
+@Injectable()
+export class BookingsService {
+  constructor(
+    @InjectRepository(BookingEntity) private readonly repo: Repository<BookingEntity>,
+    private readonly dataSource: DataSource,
+  ) {}
+
+  list(businessId: string) {
+    return this.repo.find({
+      where: { businessId },
+      order: { startsAt: 'DESC' },
+      take: 20,
+      relations: { customer: true },               // join, avoids N+1
+    });
+  }
+
+  search(businessId: string, q: string) {
+    return this.repo.createQueryBuilder('b')
+      .leftJoinAndSelect('b.customer', 'c')
+      .where('b.business_id = :businessId', { businessId })   // named parameters: safe
+      .andWhere('c.name ilike :q', { q: `%${q}%` })
+      .getMany();
+  }
+
+  cancel(id: string) {
+    return this.dataSource.transaction(async (manager) => {
+      // use `manager` inside, like Prisma's `tx`
+      await manager.update(BookingEntity, { id }, { status: 'cancelled' });
+    });
+  }
+}
+```
+
+TypeORM traps to look for in code reviews:
+
+- **`synchronize: true`** changes the database schema to match the entities on startup. Fine for a toy project, dangerous in production (it can drop columns). Use migrations (`typeorm migration:generate`, `migration:run`).
+- `!` on every property: TypeORM's types don't guarantee a relation is loaded. `booking.customer` is `undefined` unless you asked for it.
+- `eager: true` and lazy relations hide queries and cause N+1.
+- `save()` does a select first and then an insert or update; use `insert()` / `update()` when you know which one you want.
+
+## Common mistakes
+
+- `DateTime` without `@db.Timestamptz`.
+- Using `prisma` instead of `tx` inside an interactive transaction (that query runs outside the transaction).
+- `include` everything, then returning it from the API (leaks and slow).
+- `findUnique({ where: { id } })` without the tenant check.
+- Forgetting `prisma generate` after a schema change (Prisma 7 doesn't run it automatically).
+- Editing a migration that's already been applied somewhere.
+- `$queryRawUnsafe` with user input.
+- Catching every Prisma error as "409".
+
+## Exercises
+
+- **8.1** 🟢 Set up Prisma 7 in your NestJS booking API with the schema above and both migrations. Connect `psql` to `booking_api`, run `\d bookings`, and compare it with the Lesson 2 schema. List every difference and decide whether it matters.
+- **8.2** 🟡 Replace the in-memory `BookingsRepository` with Prisma: `list` (keyset, `select`), `findById` (tenant-scoped), `create` (the interactive transaction with the outbox event), `cancel` (only if not already cancelled). Map errors: overlap → `slot-taken` 409, `P2025` → 404. Keep the controller and service unchanged as much as possible: that's the point of the repository layer.
+- **8.3** 🟡 Write a seed script (`prisma/seed.ts`) that's safe to run twice (use `upsert` on unique keys): 2 businesses, 3 staff each, 3 services, staff–service links, 20 customers, 50 bookings. Then turn on query logging, call `GET /v1/bookings`, and count the queries. Write an N+1 version on purpose and count again.
+- **8.4** 🔴 Add `GET /v1/staff/:id/availability?date=2026-11-10` using `$queryRaw` (or TypedSQL), with the slot length from the service and the business's time zone. Add `PATCH /v1/bookings/:id` (reschedule) with optimistic locking: return `ETag: "<version>"` on `GET`, require `If-Match` on `PATCH`, and return 412 when it doesn't match, or 409 `slot-taken` when the new time overlaps.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"Why Prisma? What are its limits?"**
+
+> "Prisma gives me a typed client generated from one schema file, so query results are fully typed, including the exact fields I select, and it has a good migration workflow. That makes everyday CRUD fast and safe. Its limits are database-specific features: it can't express check constraints, exclusion constraints, partial or expression indexes, and some complex queries. For those, I write custom SQL in migrations and use its tagged-template raw queries, which are still parameterised. I always read the generated SQL, watch the query log for N+1 problems, and use select to return only the fields I need."
+
+**"Have you used TypeORM?"**
+
+> "Yes, I can work with it. It uses decorated entity classes and repositories, which fit naturally with NestJS's TypeOrmModule. The things I watch out for are synchronize being turned on outside local development, lazy or eager relations causing N+1 queries, and relations being undefined when they weren't loaded. I use migrations, named parameters in the query builder, and the data source's transaction method with its entity manager."

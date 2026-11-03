@@ -1,0 +1,126 @@
+---
+title: "PostgreSQL"
+description: "PostgreSQL for production backends: data modelling, time ranges and no double bookings, indexes, EXPLAIN ANALYZE, transactions and locking, advanced SQL, Prisma, migrations, pooling, multi-tenancy and scaling. Phase 1, Month 1."
+---
+
+PostgreSQL ("Postgres") is the default database for new TypeScript backends, and it's in almost every remote full-stack job ad you're targeting. Interviewers expect more than CRUD: they ask how you'd model data, why a query is slow, and what happens when two requests change the same row at the same time.
+
+All examples build the **booking platform** (Project 1). By the end, your NestJS booking API stores everything in Postgres, and **the database itself makes double bookings impossible**, even under heavy concurrent traffic.
+
+<Callout title="My progress">
+- Lesson 1 (setup and SQL foundations): not started
+- Lesson 2 (data modelling and constraints): not started
+- Lesson 3 (time, ranges and no double bookings): not started
+- Lesson 4 (indexes): not started
+- Lesson 5 (EXPLAIN ANALYZE and N+1): not started
+- Lesson 6 (transactions and locking): not started
+- Lesson 7 (advanced SQL): not started
+- Lesson 8 (Prisma and TypeORM basics): not started
+- Lesson 9 (migrations, pooling and operations): not started
+- Lesson 10 (multi-tenancy, security and scaling): not started
+- Practice project: not started
+</Callout>
+
+## Before you start
+
+Finish the [NestJS](/docs/nestjs) section first, or at least its practice project. In this section you replace that project's in-memory repositories with Postgres. Lesson 7 of [Node.js and HTTP](/docs/node-http/lesson-7-lists-and-retries) (cursor pagination and idempotency keys) is used again in Lessons 4, 6 and 8.
+
+## What you will learn
+
+| Lessons | Topic | You will be able to… |
+| --- | --- | --- |
+| 1 | Setup and SQL foundations | Run Postgres in Docker, use `psql`, pick the right data types, handle `NULL`, write joins and aggregates |
+| 2 | Data modelling | Turn requirements into tables, relations and constraints; design multi-tenant tables; do soft deletes properly |
+| 3 | Time and ranges | Store times correctly across time zones, and block double bookings with an exclusion constraint |
+| 4 | Indexes | Choose B-tree, composite, partial, expression, covering, GIN, GiST and BRIN indexes, and know their costs |
+| 5 | Query performance | Read `EXPLAIN ANALYZE`, find slow queries with `pg_stat_statements`, fix N+1 queries |
+| 6 | Transactions and locking | Explain MVCC and isolation levels, prevent lost updates, use `FOR UPDATE`, `SKIP LOCKED`, optimistic locking and retries |
+| 7 | Advanced SQL | Write CTEs, window functions, `FILTER`, `LATERAL`, JSONB queries, full-text search and materialized views |
+| 8 | Prisma | Model the schema in Prisma 7, query without N+1, run transactions, use raw SQL safely, map DB errors to HTTP; read TypeORM code |
+| 9 | Operations | Run migrations safely in production (zero downtime), seed data, size connection pools, understand VACUUM, backups and monitoring |
+| 10 | Multi-tenancy and scaling | Isolate tenants with row-level security, prevent SQL injection, and explain how you'd scale the database |
+
+### Topics added beyond the roadmap
+
+The roadmap's list (modelling, constraints, soft deletes, indexes, `EXPLAIN ANALYZE`, N+1, transactions, isolation, locking, migrations, seeding, pooling, CTEs, window functions, JSONB, full-text search, Prisma, TypeORM basics, raw SQL) is the core, and every item is covered. These are added because **your projects need them** or **interviews ask about them**:
+
+| Added topic | Why | Lesson |
+| --- | --- | --- |
+| `timestamptz`, IANA time zones, DST | Project 1 has "time zones" as a requirement; time bugs are the most common booking bugs | 3 |
+| Range types and **exclusion constraints** (`btree_gist`) | The roadmap says "no double-booking enforced in Postgres". This is how | 3 |
+| Composite foreign keys for tenant safety | Stops a booking pointing at another business's service | 2 |
+| Covering, expression and BRIN indexes | Common in performance interviews | 4 |
+| `pg_stat_statements`, why the planner ignores an index | How you find slow queries in real jobs | 5 |
+| MVCC, write skew, advisory locks, deadlocks, retrying `40001` | "How do you handle concurrency?" is a top backend interview question | 6 |
+| `SKIP LOCKED` job queues and the **transactional outbox** | Needed for reminders, webhooks (Mini-build B) and BullMQ in Month 2 | 6 |
+| `ON CONFLICT` upserts | Idempotency keys stored in Postgres | 6 |
+| `LATERAL`, `generate_series`, views and materialized views | Availability slots and analytics (Mini-build A: clicks per day) | 3, 7 |
+| Prisma 7 setup (driver adapters, `prisma.config.ts`), custom SQL in migrations | Prisma changed a lot in version 7; old tutorials are out of date | 8 |
+| **Zero-downtime migrations** (expand and contract, `CONCURRENTLY`, `lock_timeout`) | A migration that locks a big table is a classic production outage | 9 |
+| VACUUM, backups, `pg_stat_activity`, database roles | Basic operations every senior backend engineer knows | 9 |
+| **Row-level security (RLS)** | A safety net for multi-tenant data, popular with Supabase-style stacks | 10 |
+| Read replicas, partitioning, sharding (for system design) | "How would you scale this?" in Phase 3 interviews | 10 |
+| PostgreSQL 18 features (`uuidv7()`, `WITHOUT OVERLAPS`, buffers in `EXPLAIN ANALYZE`) | You're learning on the current version | 1, 3, 5 |
+
+### Topics left for later (on purpose)
+
+| Topic | When |
+| --- | --- |
+| Integration tests against real Postgres with Testcontainers | Month 2, testing |
+| Redis caching in front of Postgres | Month 2 |
+| Postgres in docker-compose with the API, AWS RDS, backups in CI/CD | Month 2–3, Docker and AWS |
+| `pgvector` and hybrid search (vector + full-text) | Phase 2, RAG |
+| Writing your own extensions, PL/pgSQL in depth, logical replication setup | Not needed for your target jobs |
+
+## Setup
+
+You need Docker Desktop. (If you can't use Docker, install PostgreSQL 18 for Windows from postgresql.org; everything else is the same.)
+
+Create a practice folder, for example `pg-practice`, next to your `booking-api` project, and add `docker-compose.yml`:
+
+```yaml
+services:
+  db:
+    image: postgres:18
+    container_name: booking-pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: booking
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql   # PostgreSQL 18 images use this path (not .../data)
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
+
+volumes:
+  pgdata:
+```
+
+```powershell
+docker compose up -d
+docker exec -it booking-pg psql -U postgres -d booking
+```
+
+You should see the `booking=#` prompt. Type `select version();` and check it says PostgreSQL 18. Type `\q` to quit.
+
+A GUI is useful too: **DBeaver** (free), **TablePlus**, or the **PostgreSQL extension for VS Code**. Connection: host `localhost`, port `5432`, user `postgres`, password `postgres`, database `booking`. Still learn `psql`: in interviews and on servers, it's what you'll have.
+
+## How each lesson works
+
+Same as before: type the examples yourself (don't copy and paste), do the exercises without help, send them to Claude for a scored review, then check the [Solutions](/docs/postgresql/solutions). Write your mistakes in each page's notes box and practise the interview answers out loud.
+
+Keep every SQL file you write in `pg-practice/sql/` (`01-basics.sql`, `02-schema.sql`, …). You'll reuse them, and they become your personal reference.
+
+## Schedule (about 3 weeks)
+
+| When | What |
+| --- | --- |
+| Week 1 | Lessons 1, 2, 3 (Lesson 3 is the most important for Project 1; take two sessions) |
+| Week 2 | Lessons 4, 5, 6 (Lesson 6 is the most important for interviews; take two sessions) |
+| Week 3 | Lessons 7, 8, 9, 10 |
+| Week 3, Friday block | [Practice project](/docs/postgresql/practice-project) |
+
+Then: Mini-build A (URL shortener), which uses everything here.
+
+**Done means:** you can design the booking schema from memory with its constraints, explain why a query is slow from its plan, show that 20 parallel booking requests for the same slot produce exactly one booking, and explain isolation levels and locking in English without notes.

@@ -1,0 +1,226 @@
+---
+title: "Lesson 4: Indexes"
+description: "How B-tree indexes work, composite column order, partial, expression and covering indexes, GIN, GiST and BRIN, indexing foreign keys, and what indexes cost."
+---
+
+An index is like the index at the back of a book: instead of reading every page to find "PostgreSQL", you look it up and jump to page 212. Without an index, Postgres reads every row (a **sequential scan**). With 100 rows that's fine. With 1 million bookings, it's a slow page and an unhappy database.
+
+Indexing is the most common database topic in backend interviews. You need to explain **which** index you'd add for a query and **why**.
+
+## Get a big table first
+
+Indexes only matter with real amounts of data. This script creates 10 businesses, 50 staff, 20,000 customers and **1,000,000 bookings**. Save it as `sql/04-seed-big.sql`. It takes a minute or two.
+
+```sql
+truncate businesses cascade;
+
+insert into businesses (name, slug, time_zone)
+select 'Business ' || g, 'business-' || g, 'Asia/Dhaka'
+from generate_series(1, 10) g;
+
+insert into staff (business_id, name)
+select b.id, 'Staff ' || g from businesses b cross join generate_series(1, 5) g;
+
+insert into services (business_id, name, duration_minutes, price_cents)
+select b.id, 'Haircut', 30, 50000 from businesses b;
+
+insert into customers (business_id, email, name)
+select b.id, 'customer' || g || '@' || b.slug || '.test', 'Customer ' || g
+from businesses b cross join generate_series(1, 2000) g;
+
+-- 20,000 hourly bookings per staff member = 1,000,000 bookings, every 10th cancelled
+insert into bookings (business_id, service_id, staff_id, customer_id,
+                      starts_at, ends_at, status, cancelled_at, price_cents)
+select st.business_id, sv.id, st.id,
+       c.ids[1 + (g % 2000)],
+       t.starts_at, t.starts_at + interval '30 minutes',
+       case when g % 10 = 0 then 'cancelled' else 'confirmed' end,
+       case when g % 10 = 0 then t.starts_at - interval '1 day' end,
+       sv.price_cents
+from staff st
+join services sv on sv.business_id = st.business_id
+join (select business_id, array_agg(id) as ids from customers group by business_id) c
+  on c.business_id = st.business_id
+cross join generate_series(0, 19999) g
+cross join lateral (select timestamptz '2025-06-01 03:00Z' + g * interval '1 hour' as starts_at) t;
+
+analyze;   -- update the planner's statistics (Lesson 5)
+```
+
+```sql
+\timing on
+select count(*) from bookings;              -- 1000000
+select pg_size_pretty(pg_total_relation_size('bookings'));
+```
+
+## How a B-tree index works
+
+The default index type is a **B-tree**: a sorted, balanced tree of the indexed values, each pointing to the row's location in the table.
+
+```text
+                    [ M ]
+            /                 \
+     [ D  H ]                 [ R  W ]
+    /   |    \               /   |    \
+ [A-C] [D-G] [H-L]       [M-Q] [R-V] [W-Z]   ← leaf pages, sorted, linked
+                                               each entry → row in the table
+```
+
+Finding one value takes a few page reads, even for millions of rows (it's O(log n)). Because leaves are **sorted and linked**, a B-tree also helps with:
+
+- `=`, `<`, `>`, `between`, `in (...)`
+- `order by` on the indexed columns (no sort step needed)
+- `like 'abc%'` (prefix), but **not** `like '%abc'`
+- `min()` / `max()`
+
+```sql
+create index bookings_starts_at_idx on bookings (starts_at);
+```
+
+## Composite indexes and column order
+
+Our most important query, the bookings list from [Node Lesson 7](/docs/node-http/lesson-7-lists-and-retries), with keyset pagination:
+
+```sql
+select id, starts_at, status from bookings
+where business_id = $1
+  and (starts_at, id) < ($2, $3)          -- the cursor
+order by starts_at desc, id desc
+limit 20;
+```
+
+The best index:
+
+```sql
+create index bookings_business_starts_idx
+  on bookings (business_id, starts_at desc, id desc);
+```
+
+A composite index is sorted by the first column, then the second inside it, and so on, like a phone book sorted by last name, then first name. So Postgres jumps to this business, then to the cursor position, and reads 20 rows **already in order**. No sorting, no matter how many bookings the business has.
+
+**The column order rule:**
+
+1. Columns compared with `=` first.
+2. Then the column used for a range (`<`, `>`, `between`) or `order by`.
+3. Usually only **one** range column is useful; columns after it can't be used for jumping.
+
+An index on `(a, b, c)` helps queries that filter on `a`, on `a` and `b`, or on `a`, `b` and `c`: the **leftmost prefix**. It usually doesn't help a filter on `b` alone, just as a phone book sorted by last name doesn't help you find everyone called "Rahim". (PostgreSQL 18 added **skip scan**, which can use the index when the first column has only a few distinct values, but don't design for it.)
+
+Should you also create an index on `business_id` alone? No: `(business_id, starts_at, id)` already covers it.
+
+## Partial indexes
+
+Index only the rows you query. The reminder job asks "confirmed bookings starting in the next 24 hours":
+
+```sql
+create index bookings_upcoming_confirmed_idx
+  on bookings (starts_at)
+  where status = 'confirmed';
+```
+
+Smaller index, faster writes for rows outside it, and the query must include the same condition (`where status = 'confirmed' and starts_at between ...`) for Postgres to use it. You already used a partial **unique** index for soft deletes in Lesson 2.
+
+Indexing `status` on its own is almost useless: with 3 possible values, each value matches a third of the table, and reading the table directly is faster. Low-cardinality columns belong in a partial index's `where`, or after the `=` columns in a composite index.
+
+## Expression indexes
+
+If the query uses a function on a column, the index must use the same expression:
+
+```sql
+-- this query can't use an index on (email)
+select * from users where lower(email) = lower($1);
+
+create unique index users_email_key on users (lower(email));   -- Lesson 2: now it can
+```
+
+The same goes for `date(created_at)`, `(data->>'country')` and so on. Often it's better to change the query instead: `created_at >= $1 and created_at < $2` uses a normal index on `created_at`; `date(created_at) = $1` doesn't.
+
+## Covering indexes and index-only scans
+
+Normally Postgres finds the entry in the index, then visits the table to read the other columns. If the index contains **every column the query needs**, it can skip the table: an **index-only scan**.
+
+```sql
+-- "a staff member's day": only needs starts_at, ends_at, status
+create index bookings_staff_day_idx
+  on bookings (staff_id, starts_at)
+  include (ends_at, status);
+```
+
+`include` adds columns to the index leaves without making them part of the sort order. Index-only scans work best on tables where most rows haven't changed recently (Postgres checks the "visibility map", which VACUUM keeps up to date; Lesson 9).
+
+## Other index types
+
+| Type | Good for | Example |
+| --- | --- | --- |
+| **B-tree** (default) | Equality, ranges, sorting | Almost everything |
+| **GIN** | "Contains" searches over values with many parts: JSONB, arrays, full-text, trigrams | `where metadata @> '{"source": "instagram"}'`, `where tags @> array['vip']`, full-text search (Lesson 7) |
+| **GiST** | Ranges, geometry, "nearest" | The exclusion constraint (Lesson 3), PostGIS |
+| **BRIN** | Huge, append-only tables where values follow the physical order | `clicks.created_at` in the URL shortener: tiny index, good for time ranges |
+| **Hash** | Only `=` | Rarely better than B-tree |
+| HNSW / IVFFlat (pgvector) | Vector similarity | Phase 2, RAG |
+
+```sql
+-- fuzzy and "contains" search on names: where name ilike '%rah%'
+create extension if not exists pg_trgm;
+create index customers_name_trgm_idx on customers using gin (name gin_trgm_ops);
+```
+
+## Index your foreign keys
+
+From Lesson 2: Postgres doesn't index foreign key columns for you. Without one:
+
+- "This customer's bookings" scans all bookings.
+- Deleting a customer (or soft-deleting checks with joins) scans all bookings to check the foreign key.
+
+Check every `references` you write and ask "is the referencing column the **first** column of some index?". In our schema, `(business_id, customer_id)` and `(business_id, service_id)` cover the composite foreign keys; the exclusion constraint's GiST index starts with `staff_id`, so it helps queries for one staff member's active bookings.
+
+## What indexes cost
+
+Indexes aren't free:
+
+- **Every** insert, and every update of an indexed column, must update **every** index on the table. Ten indexes make writes much slower.
+- They use disk and memory (check with `\di+`).
+- Updates of non-indexed columns can use a fast path called a **HOT update**; indexing a column that changes often (like `updated_at`) loses it.
+
+So add indexes for **real, frequent queries**, and remove the ones nobody uses:
+
+```sql
+select relname as table_name, indexrelname as index_name, idx_scan,
+       pg_size_pretty(pg_relation_size(indexrelid)) as size
+from pg_stat_user_indexes
+order by idx_scan asc, pg_relation_size(indexrelid) desc;
+-- idx_scan = 0 after weeks in production → probably remove it (but not unique/constraint indexes!)
+```
+
+Creating an index on a big production table locks writes while it builds. Use `create index concurrently` there (Lesson 9).
+
+## Common mistakes
+
+- An index for every column "just in case".
+- Composite indexes in the wrong order (range column first).
+- Separate indexes on `a` and `b` when queries filter on both (one `(a, b)` index is usually better).
+- A function on the column in `where`, so the index isn't used.
+- Indexing a low-cardinality column (`status`, `is_active`) on its own.
+- Forgetting foreign key indexes.
+- `like '%term%'` on a B-tree index (use `pg_trgm` or full-text search).
+
+## Exercises
+
+- **4.1** 🟢 Run the seed script. With `\timing on`, time the bookings list query for one business (first page, then a page with a cursor in the middle) **before** and **after** creating `bookings_business_starts_idx`. Write down both times.
+- **4.2** 🟡 For each query, design the best index and explain the column order: (a) a customer's bookings, newest first; (b) a staff member's confirmed bookings between two times; (c) the number of cancelled bookings per business in the last 30 days; (d) customers whose email ends with `@gmail.com`. One of these needs a trick or a different query. Which one, and why?
+- **4.3** 🟡 Create the covering index `bookings_staff_day_idx`. Run `vacuum analyze bookings;`, then `explain analyze` the "staff member's day" query with and without `ends_at` in the `include` list. What's different in the plan? (Look for `Index Only Scan` and `Heap Fetches`.)
+- **4.4** 🔴 Measure the write cost: time inserting 50,000 new bookings with 2 indexes on `bookings`, then add 5 more indexes and insert another 50,000. Calculate the slowdown in percent. Then list the indexes the booking API really needs, with the query each one is for.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you decide which indexes to add?"**
+
+> "I start from the real queries, not the columns. For each important query I look at the filters and the sort: columns compared with equals go first in a composite index, then the range or sort column. For example, a paginated list of a tenant's bookings gets an index on business ID, starts-at and ID, so Postgres can jump straight to the page with no sort. I use partial indexes for queries that only touch a subset, like confirmed bookings, and expression indexes when a query uses a function like lower of email. I always index foreign key columns. And I keep the number of indexes small, because every index slows down writes, so I check usage statistics and drop unused ones. Then I confirm with EXPLAIN ANALYZE that the index is actually used."
+
+**"Why isn't my index being used?"**
+
+> "Common reasons: the query wraps the column in a function or casts it, so it doesn't match the index; the condition matches a large part of the table, so a sequential scan is cheaper; the composite index's first column isn't in the filter; it's a leading-wildcard LIKE; the table is small; or the statistics are out of date, which ANALYZE fixes. I check with EXPLAIN ANALYZE rather than guessing."

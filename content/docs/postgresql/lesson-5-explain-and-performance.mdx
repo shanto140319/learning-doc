@@ -1,0 +1,219 @@
+---
+title: "Lesson 5: EXPLAIN ANALYZE and query performance"
+description: "Reading query plans, scan and join types, estimates vs actual rows, statistics, finding slow queries with pg_stat_statements, why OFFSET is slow, and fixing N+1 queries."
+---
+
+In Lesson 4 you guessed which index helps. In this lesson you **prove** it. `EXPLAIN ANALYZE` shows exactly how Postgres ran a query and where the time went. "Here's a slow query, what do you do?" is a very common interview question, and the answer always starts with this tool.
+
+## EXPLAIN vs EXPLAIN ANALYZE
+
+```sql
+explain select * from bookings where business_id = '...';          -- the plan, NOT run
+explain analyze select * from bookings where business_id = '...';  -- runs it, shows real times
+explain (analyze, buffers) select ...;                             -- plus memory/disk pages
+```
+
+In PostgreSQL 18, `explain analyze` includes buffer numbers automatically.
+
+<Callout type="warn" title="EXPLAIN ANALYZE really runs the query">
+For `insert`, `update` or `delete`, it **changes data**. Wrap it: `begin; explain analyze update ...; rollback;`
+</Callout>
+
+## Reading a plan
+
+The bookings list query from Lesson 4, **without** the index (your numbers will be different):
+
+```text
+Limit  (cost=38016.12..38016.17 rows=20 width=40) (actual time=162.418..162.424 rows=20 loops=1)
+  ->  Sort  (cost=38016.12..38266.12 rows=100000 width=40) (actual time=162.416..162.419 rows=20 loops=1)
+        Sort Key: starts_at DESC, id DESC
+        Sort Method: top-N heapsort  Memory: 27kB
+        ->  Seq Scan on bookings  (cost=0.00..35355.00 rows=100000 width=40) (actual time=0.015..148.902 rows=100000 loops=1)
+              Filter: (business_id = '019a...'::uuid)
+              Rows Removed by Filter: 900000
+              Buffers: shared hit=2112 read=20743
+Planning Time: 0.180 ms
+Execution Time: 162.470 ms
+```
+
+How to read it:
+
+1. **It's a tree. Read from the most indented line up.** Here: scan the table → sort → take 20.
+2. **`cost=start..total`**: the planner's estimate, in made-up units. Use it to compare plans, not as milliseconds.
+3. **`rows=` in the first brackets** is the estimate; **`actual ... rows=`** is the truth. A big difference (10× or more) means bad statistics and often a bad plan.
+4. **`actual time=start..end`** is in milliseconds, **per loop**. Multiply by `loops`.
+5. **`Rows Removed by Filter: 900000`**: it read a million rows to keep 100,000. That's the smell. An index should do the filtering.
+6. **`Buffers: shared hit`** = pages found in memory; **`read`** = pages read from disk (slower). Each page is 8 kB.
+7. **`Execution Time`** at the bottom is the total.
+
+You may also see `Gather` and `Parallel Seq Scan`: Postgres split the scan across several workers. It's still a full scan.
+
+**With** `bookings_business_starts_idx`:
+
+```text
+Limit  (cost=0.43..4.12 rows=20 width=40) (actual time=0.031..0.058 rows=20 loops=1)
+  ->  Index Scan using bookings_business_starts_idx on bookings  (cost=0.43..18426.43 rows=100000 width=40) (actual time=0.030..0.054 rows=20 loops=1)
+        Index Cond: (business_id = '019a...'::uuid)
+        Buffers: shared hit=24
+Planning Time: 0.210 ms
+Execution Time: 0.079 ms
+```
+
+No sort (the index is already in order), 24 pages instead of 22,000, and **2,000 times faster**. `Limit` stops the index scan after 20 rows.
+
+## Plan nodes you'll see
+
+| Node | What it does | Good or bad? |
+| --- | --- | --- |
+| `Seq Scan` | Reads the whole table | Fine for small tables or when most rows are needed. Bad with a big `Rows Removed by Filter` |
+| `Index Scan` | Walks the index, then reads each row from the table | Good for few rows |
+| `Index Only Scan` | Gets everything from the index | Best. Check `Heap Fetches` is low |
+| `Bitmap Index Scan` + `Bitmap Heap Scan` | Collects matching row locations first, then reads table pages in order | Good for "medium" numbers of rows; can combine indexes (`BitmapAnd`, `BitmapOr`) |
+| `Nested Loop` | For each row on the outer side, look up matches on the inner side | Great when the outer side is small and the inner side has an index. Terrible with large outer sides and no index |
+| `Hash Join` | Builds a hash table from one side, probes it with the other | Good for big joins without useful indexes |
+| `Merge Join` | Joins two inputs already sorted on the join key | Good for big sorted inputs |
+| `Sort` | Sorts rows | Watch for `Sort Method: external merge Disk`: not enough `work_mem`, sorting on disk |
+| `HashAggregate` / `GroupAggregate` | `group by` | |
+| `Limit` | Stops early | Combined with an ordered index scan, very fast |
+
+## When the planner chooses badly
+
+The planner decides from **statistics**: row counts and value distributions per column, collected by `analyze` (autovacuum runs it automatically, but not instantly after a big load).
+
+- After a big import or delete, run `analyze bookings;`.
+- If estimates are far off on a column with an unusual distribution, raise its statistics target: `alter table bookings alter column status set statistics 1000; analyze bookings;`.
+- If two columns are **correlated** (every `staff_id` belongs to one `business_id`), Postgres assumes they're independent and underestimates rows when you filter on both. Fix: `create statistics bookings_staff_business (dependencies) on staff_id, business_id from bookings; analyze bookings;`.
+
+### Why Postgres ignores your index
+
+- The condition matches a lot of rows (more than roughly 5–10% of the table): a sequential scan really is cheaper.
+- A function or cast on the column: `where date(starts_at) = ...`, `where id::text = ...`.
+- A type mismatch between the column and the parameter.
+- `like '%abc'` on a B-tree.
+- `or` across different columns (sometimes solved with a `BitmapOr`, sometimes with `union all`).
+- The composite index's first column isn't in the query.
+- The table is tiny.
+- Stale statistics.
+
+To test whether an index **could** be used: `set enable_seqscan = off;` in your session, run `explain`, then `reset enable_seqscan;`. Never do this in production code.
+
+## OFFSET is slow, keyset is not
+
+```sql
+explain analyze
+select id, starts_at from bookings
+where business_id = '...'
+order by starts_at desc, id desc
+offset 90000 limit 20;
+```
+
+Even with the index, Postgres must walk and **throw away** 90,000 rows. Look at `actual rows` on the index scan: 90,020. Compare with the cursor version (`and (starts_at, id) < (...)`): it reads 20. That's why [cursor pagination](/docs/node-http/lesson-7-lists-and-retries) scales and offset doesn't.
+
+## Finding slow queries: pg_stat_statements
+
+You can't `explain` a query you don't know is slow. `pg_stat_statements` records statistics for **every** query shape (values replaced by `$1`). The compose file already loads it; turn it on in the database:
+
+```sql
+create extension if not exists pg_stat_statements;
+
+-- the queries that use the most total time (the ones worth fixing)
+select calls,
+       round(total_exec_time) as total_ms,
+       round(mean_exec_time::numeric, 2) as mean_ms,
+       rows,
+       left(query, 100) as query
+from pg_stat_statements
+order by total_exec_time desc
+limit 10;
+
+select pg_stat_statements_reset();   -- start fresh before a test
+```
+
+Sort by `total_exec_time`, not `mean`: a 2 ms query called a million times hurts more than one 2-second report. A huge `calls` number for a simple query is often an **N+1** (below).
+
+Other tools:
+
+- `log_min_duration_statement = 500` logs every query slower than 500 ms.
+- `auto_explain` logs the plans of slow queries automatically.
+- Managed Postgres (RDS Performance Insights, Neon, Supabase) shows the same data in a dashboard.
+- Paste plans into [explain.dalibo.com](https://explain.dalibo.com) or [explain.depesz.com](https://explain.depesz.com) for a visual view.
+
+## The N+1 query problem
+
+A list of 20 bookings with customer names, written the "obvious" way:
+
+```typescript
+const bookings = await repo.listForBusiness(businessId, 20);       // 1 query
+for (const booking of bookings) {
+  booking.customer = await customers.findById(booking.customerId); // +20 queries
+}
+```
+
+That's **1 + N** queries: 21 round trips for one page. Each is fast, but with network latency (often 1–5 ms to a managed database) and many concurrent users, it adds up fast. It's very common with ORMs, because lazy loading hides the queries.
+
+Fixes, best first:
+
+```sql
+-- 1. one query with a join
+select b.id, b.starts_at, b.status, c.name as customer_name
+from bookings b
+join customers c on c.business_id = b.business_id and c.id = b.customer_id
+where b.business_id = $1
+order by b.starts_at desc, b.id desc
+limit 20;
+```
+
+```typescript
+// 2. two queries: load the related rows in one batch
+const bookings = await repo.listForBusiness(businessId, 20);
+const ids = [...new Set(bookings.map((b) => b.customerId))];
+const { rows } = await pool.query(
+  'select id, name from customers where business_id = $1 and id = any($2::uuid[])',
+  [businessId, ids],
+);
+const byId = new Map(rows.map((c) => [c.id, c]));
+```
+
+3. In Prisma, `include` or a nested `select` does the batching for you (Lesson 8). In GraphQL, a DataLoader does the same.
+
+How to spot N+1: turn on query logging in development and count queries per request; look for very high `calls` in `pg_stat_statements`; tracing tools in Month 3 (OpenTelemetry) show a "staircase" of identical queries.
+
+## A query-tuning checklist
+
+1. Find the slow query (`pg_stat_statements`, slow log, traces).
+2. `explain (analyze, buffers)` it with **realistic** parameters and data.
+3. Find the most expensive node. Big `Rows Removed by Filter`? Big `Sort`? Estimates way off? `Nested Loop` with a big outer side?
+4. Fix one thing: an index, a rewritten condition, `analyze`, fewer columns, keyset pagination, a join instead of N+1.
+5. `explain analyze` again and compare. Check it didn't slow down writes too much.
+6. If it's still slow and it's a dashboard query, think about caching or a materialized view (Lesson 7).
+
+## Common mistakes
+
+- Guessing instead of reading the plan.
+- `explain analyze` on an `update` without a `rollback`.
+- Testing on a table with 50 rows: the plan will be different with real data.
+- Reading `cost` as milliseconds.
+- Ignoring the gap between estimated and actual rows.
+- `select *` everywhere: more data to read and send, and no index-only scans.
+- Fixing an N+1 by adding a cache instead of fixing the query.
+
+## Exercises
+
+- **5.1** 🟢 Run `explain analyze` on the bookings list query without and with `bookings_business_starts_idx`. For each plan, write down: the scan type, rows read, buffers, and execution time.
+- **5.2** 🟡 Run these and explain each plan in one or two sentences: (a) `where date(starts_at) = '2026-11-10'`, then rewrite it to use an index; (b) `offset 90000 limit 20` vs the cursor version; (c) a join of bookings and customers for one customer's email; (d) `where status = 'cancelled'` with an index on `status` alone. Is that index used?
+- **5.3** 🟡 Write the N+1 version of "20 bookings with customer and service names" in TypeScript with `pg`, then the join version. Use `pg_stat_statements` (reset first) to show the number of calls for each version.
+- **5.4** 🔴 This query powers the owner's dashboard: "revenue per staff member per month this year, confirmed bookings only". Write it, `explain analyze` it on the big table, and make it as fast as you can. Write down what you tried, what helped and what didn't. Consider: is an index the right answer for a query that reads a large part of the table?
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"A query is slow in production. What do you do?"**
+
+> "First I find it and measure it, using pg_stat_statements or the slow query log, sorted by total time. Then I run EXPLAIN ANALYZE with realistic parameters and look for the most expensive part of the plan: a sequential scan that throws away most rows, a big sort, estimated rows that are far from the actual rows, or a nested loop over many rows. Then I fix one thing at a time, often a composite or partial index, rewriting a condition so it can use an index, updating statistics, or switching from OFFSET to keyset pagination, and I run EXPLAIN ANALYZE again to confirm. If it's an N+1 problem, I replace the loop of queries with a join or one batched query."
+
+**"What is the N+1 problem?"**
+
+> "It's when code runs one query to get a list and then one more query for each item, for example loading twenty bookings and then each booking's customer separately, so twenty-one queries instead of one or two. Each query is fast, but the round trips add up and it gets worse with more data. It often hides in ORMs with lazy loading. I fix it with a join, or by loading all the related rows in one query with WHERE id = ANY, which is what Prisma's include does."

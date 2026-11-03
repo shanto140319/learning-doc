@@ -1,0 +1,184 @@
+---
+title: "Practice project: the booking API on PostgreSQL"
+description: "Move the NestJS booking API from memory to PostgreSQL with Prisma: database-enforced no double bookings, idempotency keys and an outbox in Postgres, keyset pagination, availability, optimistic locking, roles, RLS, a race test and a performance report."
+---
+
+Replace the in-memory repositories in your [NestJS practice project](/docs/nestjs/practice-project) with PostgreSQL and Prisma. The API stays the same from the outside. Inside, the database now guarantees the rules that matter, and you can **prove** it with a race test.
+
+This project is the real foundation of Project 1, so do it properly. It's also your best interview story from Phase 1: "I made double bookings impossible with one Postgres constraint, and here's the test that proves it."
+
+Time: one Friday block (about 4 hours) plus two or three weekday sessions.
+
+## Requirements
+
+### Endpoints
+
+Everything from the NestJS project, plus:
+
+| Endpoint | Who | Notes |
+| --- | --- | --- |
+| `GET /v1/staff/:id/availability?date=YYYY-MM-DD&serviceId=...` | Public | Free slots from working hours, service length and the business's time zone (exercise 3.4) |
+| `PATCH /v1/bookings/:id` | Any logged-in user | Reschedule. `If-Match` required, 412 on version mismatch, 409 `slot-taken` on overlap |
+| `GET /v1/reports/daily?from=...&to=...` | owner, admin | Bookings and revenue per day in the business's time zone, with zero days (Lesson 7) |
+
+### Quality checklist
+
+- [ ] Prisma 7 with the driver adapter, `prisma.config.ts`, `@db.Timestamptz` on every `DateTime`
+- [ ] Custom SQL migration: `bookings_no_overlap` exclusion constraint, check constraints, partial unique index for service names, `lock_timeout` at the top
+- [ ] `staff_working_hours` table with constraints (exercise 2.4)
+- [ ] `PrismaService` in a global `DatabaseModule`; readiness check runs `select 1`
+- [ ] Repositories are the only classes that use Prisma; controllers and services don't change much from the NestJS project
+- [ ] Every query is scoped by `businessId`; composite foreign keys in the schema
+- [ ] `GET /v1/bookings` uses keyset pagination with `select` (no N+1, check the query log)
+- [ ] `POST /v1/bookings` runs in one transaction: customer upsert, booking insert, outbox event
+- [ ] Overlap → 409 `slot-taken`; not found → 404; no Prisma error ever reaches the client as a 500 with internal details
+- [ ] Idempotency keys stored in Postgres with `on conflict do nothing` (scaffold below)
+- [ ] Optimistic locking on reschedule with `version`, `ETag` and `If-Match`
+- [ ] Cancel writes an outbox event in the same transaction
+- [ ] Seed script that's safe to run twice
+- [ ] App connects as `booking_app`; migrations run as `booking_migrator`
+- [ ] Pool size, `connectionTimeoutMillis` and `statement_timeout` set on purpose (write the numbers and why in the README)
+- [ ] **Race test** passes (scaffold below)
+- [ ] `PERFORMANCE.md` (see below)
+- [ ] Stretch: row-level security with the `forTenant` extension (Lesson 10)
+
+## Scaffold: the race test
+
+The most important test in the project. Fill in the `TODO`s:
+
+```typescript
+// scripts/race.ts: run with  npx tsx scripts/race.ts
+import { randomUUID } from 'node:crypto';
+
+const BASE = 'http://localhost:3000/v1';
+
+async function main(): Promise<void> {
+  const body = {
+    serviceId: process.env.SERVICE_ID,              // from your seed data
+    staffId: process.env.STAFF_ID,
+    customerName: 'Race Test',
+    startsAt: '2026-12-01T10:00:00+06:00',          // TODO 1: use a free slot in the future
+  };
+
+  const statuses = await Promise.all(
+    Array.from({ length: 20 }, (_, i) =>
+      fetch(`${BASE}/bookings`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': randomUUID(),          // different keys: 20 different requests
+        },
+        body: JSON.stringify({ ...body, customerEmail: `race${i}@test.dev` }),
+      }).then((res) => res.status),
+    ),
+  );
+
+  // TODO 2: count how many of each status code you got and print it
+  // TODO 3: exit with code 1 unless there is exactly one 201 and nineteen 409s
+  // TODO 4: query the database: exactly ONE active booking for that staff member at that time
+}
+
+main().catch((err: unknown) => {
+  console.error(err);
+  process.exit(1);
+});
+```
+
+Then run it again with the **same** `customerEmail` for all 20 requests. If some requests return **500** instead of 409, find out why. (Hint: 20 transactions try to create the same new customer at the same time. What does Prisma's `upsert` do in that case, and what would `insert ... on conflict` do?)
+
+## Scaffold: idempotency keys in Postgres
+
+Replace the in-memory `IdempotencyStore` from the NestJS project. The interceptor doesn't change, which shows why it depended on an abstraction:
+
+```typescript
+// src/common/idempotency/pg-idempotency.store.ts
+@Injectable()
+export class PgIdempotencyStore implements IdempotencyStore {
+  constructor(private readonly prisma: PrismaService) {}
+
+  /** Returns true if this request now owns the key (NestJS project TODO 4: the race is solved here). */
+  async start(scope: string, key: string, requestHash: string): Promise<boolean> {
+    const rows = await this.prisma.$queryRaw<{ key: string }[]>`
+      insert into idempotency_keys (scope, key, request_hash, status)
+      values (${scope}, ${key}, ${requestHash}, 'processing')
+      on conflict (scope, key) do nothing
+      returning key`;
+    return rows.length === 1;
+  }
+
+  get(scope: string, key: string) {
+    return this.prisma.idempotencyKey.findUnique({ where: { scope_key: { scope, key } } });
+  }
+
+  async complete(scope: string, key: string, status: number, body: unknown): Promise<void> {
+    // TODO 5: set status 'completed', response_status and response_body
+  }
+
+  async remove(scope: string, key: string): Promise<void> {
+    // TODO 6: delete it, so the client can retry after an error
+  }
+
+  // TODO 7: keys older than 24 hours should be deleted. Where does that run, and which index does it need?
+}
+```
+
+Question for your README: the booking insert and `complete()` run in **different** transactions. What happens if the process crashes between them? Is that acceptable, and how could you make it impossible?
+
+## PERFORMANCE.md
+
+Load about 1 million bookings (adapt the Lesson 4 seed to your Prisma tables). Then for these three queries, include the `explain (analyze, buffers)` output **before and after** your indexes, and two sentences each on what changed:
+
+1. `GET /v1/bookings` for one business (first page and a deep page with a cursor)
+2. The availability query for one staff member and day
+3. The daily report for 60 days
+
+Finish with a list of every index on `bookings`, the query each one serves, and the time to insert 10,000 bookings with all of them.
+
+## Suggested order
+
+1. Prisma setup, schema, `init` migration, custom SQL migration (Lesson 8). Check with `\d`.
+2. `DatabaseModule`, health check, seed script.
+3. Services and customers repositories (simple CRUD; soft delete for services).
+4. Bookings repository: list, get, create (transaction + outbox), cancel. Error mapping.
+5. **Race test.** Get it green before you go further.
+6. Idempotency store in Postgres.
+7. Working hours and availability.
+8. Reschedule with optimistic locking.
+9. Daily report.
+10. Roles, pool settings, timeouts.
+11. `PERFORMANCE.md`.
+12. Stretch: RLS.
+
+## Test checklist
+
+Run the [NestJS project's checks](/docs/nestjs/practice-project#test-checklist) again (they must still pass), plus:
+
+1. Restart the app: data is still there.
+2. `npm run race` (or the script): exactly one 201 and nineteen 409s, every time you run it.
+3. Book 10:00–10:30, then 10:30–11:00 for the same staff member: both succeed.
+4. Cancel the 10:00 booking, book 10:00 again: succeeds.
+5. Same `Idempotency-Key` twice at the same moment (two terminals or `Promise.all`): one booking, both responses have the same ID (or the second gets 409 "still processing").
+6. Reschedule with an old `If-Match`: 412. With the right one: 200, and the `ETag` changes.
+7. After create and cancel, the `outbox` table has the matching events.
+8. Availability for a day with existing bookings: those slots are missing; a lunch break has no slots.
+9. Run `prisma db seed` twice: no errors, no duplicates.
+10. As `booking_app` in `psql`: `drop table bookings;` fails.
+11. With `log: ['query']`, `GET /v1/bookings` runs 1 or 2 queries, not 21.
+12. Stretch: remove the `businessId` filter from one query; RLS still hides other businesses' rows.
+
+## Part 2: warm-up for Mini-build A
+
+Before you start the URL shortener, write its data layer design in its README, using your answer to exercise 2.3:
+
+- The tables, with constraints and indexes, and the query each index is for.
+- How a redirect finds the link (the hottest query: one index lookup, then a Redis cache in Month 2).
+- How clicks are recorded without making every redirect slow (raw `clicks` rows, a daily rollup table, or both?). What happens to a single hot row's `click_count` under heavy traffic (Lesson 6)?
+- When the `clicks` table would need partitioning (Lesson 10), and how you'd delete clicks older than 90 days.
+
+## When you're done
+
+1. Push to GitHub with a README: how to run (`docker compose up`, migrate, seed, start), the schema diagram, the race test and its output, and your design decisions (pool size, isolation level, why an exclusion constraint).
+2. Paste the schema, the custom migration, `BookingsRepository` and the race test into Claude for a **scored code review**.
+3. Ask Claude for a **10-question PostgreSQL quiz**: at least two "which index?" questions, one plan to read, one isolation level question and one zero-downtime migration question. **Score 8 or more** to move on to Mini-build A.
+4. Blog post idea: "How I made double bookings impossible with one PostgreSQL constraint" (the race, why app checks aren't enough, the exclusion constraint, the race test). It's specific, practical, and very good for your LinkedIn.
+5. Update the progress box on the [section home page](/docs/postgresql).

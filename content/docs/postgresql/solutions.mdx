@@ -1,0 +1,696 @@
+---
+title: "Solutions"
+description: "Model answers for every exercise in the PostgreSQL section. Try the exercises first."
+---
+
+<Callout type="warn" title="Try first">
+Do each exercise yourself and get it reviewed before reading the answer. If your solution is different, it may still be right: ask "Is my version correct? Is it better or worse, and why?" Timings and plan numbers on your machine will be different from the ones here; compare the **shape** of the results.
+</Callout>
+
+## Lesson 1: Setup and SQL foundations
+
+**1.1**
+
+```sql
+insert into services (name, duration_minutes, price_cents) values
+  ('Haircut', 30, 50000), ('Beard trim', 15, 20000), ('Hair colour', 90, 150000)
+returning id, name;
+
+insert into customers (email, name) values
+  ('rahim@test.dev', 'Rahim'), ('karim@test.dev', 'Karim'),
+  ('nadia@test.dev', 'Nadia'), ('sara@test.dev', 'Sara')        -- Sara gets no bookings
+returning id, name;
+
+-- use the IDs returned above; or look them up inside the insert:
+insert into bookings (customer_id, service_id, starts_at)
+select c.id, s.id, timestamptz '2026-11-10 10:00+06' + (n * interval '1 hour')
+from (values ('rahim@test.dev', 'Haircut', 0), ('rahim@test.dev', 'Beard trim', 1),
+             ('karim@test.dev', 'Haircut', 2), ('karim@test.dev', 'Haircut', 3),
+             ('nadia@test.dev', 'Hair colour', 4), ('nadia@test.dev', 'Haircut', 5),
+             ('rahim@test.dev', 'Hair colour', 6), ('karim@test.dev', 'Beard trim', 7))
+       as v(email, service, n)
+join customers c on c.email = v.email
+join services s on s.name = v.service
+returning id;
+```
+
+**1.2**
+
+```sql
+-- (a)
+select b.starts_at, c.name as customer, s.name as service
+from bookings b
+join customers c on c.id = b.customer_id
+join services s on s.id = b.service_id
+order by b.starts_at desc;
+
+-- (b)
+select c.* from customers c
+where not exists (select 1 from bookings b where b.customer_id = c.id);
+
+-- (c)
+select s.name, count(*) as bookings, sum(s.price_cents) / 100.0 as revenue
+from bookings b join services s on s.id = b.service_id
+group by s.id, s.name
+having count(*) >= 2
+order by revenue desc;
+```
+
+**1.3** With one `null` in `bookings.customer_id`, `not in` returns **no rows**, while `not exists` still returns Sara. Reason: `x not in (a, b, null)` means `x <> a and x <> b and x <> null`. The last part is `null` (unknown), so the whole condition can never be true. `not exists` only asks "is there a matching row?", which is never unknown. Restore with `delete from bookings where customer_id is null; alter table bookings alter column customer_id set not null;`.
+
+**1.4**
+
+```typescript
+// scripts/search-services.ts: npx tsx scripts/search-services.ts haircut
+import { Pool } from 'pg';
+
+async function main(): Promise<void> {
+  const term = process.argv[2] ?? '';
+  const pool = new Pool({ connectionString: 'postgres://postgres:postgres@localhost:5432/booking' });
+
+  // escape LIKE wildcards so "%" and "_" are searched as normal characters
+  const escaped = term.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+
+  const { rows } = await pool.query<{ id: string; name: string }>(
+    `select id, name from services where name ilike '%' || $1 || '%' order by name`,
+    [escaped],
+  );
+  console.table(rows);
+  await pool.end();
+}
+
+main().catch((err: unknown) => { console.error(err); process.exit(1); });
+```
+
+With the input `x' or '1'='1`, the result is empty: the whole string is a **value** searched for in names, never SQL. The wildcard escaping is a bonus: without it, searching for `%` would match every row.
+
+## Lesson 2: Data modelling and constraints
+
+**2.1** In `\d bookings` you'll see, among others:
+
+- Named by you: `bookings_time_order`, `bookings_cancelled_consistent`, `bookings_customer_idx`, `bookings_service_idx`.
+- Named by Postgres: `bookings_pkey`, `bookings_status_check`, `bookings_price_cents_check`, `bookings_notes_check`, `bookings_business_id_fkey`, `bookings_business_id_service_id_fkey`, `bookings_business_id_staff_id_fkey`, `bookings_business_id_customer_id_fkey`.
+
+The pattern is `<table>_<columns>_<pkey|key|check|fkey>`. Naming important constraints yourself makes error mapping in code clearer.
+
+**2.2**
+
+```sql
+-- (a) 23514: new row violates check constraint "bookings_time_order"
+insert into bookings (business_id, service_id, staff_id, customer_id, starts_at, ends_at, price_cents)
+values ('<biz A>', '<svc A>', '<staff A>', '<cust A>', '2026-11-10 11:00+06', '2026-11-10 10:00+06', 50000);
+
+-- (b) 23514: violates check constraint "bookings_cancelled_consistent"
+update bookings set status = 'cancelled' where id = '<booking>';
+
+-- (c) 23503: violates foreign key constraint "bookings_business_id_service_id_fkey"
+--     Key (business_id, service_id)=(<biz A>, <svc B>) is not present in table "services".
+insert into bookings (...) values ('<biz A>', '<svc B>', ...);
+
+-- (d) 23505: duplicate key value violates unique constraint "services_business_name_key"
+insert into services (business_id, name, duration_minutes, price_cents)
+values ('<biz A>', 'haircut', 30, 50000);
+
+-- (e) 23503: update or delete on table "services" violates foreign key constraint ... on table "bookings"
+delete from services where id = '<svc A>';
+
+-- soft delete, then the name is free again
+update services set deleted_at = now() where id = '<svc A>';
+insert into services (business_id, name, duration_minutes, price_cents)
+values ('<biz A>', 'Haircut', 45, 60000);     -- works
+```
+
+**2.3** One good design (there are others):
+
+```sql
+create table users (
+  id            uuid primary key default uuidv7(),
+  email         text not null,
+  password_hash text not null,
+  created_at    timestamptz not null default now()
+);
+create unique index users_email_key on users (lower(email));
+
+create table links (
+  id          bigint generated always as identity primary key,   -- internal; the public ID is the code
+  user_id     uuid not null references users (id) on delete cascade,
+  code        text not null unique check (code ~ '^[A-Za-z0-9_-]{4,32}$'),
+  target_url  text not null check (length(target_url) <= 2048 and target_url ~ '^https?://'),
+  expires_at  timestamptz,
+  deleted_at  timestamptz,                    -- soft delete: a code is never reused
+  created_at  timestamptz not null default now()
+);
+create index links_user_created_idx on links (user_id, created_at desc);
+
+create table clicks (                         -- raw events, kept 90 days
+  link_id    bigint not null references links (id) on delete cascade,
+  clicked_at timestamptz not null default now(),
+  country    char(2),
+  referrer   text,
+  user_agent text
+);
+create index clicks_link_time_idx on clicks (link_id, clicked_at);
+
+create table link_daily_clicks (              -- rollup for dashboards, kept forever
+  link_id bigint not null references links (id) on delete cascade,
+  day     date not null,
+  clicks  bigint not null default 0,
+  primary key (link_id, day)
+);
+```
+
+Decisions: `bigint` link IDs because the code is the public identifier; a plain `unique` on `code` (not partial) so a deleted link's code is never given to someone else (old shared links must not point somewhere new); raw clicks for details plus a daily rollup so dashboards stay fast after raw clicks are deleted; a check on the URL scheme blocks `javascript:` links.
+
+**2.4**
+
+```sql
+create table staff_working_hours (
+  id          uuid primary key default uuidv7(),
+  business_id uuid not null,
+  staff_id    uuid not null,
+  weekday     smallint not null check (weekday between 1 and 7),   -- ISO: 1 = Monday, 7 = Sunday
+  opens_at    time not null,
+  closes_at   time not null,
+  constraint working_hours_order check (closes_at > opens_at),
+  foreign key (business_id, staff_id) references staff (business_id, id) on delete cascade,
+  -- no overlapping blocks for the same staff member and day
+  constraint working_hours_no_overlap exclude using gist (
+    staff_id with =,
+    weekday with =,
+    tsrange(date '2000-01-01' + opens_at, date '2000-01-01' + closes_at, '[)') with &&
+  )
+);
+```
+
+A lunch break is **two rows** (09:00–13:00 and 14:00–17:00). A day off is **no row**. The fixed date `2000-01-01` is just a trick to turn `time` values into a range. Limits: shifts past midnight aren't supported (`closes_at > opens_at`). In a real product you'd add a `staff_time_off` table with a `tstzrange` for holidays and sick days.
+
+## Lesson 3: Time, ranges and no double bookings
+
+**3.1**
+
+```sql
+set timezone = 'UTC';              select timestamptz '2026-11-10 10:00+06';   -- 2026-11-10 04:00:00+00
+set timezone = 'Asia/Dhaka';       select timestamptz '2026-11-10 10:00+06';   -- 2026-11-10 10:00:00+06
+set timezone = 'America/New_York'; select timestamptz '2026-11-10 10:00+06';   -- 2026-11-09 23:00:00-05
+reset timezone;
+
+-- Dhaka wall time → moment (timestamp → timestamptz)
+select timestamp '2026-11-10 09:00' at time zone 'Asia/Dhaka';    -- 2026-11-10 03:00:00+00
+-- moment → Dhaka wall time (timestamptz → timestamp)
+select timestamptz '2026-11-10 03:00Z' at time zone 'Asia/Dhaka'; -- 2026-11-10 09:00:00
+```
+
+Same moment every time; only the display changes.
+
+**3.2** Without the constraint, both sessions insert and commit: two bookings overlap. With the constraint: session B's `insert` **hangs** (it waits, because A's row isn't committed yet and might still be rolled back). When A commits, B immediately fails with `23P01 conflicting key value violates exclusion constraint "bookings_no_overlap"`. If A had rolled back, B's insert would have succeeded.
+
+**3.3** (a), (b) and (c) succeed. (d) fails with `23P01`: the constraint is checked on **update** too. Making the old booking active again would make it overlap the new one, and `where (status <> 'cancelled')` now includes it.
+
+**3.4**
+
+```sql
+-- $1 staff_id, $2 local date, $3 service_id
+with params as (
+  select st.id as staff_id, $2::date as day, b.time_zone, sv.duration_minutes
+  from staff st
+  join businesses b on b.id = st.business_id
+  join services sv on sv.business_id = st.business_id and sv.id = $3
+  where st.id = $1 and st.deleted_at is null and sv.deleted_at is null
+),
+blocks as (
+  select p.staff_id, p.duration_minutes,
+         (p.day + h.opens_at)  at time zone p.time_zone as block_start,
+         (p.day + h.closes_at) at time zone p.time_zone as block_end
+  from params p
+  join staff_working_hours h
+    on h.staff_id = p.staff_id and h.weekday = extract(isodow from p.day)
+),
+slots as (
+  select bl.staff_id, s as starts_at, s + make_interval(mins => bl.duration_minutes) as ends_at
+  from blocks bl
+  cross join lateral generate_series(
+    bl.block_start,
+    bl.block_end - make_interval(mins => bl.duration_minutes),
+    interval '15 minutes'
+  ) as s
+)
+select sl.starts_at, sl.ends_at
+from slots sl
+where sl.starts_at > now()
+  and not exists (
+    select 1 from bookings b
+    where b.staff_id = sl.staff_id and b.status <> 'cancelled'
+      and tstzrange(b.starts_at, b.ends_at, '[)') && tstzrange(sl.starts_at, sl.ends_at, '[)')
+  )
+order by sl.starts_at;
+```
+
+Each working block makes its own slots, so a lunch break never appears, and the last slot of a block ends exactly at closing time. For a `America/New_York` business on 2027-03-14, check with `select starts_at at time zone 'America/New_York' ...`: slots still start at 09:00 local, even though that's 13:00 UTC (it was 14:00 UTC the day before). That's DST handled correctly.
+
+## Lesson 4: Indexes
+
+**4.1** Typical results on a laptop: first page without the index about 100–300 ms (a full scan plus a top-N sort); with the index well under 1 ms. A page in the middle with a cursor: the same under 1 ms with the index, because it jumps straight to the cursor position.
+
+**4.2**
+
+- (a) `(business_id, customer_id, starts_at desc)`. Equality columns first, then the sort column. It replaces `bookings_customer_idx`, since the first two columns are the same.
+- (b) `(staff_id, starts_at) where status = 'confirmed'`. Equality, then the range; the status filter goes into the partial `where`.
+- (c) `(starts_at) where status = 'cancelled'` (or `(business_id, starts_at) where status = 'cancelled'` for one business). It only indexes the 10% of rows that are cancelled.
+- (d) The trick one: `like '%@gmail.com'` has a **leading** wildcard, and a B-tree can only search by prefix. Options: a generated column `email_domain text generated always as (split_part(lower(email), '@', 2)) stored` with a normal index (best: simple and clear); an expression index on `reverse(lower(email)) text_pattern_ops` queried with `reverse(lower(email)) like 'moc.liamg@%'`; or a `pg_trgm` GIN index.
+
+(`text_pattern_ops` is needed for `like 'prefix%'` on a B-tree when the database collation isn't `C`.)
+
+**4.3** With `include (ends_at, status)` and after `vacuum analyze`: `Index Only Scan using bookings_staff_day_idx`, `Heap Fetches: 0`. Without `ends_at` in the index: `Index Scan` (or bitmap scan), because Postgres must visit the table to read `ends_at`. If you see `Index Only Scan` but with many heap fetches, the visibility map is out of date: run `vacuum` again.
+
+**4.4** Expect something like 1.5–3× slower inserts with 7 indexes than with 2; the exact number depends on your machine. The indexes the booking API needs:
+
+| Index | Query |
+| --- | --- |
+| `bookings_pkey` | Get by ID |
+| `(business_id, starts_at desc, id desc)` | List with keyset pagination |
+| `(business_id, customer_id, starts_at desc)` | A customer's bookings; foreign key |
+| `(business_id, service_id)` | Foreign key (deleting/checking services) |
+| `bookings_no_overlap` (GiST) | The no-overlap rule; a staff member's active bookings |
+| `(starts_at) where status = 'confirmed'` | The reminder job |
+
+## Lesson 5: EXPLAIN ANALYZE and query performance
+
+**5.1** Without the index: `Seq Scan` (often `Parallel Seq Scan` under `Gather Merge`), around 1,000,000 rows read with about 900,000 removed by the filter, thousands of buffers, about 100–300 ms. With it: `Index Scan using bookings_business_starts_idx`, 20 rows, about 20–30 buffers, under 1 ms.
+
+**5.2**
+
+- (a) `date(starts_at) = '2026-11-10'` gives a sequential scan: the function hides the column from the index. (On `timestamptz`, `date()` also depends on the session time zone, so you can't even build an expression index on it.) Rewrite as a range: `starts_at >= '2026-11-10 00:00+06' and starts_at < '2026-11-11 00:00+06'`.
+- (b) With `offset 90000`, the index scan node shows `actual rows=90020`; with the cursor, `rows=20`. Same index, about 1,000 times less work.
+- (c) An index scan on `customers_business_email_key` (1 row), then a `Nested Loop` with an index scan on the bookings customer index. A small outer side plus an indexed inner side: the ideal nested loop.
+- (d) `status = 'cancelled'` matches about 100,000 rows (10%). The planner usually chooses a bitmap heap scan or even a sequential scan over the index on `status` alone. A partial index that also covers the other filters (exercise 4.2c) is much better.
+
+**5.3**
+
+```typescript
+// N+1
+const { rows: bookings } = await pool.query(
+  'select id, customer_id, service_id, starts_at from bookings where business_id = $1 order by starts_at desc, id desc limit 20',
+  [businessId],
+);
+for (const b of bookings) {
+  b.customer = (await pool.query('select name from customers where id = $1', [b.customer_id])).rows[0];
+  b.service = (await pool.query('select name from services where id = $1', [b.service_id])).rows[0];
+}
+
+// one query
+const { rows } = await pool.query(
+  `select b.id, b.starts_at, c.name as customer_name, s.name as service_name
+   from bookings b
+   join customers c on c.business_id = b.business_id and c.id = b.customer_id
+   join services  s on s.business_id = b.business_id and s.id = b.service_id
+   where b.business_id = $1
+   order by b.starts_at desc, b.id desc
+   limit 20`,
+  [businessId],
+);
+```
+
+In `pg_stat_statements` after one call of each: the N+1 version shows the customer query with `calls = 20` and the service query with `calls = 20` (41 queries total); the join version shows one query with `calls = 1`.
+
+**5.4**
+
+```sql
+select staff_id,
+       date_trunc('month', starts_at at time zone 'Asia/Dhaka') as month,
+       count(*) as bookings,
+       sum(price_cents) / 100.0 as revenue
+from bookings
+where business_id = $1
+  and status = 'confirmed'
+  and starts_at >= timestamp '2026-01-01' at time zone 'Asia/Dhaka'
+  and starts_at <  timestamp '2027-01-01' at time zone 'Asia/Dhaka'
+group by 1, 2
+order by 2, 1;
+```
+
+What usually helps: `(business_id, starts_at) include (staff_id, price_cents, status)` turns it into an index-only scan over one business's year, maybe 2–3× faster. But it still reads every booking of the year, so it can't become instant. The better answer for a dashboard is to **not compute it on every request**: the `daily_business_stats` materialized view from Lesson 7, or a summary table, refreshed every few minutes. An index is the right tool for finding a few rows, not for summarising many.
+
+## Lesson 6: Transactions, isolation and locking
+
+**6.1** Under read committed, A's second `select` shows `cancelled` after B commits: each statement takes a new snapshot. Under `repeatable read`, A still sees `confirmed` until A ends its transaction: one snapshot for the whole transaction.
+
+**6.2**
+
+```typescript
+// read-then-write (broken)
+async function payBroken(id: string, price: number): Promise<boolean> {
+  const { rows } = await pool.query<{ credit_cents: number }>('select credit_cents from customers where id = $1', [id]);
+  if (rows[0]!.credit_cents < price) return false;
+  await pool.query('update customers set credit_cents = $2 where id = $1', [id, rows[0]!.credit_cents - price]);
+  return true;
+}
+
+// (a) atomic
+async function payAtomic(id: string, price: number): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    'update customers set credit_cents = credit_cents - $2 where id = $1 and credit_cents >= $2',
+    [id, price],
+  );
+  return rowCount === 1;
+}
+
+// (b) row lock
+async function payLocked(id: string, price: number): Promise<boolean> {
+  return withTransaction(pool, async (client) => {
+    const { rows } = await client.query<{ credit_cents: number }>(
+      'select credit_cents from customers where id = $1 for update', [id],
+    );
+    if (rows[0]!.credit_cents < price) return false;
+    await client.query('update customers set credit_cents = credit_cents - $2 where id = $1', [id, price]);
+    return true;
+  });
+}
+
+const results = await Promise.all(Array.from({ length: 20 }, () => payAtomic(customerId, 50000)));
+console.log(results.filter(Boolean).length);   // 2
+```
+
+The broken version usually reports many successes (often all 20) with a final balance of 50,000: lost updates. Both fixes give exactly 2 successes and a balance of 0.
+
+**6.3** The error: `ERROR: deadlock detected. DETAIL: Process 123 waits for ShareLock on transaction 456; blocked by process 789...`. The safe version locks in a fixed order before updating:
+
+```sql
+begin;
+select id from customers where id = any($1::uuid[]) order by id for update;   -- always the same order
+update customers set name = 'x' where id = '<c1>';
+update customers set name = 'y' where id = '<c2>';
+commit;
+```
+
+**6.4** The key parts:
+
+```typescript
+async function workOnce(workerId: string): Promise<boolean> {
+  const { rows } = await pool.query<{ id: string; attempts: number }>(
+    `update jobs set status = 'running', locked_at = now(), attempts = attempts + 1
+     where id = (
+       select id from jobs
+       where queue = 'reminders' and status = 'pending' and run_at <= now()
+       order by run_at
+       for update skip locked
+       limit 1)
+     returning id, attempts`,
+  );
+  const job = rows[0];
+  if (!job) return false;                                   // queue empty
+
+  try {
+    await sleep(10);
+    if (Math.random() < 0.1) throw new Error('random failure');
+    await pool.query(
+      `insert into job_runs (job_id, worker_id) values ($1, $2)`, [job.id, workerId],
+    );
+    await pool.query(`update jobs set status = 'done' where id = $1`, [job.id]);
+  } catch (err) {
+    const failed = job.attempts >= 3;
+    await pool.query(
+      `update jobs set status = $2, last_error = $3, locked_at = null,
+              run_at = now() + make_interval(secs => power(2, attempts))
+       where id = $1`,
+      [job.id, failed ? 'failed' : 'pending', String(err)],
+    );
+  }
+  return true;
+}
+```
+
+Checks:
+
+```sql
+select job_id, count(*) from job_runs group by job_id having count(*) > 1;   -- expect 0 rows
+select status, count(*) from jobs group by status;                           -- only done and failed
+```
+
+Note: if a worker crashed **after** the work but **before** `status = 'done'`, the job would run again after the cleanup resets it. Queues are at-least-once; handlers must be idempotent.
+
+## Lesson 7: Advanced SQL
+
+**7.1**
+
+```sql
+select business_id,
+       date_trunc('month', starts_at) as month,
+       count(*) filter (where status = 'confirmed') as confirmed,
+       count(*) filter (where status = 'cancelled') as cancelled,
+       round(100.0 * count(*) filter (where status = 'cancelled') / count(*), 1) as cancel_rate_pct
+from bookings
+where starts_at >= date_trunc('month', now()) - interval '5 months'
+  and starts_at <  date_trunc('month', now()) + interval '1 month'
+group by 1, 2
+order by 1, 2;
+```
+
+(For per-business local months, group by `date_trunc('month', starts_at at time zone biz.time_zone)` with a join to `businesses`.)
+
+**7.2**
+
+```sql
+with revenue as (
+  select staff_id, sum(price_cents) as cents
+  from bookings
+  where business_id = $1 and status = 'confirmed'
+    and starts_at >= date_trunc('month', now()) - interval '1 month'
+    and starts_at <  date_trunc('month', now())
+  group by staff_id
+)
+select staff_id,
+       cents / 100.0 as revenue,
+       rank() over w as rank,
+       round(100.0 * cents / sum(cents) over (), 1) as share_pct,
+       (lag(cents) over w - cents) / 100.0 as behind_previous
+from revenue
+window w as (order by cents desc)
+order by rank;
+```
+
+The `window w as (...)` clause names a window so you can reuse it.
+
+**7.3**
+
+```sql
+with days as (
+  select d::date as day
+  from generate_series(current_date - 59, current_date, interval '1 day') as d
+),
+counts as (
+  select (starts_at at time zone 'Asia/Dhaka')::date as day, count(*) as n
+  from bookings
+  where business_id = $1 and status = 'confirmed'
+    and starts_at >= (current_date - 59)::timestamp at time zone 'Asia/Dhaka'
+    and starts_at <  (current_date + 1)::timestamp at time zone 'Asia/Dhaka'
+  group by 1
+)
+select d.day,
+       coalesce(c.n, 0) as bookings,
+       round(avg(coalesce(c.n, 0)) over (order by d.day rows between 6 preceding and current row), 1) as avg_7d,
+       sum(coalesce(c.n, 0)) over (order by d.day) as running_total
+from days d
+left join counts c using (day)
+order by d.day;
+```
+
+For Mini-build A, replace `bookings` with `clicks`, `starts_at` with `clicked_at`, the business filter with `link_id = $1`, and the time zone with the link owner's zone (or UTC).
+
+**7.4**
+
+```sql
+create extension if not exists pg_trgm;
+create index faq_articles_title_trgm_idx on faq_articles using gin (title gin_trgm_ops);
+
+-- (a) full-text search
+select id, title, ts_rank(search, q) as rank, ts_headline('english', body, q) as snippet
+from faq_articles, websearch_to_tsquery('english', $2) q
+where business_id = $1 and search @@ q
+order by rank desc
+limit 10;
+
+-- (b) fallback for typos, only when (a) returned nothing
+select id, title, similarity(title, $2) as score
+from faq_articles
+where business_id = $1 and title % $2
+order by score desc
+limit 10;
+```
+
+Do the "if (a) is empty, run (b)" in TypeScript. Typical findings: full-text search understands "cancelled" when you search "cancel" and ranks title matches first; trigram finds "refnd polcy"; `ilike '%refund%'` finds exact substrings only, can't rank, and on large tables needs a full scan.
+
+## Lesson 8: Prisma
+
+**8.1** Typical differences from the Lesson 2 schema: `status` is a Postgres **enum** (`booking_status`) instead of `text` + `check`; timestamps are `timestamptz(3)` (milliseconds, matching JS `Date`) instead of microseconds; foreign key names are generated by Prisma; customer emails use a lowercase `check` + normal unique instead of a `lower(email)` unique index; `notes` has no length check (add it in the custom migration if you care); no `users` or `memberships` yet. None of these are problems; the important rules (composite foreign keys, the exclusion constraint, checks) are all there.
+
+**8.2** The key parts:
+
+```typescript
+async create(businessId: string, input: CreateBookingInput): Promise<Booking> {
+  try {
+    return await this.prisma.$transaction(async (tx) => {
+      // ...service lookup, customer upsert, booking create, outbox event (as in the lesson)
+    });
+  } catch (err) {
+    if (isOverlapViolation(err)) throw new SlotTakenError();
+    throw err;
+  }
+}
+
+async cancel(businessId: string, id: string): Promise<Booking> {
+  return this.prisma.$transaction(async (tx) => {
+    const { count } = await tx.booking.updateMany({
+      where: { id, businessId, status: { not: 'cancelled' } },
+      data: { status: 'cancelled', cancelledAt: new Date(), version: { increment: 1 } },
+    });
+    if (count === 0) {
+      const exists = await tx.booking.findFirst({ where: { id, businessId }, select: { id: true } });
+      throw exists ? new AlreadyCancelledError() : new NotFoundError('booking', id);
+    }
+    await tx.outboxEvent.create({ data: { topic: 'booking.cancelled', payload: { bookingId: id, businessId } } });
+    return tx.booking.findFirstOrThrow({ where: { id, businessId } });
+  });
+}
+```
+
+`updateMany` with the status condition makes "cancel" atomic: two cancels at the same time can't both succeed.
+
+**8.3**
+
+```typescript
+// prisma/seed.ts
+import 'dotenv/config';
+import { PrismaPg } from '@prisma/adapter-pg';
+import { PrismaClient } from '../src/generated/prisma/client';
+
+const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL! }) });
+
+async function main(): Promise<void> {
+  for (const slug of ['salon-dhaka', 'barber-london']) {
+    const business = await prisma.business.upsert({
+      where: { slug },
+      create: { slug, name: slug, timeZone: slug.endsWith('dhaka') ? 'Asia/Dhaka' : 'Europe/London' },
+      update: {},
+    });
+    // services: findFirst by (businessId, name) then create if missing, because the
+    // unique "lower(name) where deleted_at is null" index isn't known to Prisma
+    // staff, staff_services, customers (upsert on businessId_email), bookings
+    // bookings: only create if the business has none yet, so a second run adds nothing
+  }
+}
+
+main().finally(() => prisma.$disconnect());
+```
+
+Query count for `GET /v1/bookings` with `select` on relations: 3 (bookings, then one batched query each for customers and services), or 1 if you use a single raw SQL join. The N+1 version: 1 + 2 × 20 = 41.
+
+**8.4** Availability: the exercise 3.4 query in `$queryRaw` with `${staffId}::uuid`, `${date}::date` and `${serviceId}::uuid`. Reschedule:
+
+```typescript
+@Patch(':id')
+async reschedule(
+  @CurrentUser('businessId') businessId: string,
+  @Param('id', ParseUUIDPipe) id: string,
+  @Headers('if-match') ifMatch: string | undefined,
+  @Body() dto: RescheduleBookingDto,
+  @Res({ passthrough: true }) res: Response,
+) {
+  const version = Number(ifMatch?.replaceAll('"', ''));
+  if (!Number.isInteger(version)) throw new PreconditionRequiredError();   // 428
+  const booking = await this.bookings.reschedule(businessId, id, version, new Date(dto.startsAt));
+  res.setHeader('ETag', `"${booking.version}"`);
+  return toBookingResponse(booking);
+}
+
+// repository
+const { count } = await this.prisma.booking.updateMany({
+  where: { id, businessId, version, status: { not: 'cancelled' } },
+  data: { startsAt, endsAt, version: { increment: 1 } },
+});
+if (count === 0) throw new VersionMismatchError();   // → 412 (after checking it exists → else 404)
+// an overlap during updateMany is caught by isOverlapViolation → 409 slot-taken
+```
+
+## Lesson 9: Migrations, pooling and operations
+
+**9.1**
+
+```sql
+-- as postgres
+create role booking_migrator login password 'migrator-dev';
+create role booking_app login password 'app-dev';
+
+-- easiest: recreate the database owned by the migrator, then run the migrations again as the migrator
+drop database booking_api;
+create database booking_api owner booking_migrator;
+\c booking_api
+alter schema public owner to booking_migrator;
+grant connect on database booking_api to booking_app;
+grant usage on schema public to booking_app;
+grant select, insert, update, delete on all tables in schema public to booking_app;
+grant usage, select on all sequences in schema public to booking_app;
+alter default privileges for role booking_migrator in schema public
+  grant select, insert, update, delete on tables to booking_app;
+alter default privileges for role booking_migrator in schema public
+  grant usage, select on sequences to booking_app;
+```
+
+Two URLs: `prisma.config.ts` uses `MIGRATE_DATABASE_URL` (migrator), the app uses `DATABASE_URL` (app). As `booking_app`, `drop table bookings;` fails with `ERROR: must be owner of table bookings`.
+
+**9.2** C **hangs** too, even though it's a simple `select`: it's queued behind B's `ACCESS EXCLUSIVE` request, which is waiting for A. The blocking query shows B blocked by A, and C blocked by B. With `set lock_timeout = '2s'` in B, B fails after 2 seconds (`canceling statement due to lock timeout`), and C runs immediately.
+
+**9.3**
+
+1. Migration: `alter table bookings add column customer_notes text;` (with `lock_timeout`). App: writes `notes` and `customer_notes`, reads `notes`.
+2. Backfill script: the batched update from the lesson, in a loop until 0 rows.
+3. App: reads `customer_notes`, writes both.
+4. App: only `customer_notes`; remove `notes` from the Prisma schema with `@map` tricks or after step 5.
+5. Migration: `alter table bookings drop column notes;`.
+
+Typical timing: one big `update` of 1M rows takes several seconds and locks every row; batches of 5,000 take a bit longer in total, but each batch locks rows only for milliseconds.
+
+**9.4** With `max: 5` and 1-second transactions, the API completes about 5 requests per second, so the 50th request waits about 10 seconds. With `connectionTimeoutMillis: 3000`, requests that wait more than 3 seconds fail fast with an error instead (which you map to 503).
+
+Sizing for 3 API instances and 2 workers with `max_connections = 100`: remember that during a **rolling deploy**, old and new instances run at the same time, so API connections can double. For example: API pool 10 × 3 instances × 2 (deploys) = 60, workers 5 × 2 = 10, migrations/admin/monitoring 10. Total 80, leaving 20 spare. If you need more, add PgBouncer rather than raising the pool sizes.
+
+## Lesson 10: Multi-tenancy, security and scaling
+
+**10.1**
+
+```sql
+-- as the table owner
+alter table bookings enable row level security;
+alter table bookings force row level security;
+create policy tenant_isolation on bookings
+  using (business_id = nullif(current_setting('app.current_business_id', true), '')::uuid)
+  with check (business_id = nullif(current_setting('app.current_business_id', true), '')::uuid);
+-- same for customers
+
+-- as booking_app
+select count(*) from bookings;                                    -- 0
+begin;
+select set_config('app.current_business_id', '<biz A>', true);
+select count(*) from bookings;                                    -- only A's
+insert into bookings (business_id, ...) values ('<biz B>', ...);  -- ERROR: new row violates row-level security policy
+rollback;
+```
+
+**10.2** After removing the filter, user A still gets only A's bookings: Postgres adds the policy condition itself. With the filter back, the plan is often the same, because `current_setting(...)` is stable and can be used as an index condition. Keeping the explicit filter still matters: it documents intent, and it keeps the code correct if RLS is ever turned off.
+
+**10.3**
+
+1. `ilike '%' || $1 || '%'` is **not** SQL injection (it's a parameter), but `%` and `_` in the input act as wildcards. Escape them (exercise 1.4) and limit the input length.
+2. Sort parameter in `$queryRawUnsafe`: real SQL injection. Validate with `z.enum([...])` and map to fixed `Prisma.sql` fragments (Lesson 10).
+3. `where status = '${status}'` in the export script: real SQL injection. Use a parameter: ``prisma.$queryRaw`... where status = ${status}` `` (or `$1` with `pg`).
+
+**10.4** A strong answer covers, in order:
+
+1. **Measure:** `pg_stat_statements` at 9 AM Monday, find the top queries by total time; check CPU, I/O and connections.
+2. **Fix the dashboards:** they probably aggregate millions of rows on every request. Move them to precomputed daily stats (a materialized view or summary table updated by a worker), and cache the results in Redis for a few minutes.
+3. **Indexes and queries** for the remaining hot paths; check for N+1.
+4. **Connection pooling** (PgBouncer) if the Monday spike exhausts connections.
+5. **Read replica** for dashboards and reports, with read-your-writes handled for normal booking flows.
+6. **Scale up** the primary if CPU is still high.
+7. **Archive or partition** old bookings only if table size itself becomes a problem; sharding by `business_id` is the far future.
+
+For each step, say which metric you watch (p95 latency of the dashboard endpoint, database CPU, connections in use) and the target.

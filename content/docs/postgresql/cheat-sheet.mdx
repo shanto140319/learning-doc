@@ -1,0 +1,134 @@
+---
+title: "Cheat sheet"
+description: "One page to revise the whole PostgreSQL section before an interview."
+---
+
+## Types
+
+- Moments: **`timestamptz`** (never `timestamp`). Money: **integer cents**. Text: `text` + `check`. IDs: `uuidv7()` (PG 18) or `bigint generated always as identity`
+- Business time zone: IANA name (`Asia/Dhaka`), never an offset
+- `null`: use `is null`, `coalesce`, `is distinct from`; `not exists` instead of `not in (subquery)`; `count(col)` skips nulls
+- Query order: `FROM → WHERE → GROUP BY → HAVING → SELECT → ORDER BY → LIMIT`
+
+## Modelling
+
+- 1:N → foreign key on the N side. N:M → join table (data about the link lives there)
+- Store each fact once; copy on purpose for history (`bookings.price_cents`)
+- Constraints: `not null`, `check`, `unique`, `primary key`, `references`, `exclude`
+- `on delete`: default (block) for history, `cascade` for owned children, `set null` for optional links
+- **Index foreign key columns** (Postgres doesn't)
+- Multi-tenant: `business_id` everywhere + composite FKs `(business_id, x_id) → (business_id, id)`
+- Soft delete: `deleted_at` + **partial unique index** `where deleted_at is null`
+
+## Time and no double bookings
+
+```sql
+timestamptz_col at time zone 'Asia/Dhaka'          -- moment → local wall time
+(date + time '09:00') at time zone 'Asia/Dhaka'    -- local wall time → moment
+tstzrange(starts_at, ends_at, '[)')                -- half-open: back-to-back is OK
+-- && overlaps, @> contains, <@ contained by
+
+create extension btree_gist;
+alter table bookings add constraint bookings_no_overlap
+  exclude using gist (staff_id with =, tstzrange(starts_at, ends_at, '[)') with &&)
+  where (status <> 'cancelled');                   -- violation: 23P01 → 409
+```
+
+## Indexes
+
+| Need | Index |
+| --- | --- |
+| `=`, range, sort | B-tree; **equality columns first**, then range/sort |
+| Only some rows | Partial: `... where status = 'confirmed'` |
+| Function in `where` | Expression: `(lower(email))` |
+| Skip the table | Covering: `include (...)` → Index Only Scan |
+| JSONB, arrays, full-text, trigram | GIN |
+| Ranges, exclusion | GiST |
+| Huge append-only time data | BRIN |
+
+Indexes slow down writes. Check `pg_stat_user_indexes.idx_scan`. Production: `create index concurrently`.
+
+## EXPLAIN ANALYZE
+
+- Read the tree from the most indented node up; `rows` estimate vs `actual rows`; time is per loop
+- Smells: `Seq Scan` + big `Rows Removed by Filter`, `Sort Method: external merge Disk`, estimates 10× off, `Nested Loop` over many rows
+- Index ignored: function on column, type mismatch, `like '%x'`, low selectivity, wrong leading column, stale stats (`analyze`)
+- Find slow queries: `pg_stat_statements` sorted by `total_exec_time`
+- `offset` reads and throws away rows → keyset `(starts_at, id) < ($1, $2)`
+- N+1 → join, or `where id = any($1)`, or Prisma `select`/`include`
+
+## Transactions and locking
+
+| Level | Snapshot | Still possible |
+| --- | --- | --- |
+| Read committed (default) | Per statement | Non-repeatable reads, phantoms, lost updates, write skew |
+| Repeatable read | Per transaction | Write skew; `40001` on concurrent update |
+| Serializable | Per transaction + checks | Nothing, but **retry `40001`** |
+
+Prefer, in order: **constraint** → **atomic statement** (`set x = x - $1 where x >= $1`) → **`for update`** → **serializable + retry**.
+
+- `for update nowait` (fail fast), `for update skip locked` (job queues)
+- No row to lock (write skew): constraint, lock the parent row, `pg_advisory_xact_lock`, or serializable
+- Optimistic: `where id = $1 and version = $2`, 0 rows → 409 / 412 (`ETag` + `If-Match`)
+- Deadlock `40P01`: lock in a fixed order (`order by id for update`), retry
+- Upsert: `insert ... on conflict (...) do update set x = excluded.x` / `do nothing returning`
+- Outbox: event row in the same transaction → relay with `skip locked` → at-least-once
+- Short transactions, **no external calls inside**, `lock_timeout`, `statement_timeout`
+
+SQLSTATE: `23505` unique, `23503` FK, `23514` check, `23502` not null, `23P01` exclusion, `40001` serialization, `40P01` deadlock, `55P03` lock not available.
+
+## Advanced SQL
+
+- CTE `with x as (...)`; recursive for trees; `update ... returning` inside a CTE
+- `count(*) filter (where ...)` for several counts in one pass
+- Windows: `row_number`, `rank`, `lag`, `sum() over (order by ...)`, `over (partition by ...)`
+- Latest per group: `row_number() ... where rn = 1` or `distinct on (key) ... order by key, time desc`
+- Top N per group: `cross join lateral (... limit 3)`
+- Charts with zero days: `generate_series` + `left join`
+- JSONB: `->`, `->>`, `@>`, `?`; GIN `jsonb_path_ops`; no core data in JSONB
+- Full-text: generated `tsvector` column + GIN + `websearch_to_tsquery` + `ts_rank`; typos: `pg_trgm`
+- Materialized view + unique index + `refresh ... concurrently` for dashboards
+
+## Prisma 7
+
+```prisma
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+datasource db {
+  provider = "postgresql"                       // the URL lives in prisma.config.ts
+}
+// in a model: always @db.Timestamptz!
+startsAt DateTime @map("starts_at") @db.Timestamptz(3)
+```
+
+- `new PrismaClient({ adapter: new PrismaPg({ connectionString, max: 10 }) })`
+- `migrate dev` (local) → `generate` → `migrate deploy` (CI/prod). Custom SQL: `migrate dev --create-only`
+- `select` over `include`; `findFirst({ where: { id, businessId } })` for tenant scoping
+- `$transaction(async (tx) => ...)`: use **`tx`** inside
+- `updateMany` returns `count` → optimistic locking, atomic state changes
+- Raw: `` $queryRaw`... ${value}` `` (safe), `Prisma.sql`, `Prisma.join`; never `$queryRawUnsafe` with input
+- Errors: `P2002` unique → 409, `P2025` not found → 404, `P2003` FK, `P2034` conflict → retry
+- TypeORM: no `synchronize` in prod, watch lazy/eager relations, `dataSource.transaction(manager => ...)`
+
+## Operations
+
+- Migrations: never edit applied ones; work with old + new app; roll forward
+- `set lock_timeout = '5s'` in migrations; `concurrently` for indexes; `not valid` + `validate constraint` for FKs/checks
+- Rename/change type: **expand and contract**; backfill in batches
+- Pool: small (≈ 10 per instance); total across instances (× 2 during deploys) < `max_connections`
+- PgBouncer transaction mode: `set local` / `set_config(..., true)`, `pg_advisory_xact_lock`
+- Role timeouts: `statement_timeout`, `idle_in_transaction_session_timeout`, `lock_timeout`
+- MVCC → dead tuples → autovacuum (never turn it off); long transactions block cleanup
+- Backups: PITR from the provider; RPO / RTO; **test a restore**
+- `pg_stat_activity`, `pg_blocking_pids(pid)`, `pg_cancel_backend`, `pg_terminate_backend`
+- Roles: migrator owns the schema, app gets DML only, never connect as `postgres`
+
+## Multi-tenancy and scaling
+
+- Models: shared tables (default) → schema per tenant → database per tenant
+- RLS: `enable` + `force`, policy `using` **and** `with check` on `current_setting('app.current_business_id', true)`, set with `set_config(..., true)` per transaction; superusers and `bypassrls` skip it
+- Injection beyond values: allow-list sort/columns, escape `%` `_` in `like`
+- Scaling order: **queries/indexes → pooling → scale up → cache → read replicas (lag!) → partitioning → sharding**

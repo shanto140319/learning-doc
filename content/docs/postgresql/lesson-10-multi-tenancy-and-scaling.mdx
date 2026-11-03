@@ -1,0 +1,207 @@
+---
+title: "Lesson 10: Multi-tenancy, security and scaling"
+description: "Multi-tenancy models, row-level security as a safety net (with Prisma and connection poolers), SQL injection beyond the basics, data protection, and how to scale PostgreSQL: replicas, caching, partitioning and sharding."
+---
+
+The last lesson has two parts. First, **protecting tenants' data**: one business must never see another's bookings, even when your code has a bug. Second, **scaling**: the database questions you'll get in Phase 3 system design interviews.
+
+## Multi-tenancy models
+
+| Model | How | Pros | Cons |
+| --- | --- | --- | --- |
+| **Shared tables** + `business_id` (our choice) | Every row has a tenant ID | Simple, cheap, easy migrations, easy cross-tenant analytics | Isolation depends on every query being correct; one big tenant can slow others |
+| **Schema per tenant** | `tenant_42.bookings` | Stronger separation, per-tenant backup | Migrations run N times; thousands of schemas get painful |
+| **Database per tenant** | One database each | Strongest isolation, can place big customers on their own server | Expensive, complex operations, connection counts multiply |
+
+Most SaaS products start with shared tables and move only their largest customers out later. That's a good interview answer too.
+
+With shared tables, you already have two layers: `business_id` in every query (NestJS: `@CurrentUser('businessId')`), and composite foreign keys (Lesson 2). The third layer is **row-level security**.
+
+## Row-level security (RLS)
+
+RLS lets Postgres **filter rows automatically** based on a policy. Even if a query forgets `where business_id = ...`, it only sees the current tenant's rows.
+
+```sql
+alter table bookings enable row level security;
+alter table bookings force row level security;    -- apply to the table owner too
+
+create policy tenant_isolation on bookings
+  using (business_id = nullif(current_setting('app.current_business_id', true), '')::uuid)
+  with check (business_id = nullif(current_setting('app.current_business_id', true), '')::uuid);
+```
+
+- `using (...)`: which existing rows are visible (for `select`, `update`, `delete`).
+- `with check (...)`: which rows you may write (for `insert`, `update`). Without it, a bug could insert a row for another tenant.
+- `current_setting('app.current_business_id', true)` reads a custom setting; `true` means "return null if not set" instead of an error. `nullif(..., '')` handles an empty value. With no tenant set, the condition is `null`, so **no rows** are visible. That's a safe default.
+
+The app sets the tenant **for the current transaction only**:
+
+```sql
+begin;
+select set_config('app.current_business_id', '019a...', true);   -- true = local to this transaction
+select * from bookings;                                          -- only this business's rows
+commit;                                                          -- the setting disappears
+```
+
+Transaction-local settings are important: with a pool (and PgBouncer in transaction mode, Lesson 9), the next request may get the same connection. A session-level `set` would leak one tenant's ID into another tenant's request.
+
+<Callout type="warn" title="Who bypasses RLS">
+**Superusers** (like `postgres`) and roles with `BYPASSRLS` always skip policies. Table **owners** skip them too, unless you use `force row level security`. Test RLS while connected as `booking_app` (Lesson 9), never as `postgres`, or you'll think it works when it doesn't.
+</Callout>
+
+### RLS with Prisma
+
+Every query must run inside a transaction that first sets the tenant. A Prisma **client extension** does that automatically:
+
+```typescript
+import { PrismaService } from './prisma.service';
+
+export function forTenant(prisma: PrismaService, businessId: string) {
+  return prisma.$extends({
+    query: {
+      $allModels: {
+        async $allOperations({ args, query }) {
+          const [, result] = await prisma.$transaction([
+            prisma.$executeRaw`select set_config('app.current_business_id', ${businessId}, true)`,
+            query(args),
+          ]);
+          return result;
+        },
+      },
+    },
+  });
+}
+
+// in a request-scoped place (for example, a repository method that receives the tenant)
+const db = forTenant(this.prisma, user.businessId);
+const bookings = await db.booking.findMany({ take: 20 });   // filtered by Postgres
+```
+
+Keep the `where: { businessId }` in your queries anyway. It helps the planner use indexes, and two independent layers are the point. RLS is the safety net, not the only check.
+
+### Trade-offs
+
+- **Pros:** one forgotten `where` can't leak data; it also protects other tools that connect to the database (admin scripts, a BI tool, an AI agent's SQL tool in Phase 2).
+- **Cons:** every query needs the tenant set (an extra round trip per transaction); policies add a small cost (make sure `business_id` is the first column of your indexes); debugging "why are there no rows?" is confusing at first; background jobs that work across tenants need a separate role with `bypassrls`.
+
+Supabase uses RLS as its main security model (policies based on the logged-in user). If you join a team using Supabase, this is daily work.
+
+## SQL injection: beyond "use parameters"
+
+Parameters (`$1`) protect **values**. They can't be used for **identifiers** (column and table names), sort directions or SQL keywords. Those are where injection still happens:
+
+```typescript
+// sort comes from the query string: ?sort=starts_at  → injection risk
+const SORTS = {
+  newest: Prisma.sql`starts_at desc, id desc`,
+  oldest: Prisma.sql`starts_at asc, id asc`,
+} as const;
+
+// validate first: only known keys get through (not "constructor" or other object properties)
+const ListQuery = z.object({ sort: z.enum(['newest', 'oldest']).default('newest') });
+const query = ListQuery.parse(rawQuery);
+
+const orderBy = SORTS[query.sort];
+await prisma.$queryRaw`select id from bookings where business_id = ${businessId}::uuid order by ${orderBy} limit 20`;
+```
+
+Other places to watch:
+
+- `like` / `ilike` with user input: `%` and `_` are wildcards. Escape them, or a search for `%` matches everything (slow, and sometimes a data leak).
+- `$queryRawUnsafe`, `$executeRawUnsafe` and string-built SQL in migrations or scripts.
+- Dynamic SQL inside PL/pgSQL functions (`execute 'select ... ' || input`): use `format('%I', name)` for identifiers and `using` for values.
+
+## Protecting data
+
+- **TLS** to the database: `sslmode=verify-full` in the connection string for managed databases.
+- **Secrets** in a secret manager or environment, never in Git (NestJS Lesson 6: validated config).
+- **Least privilege roles** (Lesson 9).
+- **Personal data:** know which columns contain it (email, phone, notes). Don't log it (pino redaction). Support real deletion when a user asks (GDPR-style requests are common for US/EU clients).
+- **Encryption at rest** is on by default with managed providers. Encrypt especially sensitive columns in the application (or with `pgcrypto`) so even a database dump doesn't expose them.
+- **Audit trail:** an `audit_log` table written in the same transaction as the change (like the outbox).
+
+## Scaling PostgreSQL
+
+A single, well-tuned Postgres server handles **far more** than most startups ever need: thousands of queries per second and terabytes of data. Scale in this order, and only when measurements say you must:
+
+### 1. Fix queries and indexes
+
+Lessons 4 and 5. Most "the database is slow" problems are a missing index, an N+1, or `offset` pagination. Free and the biggest win.
+
+### 2. Pool connections and keep transactions short
+
+Lesson 9.
+
+### 3. Scale up (vertical)
+
+A bigger server: more RAM (so the working set fits in memory), more CPU, faster disks. Boring, but easy and effective.
+
+### 4. Cache
+
+Redis in front of expensive, frequently-read data (Month 2): a business's public profile and services, availability for the next few days. Caching adds **invalidation** problems, so cache data that changes rarely or can be a little stale. Materialized views (Lesson 7) are a kind of cache inside the database.
+
+### 5. Read replicas
+
+Copies of the primary that receive changes through streaming replication. Send **reads** (dashboards, search, reports) to replicas; **writes** always go to the primary.
+
+The catch is **replication lag**: a replica may be milliseconds to seconds behind. A customer books, gets redirected to "My bookings", the page reads from a replica, and the booking isn't there yet. Fixes: read **your own** recent writes from the primary (for example, for a few seconds after a write), or route whole user flows that need fresh data to the primary.
+
+### 6. Partitioning
+
+Split one huge table into smaller pieces by a key, while queries still use one table name:
+
+```sql
+create table clicks (
+  link_id    bigint not null,
+  clicked_at timestamptz not null,
+  country    text
+) partition by range (clicked_at);
+
+create table clicks_2026_11 partition of clicks
+  for values from ('2026-11-01') to ('2026-12-01');
+```
+
+Benefits: queries for a time range only touch the relevant partitions, and deleting old data is instant (`drop table clicks_2025_01` instead of a huge `delete`). Costs: primary keys and unique constraints must include the partition key, which makes rules like the booking exclusion constraint harder; partitions must be created ahead of time (`pg_partman` automates it). Consider it for append-heavy tables in the **hundreds of millions of rows**: events, clicks, logs, LLM call logs. Not bookings at your scale.
+
+### 7. Sharding
+
+Splitting data across **multiple servers** (for example, by `business_id`). Citus, or application-level routing. It's the last step because cross-shard queries, transactions and migrations get much harder. Mention it in interviews, but say you'd do everything above first.
+
+### Archiving
+
+Move old, rarely-read data (bookings from 3 years ago) to an archive table or cheap storage (S3 as Parquet files). Small hot tables mean fast queries and fast backups.
+
+## Coming next: pgvector
+
+In Phase 2, you'll add the `pgvector` extension and store **embeddings** next to your data, so the AI support agent can search each business's documents by meaning. Everything from this section applies: an index type (HNSW), `EXPLAIN ANALYZE`, filtering by `business_id` (with RLS!), and **hybrid search**, combining the full-text search from Lesson 7 with vector search.
+
+## Common mistakes
+
+- Testing RLS as the `postgres` superuser.
+- A session-level `set` for the tenant with a connection pool.
+- RLS policies with `using` but no `with check`.
+- Allowing raw sort or column names from the query string.
+- Reaching for sharding or microservices before fixing indexes.
+- Reading from a replica right after a write and showing stale data.
+- Partitioning a table with a few million rows.
+
+## Exercises
+
+- **10.1** 🟢 Enable RLS with `force` on `bookings` and `customers` in your practice database. Connected as `booking_app`, show that: with no tenant set, you see 0 rows; with tenant A set, you only see A's rows; inserting a row for business B fails.
+- **10.2** 🟡 Add the `forTenant` Prisma extension to the booking API. Remove the `businessId` filter from `list` **temporarily** and prove that a user from business A still only gets A's bookings. Then put the filter back and compare the query plans with and without it.
+- **10.3** 🟡 Find and fix the SQL injection risks in this code (there are three): a search endpoint using `ilike '%' || $1 || '%'`, a sort parameter passed into `$queryRawUnsafe`, and a CSV export script that builds `where status = '${status}'`. Write the safe version of each.
+- **10.4** 🔴 System design practice: your booking platform now has 20,000 businesses, 50 million bookings, and dashboards that are slow at 9 AM every Monday. Write a one-page plan (in English, as if for an interview) to scale the database, in the order you'd do things, with how you'd measure each step. Then practise saying it out loud in under 3 minutes.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you keep tenants' data isolated in a multi-tenant app?"**
+
+> "I use shared tables with a tenant ID on every row, and I protect it in layers. First, the application scopes every query by the tenant ID taken from the authenticated user, never from the request body, and that logic lives in the repository layer. Second, composite foreign keys make sure a row can only reference rows from the same tenant. Third, PostgreSQL row-level security as a safety net: a policy filters rows by a tenant setting that the app sets per transaction, so even if someone forgets a WHERE clause, no other tenant's data comes back. I also test isolation explicitly, with a test that tries to read another tenant's data."
+
+**"How would you scale the database?"**
+
+> "I'd measure first, then go step by step. Usually the biggest wins are query fixes: indexes, removing N+1 queries, keyset pagination. Then connection pooling and short transactions, and scaling the server up. Next, caching hot, rarely changing data in Redis, and moving read-heavy work like dashboards to read replicas, being careful about replication lag for read-after-write flows. For very large append-only tables like events or logs, I'd partition by time and archive old data. Sharding is the last step, because it makes queries, transactions and operations much more complex."

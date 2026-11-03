@@ -1,0 +1,19 @@
+{
+  "title": "PostgreSQL",
+  "pages": [
+    "index",
+    "lesson-1-sql-foundations",
+    "lesson-2-data-modelling",
+    "lesson-3-time-and-ranges",
+    "lesson-4-indexes",
+    "lesson-5-explain-and-performance",
+    "lesson-6-transactions-and-locking",
+    "lesson-7-advanced-sql",
+    "lesson-8-prisma",
+    "lesson-9-migrations-and-operations",
+    "lesson-10-multi-tenancy-and-scaling",
+    "practice-project",
+    "solutions",
+    "cheat-sheet"
+  ]
+}

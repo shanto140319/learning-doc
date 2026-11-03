@@ -1,0 +1,280 @@
+---
+title: "Lesson 1: Setup and SQL foundations"
+description: "psql, data types, IDs, NULL, CRUD with RETURNING, joins, aggregates, the logical order of a query, and parameterised queries from Node."
+---
+
+You probably know basic SQL from frontend projects and tutorials. This lesson fills the gaps that cause real bugs: the wrong data type, `NULL` surprises, and joins that return the wrong number of rows.
+
+## psql in 2 minutes
+
+Open it with `docker exec -it booking-pg psql -U postgres -d booking`.
+
+| Command | What it does |
+| --- | --- |
+| `\l` | List databases |
+| `\c booking` | Connect to a database |
+| `\dt` | List tables |
+| `\d bookings` | Describe a table: columns, indexes, constraints |
+| `\di` | List indexes |
+| `\x auto` | Show wide rows vertically (easier to read) |
+| `\timing on` | Show how long each query takes |
+| `\i /sql/01-basics.sql` | Run a file (mount your folder into the container first; see below) |
+| `\e` | Open the last query in an editor |
+| `\q` | Quit |
+
+Every SQL statement ends with `;`. If the prompt changes to `booking-#`, psql is waiting for the rest of a statement: type `;` and press Enter.
+
+To run your files with `\i`, mount the folder by adding this under `volumes:` in `docker-compose.yml`, then `docker compose up -d` again:
+
+```yaml
+      - ./sql:/sql
+```
+
+## Data types you'll actually use
+
+| Data | Type | Notes |
+| --- | --- | --- |
+| Text | `text` | Use `text` + a `CHECK` for length. `varchar(n)` has no speed benefit in Postgres |
+| Whole numbers | `integer` (up to about 2.1 billion), `bigint` | Use `bigint` for counters that can grow (clicks, events) |
+| Money | `integer` or `bigint` **cents** | Never `float` (`0.1 + 0.2` problem). `numeric(12,2)` is fine for accounting, but cents match Stripe |
+| Exact decimals | `numeric` | Slower; for money math, tax rates |
+| Yes/no | `boolean` | |
+| A moment in time | **`timestamptz`** | Always this one for "when did it happen". Lesson 3 explains why |
+| A calendar date | `date` | Birthdays, "2026-11-10" |
+| A wall-clock time | `time` | Opening hours ("09:00") |
+| Duration | `interval` | `interval '30 minutes'` |
+| IDs | `uuid` or `bigint` | See below |
+| Flexible data | `jsonb` | Not `json`. For settings or webhook payloads, not core data (Lesson 7) |
+| Lists | `text[]`, `integer[]` | Fine for small tag lists; usually a separate table is better |
+
+### IDs: bigint or UUID?
+
+| | `bigint generated always as identity` | `uuid` |
+| --- | --- | --- |
+| Size | 8 bytes | 16 bytes |
+| Guessable | Yes (`/bookings/1001` → try `/bookings/1002`) | No |
+| Created in the app before insert | No | Yes |
+| Merge data from many databases | Clashes | No clashes |
+| Index speed | Best | UUID **v4** is random, so inserts land all over the index. UUID **v7** starts with a timestamp, so inserts are in order, almost as fast as bigint |
+
+Our choice for the booking platform: **UUID v7**. PostgreSQL 18 has it built in:
+
+```sql
+select uuidv7();            -- 019a4b2e-7c1d-7e3a-9f10-2b6c8d4e5f60 (time-ordered)
+select gen_random_uuid();   -- v4 (random), works on any version
+```
+
+On PostgreSQL 17 or older, use `gen_random_uuid()` or create v7 IDs in the app (the `uuid` npm package has `v7()`).
+
+## A first table
+
+```sql
+create table services (
+  id               uuid primary key default uuidv7(),
+  name             text not null check (length(name) between 1 and 200),
+  duration_minutes integer not null check (duration_minutes between 5 and 480),
+  price_cents      integer not null check (price_cents >= 0),
+  created_at       timestamptz not null default now()
+);
+```
+
+SQL keywords aren't case-sensitive: `CREATE TABLE` and `create table` are the same. Names are lowercased unless you quote them (`"createdAt"`). **Don't quote names**; use `snake_case` everywhere in the database. (Prisma maps them to `camelCase` in TypeScript; Lesson 8.)
+
+## CRUD with RETURNING
+
+```sql
+insert into services (name, duration_minutes, price_cents)
+values ('Haircut', 30, 50000), ('Beard trim', 15, 20000)
+returning id, name;                         -- get the new rows back in the same query
+
+select id, name, price_cents from services
+where price_cents < 40000
+order by name
+limit 20;
+
+update services set price_cents = 55000
+where name = 'Haircut'
+returning *;
+
+delete from services where name = 'Beard trim' returning id;
+```
+
+`returning` saves a second query. Use it in every insert and update in your repositories.
+
+<Callout type="warn" title="UPDATE and DELETE without WHERE">
+`update services set price_cents = 0;` changes **every row**. When practising, start with `begin;`, run the statement, check the row count, then `commit;` or `rollback;`. Lesson 6 explains transactions properly.
+</Callout>
+
+## NULL: the source of many bugs
+
+`NULL` means "unknown", not "empty" or "zero". Any comparison with `NULL` gives `NULL`, which `WHERE` treats as false.
+
+```sql
+select null = null;           -- null (not true!)
+select null <> 1;             -- null
+select 1 + null;              -- null
+
+-- wrong: never matches anything
+select * from bookings where cancelled_at = null;
+-- right
+select * from bookings where cancelled_at is null;
+
+-- default value for display
+select coalesce(phone, 'no phone') from customers;
+
+-- "is different from", treating null as a normal value
+select * from customers where phone is distinct from '+8801700000000';
+```
+
+Two classic traps:
+
+```sql
+-- count(*) counts rows; count(column) skips nulls
+select count(*), count(phone) from customers;
+
+-- NOT IN with a null in the list returns NO rows at all
+select * from customers where id not in (select customer_id from bookings);
+-- if any customer_id is null, the result is always empty.
+-- use NOT EXISTS instead (also usually faster):
+select * from customers c
+where not exists (select 1 from bookings b where b.customer_id = c.id);
+```
+
+**Rule:** make columns `not null` unless "unknown" is a real, meaningful state.
+
+## Joins
+
+Use two small tables to practise:
+
+```sql
+create table customers (
+  id    uuid primary key default uuidv7(),
+  email text not null unique,
+  name  text not null
+);
+
+create table bookings (
+  id          uuid primary key default uuidv7(),
+  customer_id uuid not null references customers (id),
+  service_id  uuid not null references services (id),
+  starts_at   timestamptz not null,
+  status      text not null default 'confirmed'
+);
+```
+
+| Join | Returns |
+| --- | --- |
+| `inner join` (or just `join`) | Only rows that match on both sides |
+| `left join` | Every row from the left table; `null`s where the right side has no match |
+| `cross join` | Every combination (useful with `generate_series`; dangerous by accident) |
+| Anti-join (`not exists`) | Left rows with **no** match |
+| Semi-join (`exists`) | Left rows with **at least one** match, each returned once |
+
+```sql
+-- bookings with customer and service names
+select b.starts_at, c.name as customer, s.name as service
+from bookings b
+join customers c on c.id = b.customer_id
+join services s on s.id = b.service_id
+order by b.starts_at;
+
+-- every customer and how many bookings they have, including zero
+select c.name, count(b.id) as bookings
+from customers c
+left join bookings b on b.customer_id = c.id
+group by c.id, c.name
+order by bookings desc;
+```
+
+Notice `count(b.id)`, not `count(*)`: with a `left join`, a customer with no bookings still has one row (with `null`s), so `count(*)` would say 1.
+
+### The duplicate-rows trap
+
+Joining two one-to-many relations at once multiplies rows. If a customer has 3 bookings and 2 notes, joining both gives 6 rows, and `sum()` counts things twice. Fix: aggregate each one in a subquery or CTE first (Lesson 7), then join.
+
+## GROUP BY and HAVING
+
+```sql
+select s.name, count(*) as total, sum(s.price_cents) / 100.0 as revenue
+from bookings b
+join services s on s.id = b.service_id
+where b.status = 'confirmed'
+group by s.name
+having count(*) >= 5          -- filter groups (WHERE filters rows)
+order by revenue desc;
+```
+
+## The logical order of a query
+
+You write `SELECT` first, but Postgres logically runs it in this order:
+
+```text
+FROM / JOIN → WHERE → GROUP BY → HAVING → SELECT → DISTINCT → ORDER BY → LIMIT / OFFSET
+```
+
+This explains common errors: you can't use a `select` alias in `where` (it doesn't exist yet), but you **can** use it in `order by`.
+
+## Parameterised queries from Node
+
+Never build SQL by joining strings. Use placeholders (`$1`, `$2`) and pass values separately. The driver sends them apart from the SQL text, so SQL injection is impossible.
+
+```powershell
+npm i pg
+npm i -D @types/pg
+```
+
+```typescript
+import { Pool } from 'pg';
+
+const pool = new Pool({ connectionString: 'postgres://postgres:postgres@localhost:5432/booking' });
+
+type ServiceRow = { id: string; name: string; price_cents: number };
+
+export async function findCheapServices(maxPriceCents: number): Promise<ServiceRow[]> {
+  const { rows } = await pool.query<ServiceRow>(
+    'select id, name, price_cents from services where price_cents <= $1 order by name',
+    [maxPriceCents],
+  );
+  return rows;
+}
+
+// WRONG: SQL injection
+// pool.query(`select * from services where name = '${name}'`);
+```
+
+Notes:
+
+- `pool.query` borrows a connection, runs the query and gives it back. Lesson 9 covers pool sizes.
+- `pg` returns `bigint` and `numeric` columns as **strings** (they can be bigger than a JS number). `integer` comes back as a number, `timestamptz` as a `Date`.
+- The generic `<ServiceRow>` is a promise you make, not a check. Validate at the edge if the data matters (TypeScript Lesson 5, Zod).
+
+## Common mistakes
+
+- `float` for money.
+- `timestamp` instead of `timestamptz`.
+- `= null` instead of `is null`.
+- `not in (subquery)` when the subquery can return `null`.
+- `count(*)` with a `left join`.
+- Quoted camelCase names (`"createdAt"`), so every query needs quotes forever.
+- String-built SQL.
+
+## Exercises
+
+- **1.1** 🟢 Start Postgres with the compose file. Create `services`, `customers` and `bookings` as above. Insert 3 services, 4 customers and 8 bookings (one customer with no bookings). Use `returning` to collect the IDs.
+- **1.2** 🟢 Write queries: (a) every booking with customer and service names, newest first; (b) customers with **no** bookings, using `not exists`; (c) revenue per service, only services with at least 2 bookings.
+- **1.3** 🟡 Show the `not in` trap: make `bookings.customer_id` nullable for a moment (`alter table bookings alter column customer_id drop not null;`), insert a booking with a `null` customer, and compare `not in` with `not exists`. Write one sentence explaining the difference. Put the `not null` back afterwards.
+- **1.4** 🟡 Write a small TypeScript script with `pg` that takes a search word from the command line and finds services whose name contains it (`ilike`). Make it safe from SQL injection, and test it with the input `x' or '1'='1`.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What's the difference between WHERE and HAVING?"**
+
+> "WHERE filters individual rows before grouping, and HAVING filters groups after GROUP BY, so HAVING can use aggregates like count or sum. For example, to find services with more than five confirmed bookings, I filter confirmed bookings in WHERE, group by service, and put count greater than five in HAVING."
+
+**"How do you prevent SQL injection?"**
+
+> "I never build SQL by concatenating user input. I use parameterised queries, where the SQL text has placeholders like dollar one and the values are sent separately, so the database never treats them as code. ORMs like Prisma do this by default, and when I write raw SQL I use the tagged template version, not the 'unsafe' string version. For things that can't be parameters, like a column name for sorting, I use an allow-list."

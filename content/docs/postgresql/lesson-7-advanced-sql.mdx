@@ -1,0 +1,328 @@
+---
+title: "Lesson 7: Advanced SQL"
+description: "CTEs (including recursive and data-modifying), window functions, FILTER, DISTINCT ON, LATERAL, daily stats with no gaps, JSONB, full-text search, trigram search, views and materialized views."
+---
+
+ORMs handle CRUD. Dashboards, reports and analytics need real SQL. This lesson covers the features that turn "load everything into JavaScript and loop" into one fast query. These features also come up in SQL interview rounds and take-home tasks.
+
+Use the big seed data from Lesson 4. Replace `$1` with a real business ID when you run things in `psql`.
+
+## CTEs: WITH
+
+A CTE (common table expression) names a subquery so you can read a query top to bottom, step by step:
+
+```sql
+with confirmed_this_month as (
+  select staff_id, price_cents
+  from bookings
+  where business_id = $1
+    and status = 'confirmed'
+    and starts_at >= date_trunc('month', now())
+),
+per_staff as (
+  select staff_id, count(*) as bookings, sum(price_cents) as revenue_cents
+  from confirmed_this_month
+  group by staff_id
+)
+select s.name, p.bookings, p.revenue_cents / 100.0 as revenue
+from per_staff p
+join staff s on s.id = p.staff_id
+order by p.revenue_cents desc;
+```
+
+Since PostgreSQL 12, a simple CTE used once is **inlined** (optimised like a subquery), so it's not slower. `with x as materialized (...)` forces it to run once and be stored, which is occasionally useful.
+
+### Data-modifying CTEs
+
+`update`, `insert` and `delete` with `returning` can be CTEs. One statement, one transaction:
+
+```sql
+-- cancel a booking AND write the outbox event (Lesson 6) in one statement
+with cancelled as (
+  update bookings
+  set status = 'cancelled', cancelled_at = now(), version = version + 1
+  where id = $1 and business_id = $2 and status <> 'cancelled'
+  returning id, business_id
+)
+insert into outbox (topic, payload)
+select 'booking.cancelled', jsonb_build_object('bookingId', id, 'businessId', business_id)
+from cancelled
+returning id;
+```
+
+### Recursive CTEs
+
+For trees: categories, comment threads, org charts, referrals.
+
+```sql
+create table service_categories (
+  id        uuid primary key default uuidv7(),
+  parent_id uuid references service_categories (id),
+  name      text not null
+);
+
+-- a category and everything below it
+with recursive tree as (
+  select id, name, 1 as depth from service_categories where id = $1
+  union all
+  select c.id, c.name, t.depth + 1
+  from service_categories c
+  join tree t on c.parent_id = t.id
+)
+select * from tree;
+```
+
+## Aggregates with FILTER
+
+Several counts in one pass, instead of several queries:
+
+```sql
+select business_id,
+       count(*)                                     as total,
+       count(*) filter (where status = 'confirmed') as confirmed,
+       count(*) filter (where status = 'cancelled') as cancelled,
+       round(100.0 * count(*) filter (where status = 'cancelled') / count(*), 1) as cancel_rate_pct
+from bookings
+where starts_at >= now() - interval '30 days' and starts_at < now()
+group by business_id;
+```
+
+## Window functions
+
+A window function calculates across **related rows** without collapsing them into one row (as `group by` does). The `over (...)` part defines the "window": which rows, and in what order.
+
+```sql
+-- each staff member's revenue last month, their rank, and their share of the total
+with revenue as (
+  select staff_id, sum(price_cents) as cents
+  from bookings
+  where business_id = $1 and status = 'confirmed'
+    and starts_at >= date_trunc('month', now()) - interval '1 month'
+    and starts_at <  date_trunc('month', now())
+  group by staff_id
+)
+select staff_id,
+       cents,
+       rank() over (order by cents desc)                        as rank,
+       round(100.0 * cents / sum(cents) over (), 1)             as share_pct
+from revenue;
+```
+
+`sum(cents) over ()` is the total over **all** rows, shown on every row.
+
+| Function | Gives |
+| --- | --- |
+| `row_number()` | 1, 2, 3, 4 (always unique) |
+| `rank()` | 1, 2, 2, 4 (ties share a rank, then skip) |
+| `dense_rank()` | 1, 2, 2, 3 |
+| `lag(x)` / `lead(x)` | The previous / next row's value |
+| `sum(x) over (order by ...)` | A running total |
+| `avg(x) over (order by ... rows between 6 preceding and current row)` | A 7-row moving average |
+| `first_value(x)`, `last_value(x)`, `ntile(4)` | First/last in the window, quartiles |
+
+`partition by` restarts the window for each group, like a `group by` that keeps all rows:
+
+```sql
+-- gaps between a staff member's bookings (idle time) on one day
+select staff_id, starts_at, ends_at,
+       starts_at - lag(ends_at) over (partition by staff_id order by starts_at) as gap
+from bookings
+where business_id = $1 and status = 'confirmed'
+  and starts_at >= '2026-11-10 00:00+06' and starts_at < '2026-11-11 00:00+06'
+order by staff_id, starts_at;
+```
+
+### "Latest row per group": a classic interview question
+
+"Each customer's most recent booking." Two ways:
+
+```sql
+-- standard SQL, works everywhere
+select * from (
+  select b.*, row_number() over (partition by customer_id order by starts_at desc) as rn
+  from bookings b
+  where business_id = $1
+) x
+where rn = 1;
+
+-- Postgres only, shorter
+select distinct on (customer_id) *
+from bookings
+where business_id = $1
+order by customer_id, starts_at desc;
+```
+
+## LATERAL: "for each row, run this subquery"
+
+A `lateral` subquery can use columns from tables earlier in the `from`. It's the clean way to do **top N per group**:
+
+```sql
+-- each staff member's next 3 confirmed bookings
+select s.name, nb.starts_at
+from staff s
+cross join lateral (
+  select b.starts_at
+  from bookings b
+  where b.staff_id = s.id and b.status = 'confirmed' and b.starts_at > now()
+  order by b.starts_at
+  limit 3
+) nb
+where s.business_id = $1
+order by s.name, nb.starts_at;
+```
+
+With an index on `(staff_id, starts_at)`, each subquery reads only 3 index entries. Use `left join lateral (...) on true` to keep staff with no upcoming bookings.
+
+## Daily stats with no gaps
+
+A chart of bookings per day needs a row for **every** day, including days with zero. `group by` only returns days that have data. Join to `generate_series`:
+
+```sql
+with days as (
+  select d::date as day
+  from generate_series(date '2026-10-01', date '2026-10-31', interval '1 day') as d
+),
+counts as (
+  select (starts_at at time zone 'Asia/Dhaka')::date as day, count(*) as bookings
+  from bookings
+  where business_id = $1 and status = 'confirmed'
+    and starts_at >= timestamp '2026-10-01' at time zone 'Asia/Dhaka'
+    and starts_at <  timestamp '2026-11-01' at time zone 'Asia/Dhaka'
+  group by 1
+)
+select d.day,
+       coalesce(c.bookings, 0) as bookings,
+       round(avg(coalesce(c.bookings, 0)) over (order by d.day rows between 6 preceding and current row), 1) as avg_7d
+from days d
+left join counts c using (day)
+order by d.day;
+```
+
+Note how the days are grouped in the **business's** time zone. This is exactly the "clicks per day" query for Mini-build A.
+
+## JSONB
+
+`jsonb` stores JSON in a binary format you can query and index. Good for data whose shape varies or that you don't query much: a business's settings, answers to a custom booking form, raw webhook payloads, LLM tool-call logs in Phase 2.
+
+```sql
+alter table bookings add column metadata jsonb not null default '{}';
+
+update bookings
+set metadata = '{"source": "instagram", "answers": {"hairLength": "long"}}'
+where id = $1;
+```
+
+| Operator | Meaning | Example | Result type |
+| --- | --- | --- | --- |
+| `->` | Get a field as JSON | `metadata -> 'answers'` | `jsonb` |
+| `->>` | Get a field as text | `metadata ->> 'source'` | `text` |
+| `#>>` | Get by path as text | `metadata #>> '{answers,hairLength}'` | `text` |
+| `@>` | Contains | `metadata @> '{"source": "instagram"}'` | `boolean` |
+| `?` | Has key | `metadata ? 'source'` | `boolean` |
+
+Merging uses the `||` operator: `metadata || '{"vip": true}'`. To set a nested value: `jsonb_set(metadata, '{answers,hairLength}', '"short"')`.
+
+Indexes:
+
+```sql
+create index bookings_metadata_gin on bookings using gin (metadata jsonb_path_ops);   -- for @>
+create index bookings_source_idx on bookings ((metadata ->> 'source'));              -- for one field
+```
+
+**Don't** put core data (status, times, foreign keys, prices) in JSONB. You lose constraints, foreign keys, type checks and good statistics. If you filter or join on a field all the time, it should be a column.
+
+## Full-text search
+
+`ilike '%word%'` is slow on big tables, doesn't understand word forms ("booking" vs "booked"), and can't rank results. Postgres has a full-text search engine built in. Example: FAQ articles each business writes; in Project 2, the AI agent searches them (later combined with pgvector for **hybrid search**).
+
+```sql
+create table faq_articles (
+  id          uuid primary key default uuidv7(),
+  business_id uuid not null references businesses (id) on delete cascade,
+  title       text not null,
+  body        text not null,
+  search      tsvector generated always as (
+                setweight(to_tsvector('english', title), 'A') ||
+                setweight(to_tsvector('english', body), 'B')
+              ) stored
+);
+create index faq_articles_search_idx on faq_articles using gin (search);
+
+select id, title,
+       ts_rank(search, q) as rank,
+       ts_headline('english', body, q) as snippet
+from faq_articles, websearch_to_tsquery('english', $2) as q
+where business_id = $1 and search @@ q
+order by rank desc
+limit 10;
+```
+
+- `to_tsvector` splits text into normalised words ("lexemes"): "Booking cancelled" becomes `'book' 'cancel'`.
+- `websearch_to_tsquery` understands search-box input: `refund -deposit "same day"`.
+- `@@` means "matches". `setweight` makes title matches rank higher than body matches.
+- The generated column keeps `search` up to date automatically.
+- Bangla isn't one of the built-in languages; use the `'simple'` configuration (no stemming) for Bangla text.
+
+For typos and partial words ("hairct"), use **trigram** similarity from `pg_trgm` (Lesson 4): `where title % $1 order by similarity(title, $1) desc`.
+
+When Postgres search isn't enough (huge data, complex relevance, facets): Elasticsearch, OpenSearch, Meilisearch or Typesense. For most SaaS apps, Postgres is enough.
+
+## Views and materialized views
+
+A **view** is a saved query you can select from like a table. It always shows current data, and it runs the query every time.
+
+```sql
+create view active_services as
+select * from services where deleted_at is null;
+```
+
+A **materialized view** stores the result. It's fast to read but **stale** until you refresh it. Perfect for dashboards over big tables:
+
+```sql
+create materialized view daily_business_stats as
+select b.business_id,
+       (b.starts_at at time zone biz.time_zone)::date as day,
+       count(*) filter (where b.status = 'confirmed') as confirmed,
+       count(*) filter (where b.status = 'cancelled') as cancelled,
+       sum(b.price_cents) filter (where b.status = 'confirmed') as revenue_cents
+from bookings b
+join businesses biz on biz.id = b.business_id
+group by 1, 2;
+
+create unique index on daily_business_stats (business_id, day);   -- needed for "concurrently"
+
+refresh materialized view concurrently daily_business_stats;       -- readers aren't blocked
+```
+
+Refresh it from a scheduled job (every 5 or 15 minutes). For data that must be live, keep a summary table updated in the same transaction or by a worker instead.
+
+## Common mistakes
+
+- Loading thousands of rows into Node to count or group them.
+- `group by` for a chart, so days with zero are missing.
+- Grouping by UTC date when the business is in another time zone.
+- `rank()` when you need exactly one row per group (use `row_number()` or `distinct on`).
+- Core data inside JSONB.
+- `ilike '%...%'` as the search feature on a big table.
+- A materialized view with no refresh plan.
+
+## Exercises
+
+- **7.1** 🟢 One query with `filter`: for each business, the number of confirmed and cancelled bookings and the cancellation rate, per month, for the last 6 months.
+- **7.2** 🟡 Window functions: for one business last month, show each staff member's revenue, their rank, their share of the total, and the difference from the staff member ranked just above them (`lag`).
+- **7.3** 🟡 Daily confirmed bookings for one business for the last 60 days, with zero days, a 7-day moving average, and a running total. Then write the same query shape for Mini-build A's `clicks` table from exercise 2.3.
+- **7.4** 🔴 Create `faq_articles` and insert 20 articles (ask an AI to write realistic ones for a hair salon: refunds, late arrival, parking, booking changes). Build a search that (a) uses full-text search with ranking and snippets, and (b) falls back to trigram similarity when full-text search finds nothing (for typos). Compare results and speed with `ilike '%...%'`.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What's a window function, and when would you use one?"**
+
+> "A window function calculates something across a set of related rows but, unlike GROUP BY, it keeps every row. You define the window with OVER, optionally with PARTITION BY and ORDER BY. I use them for rankings, like ranking staff by revenue, running totals and moving averages for dashboard charts, comparing a row with the previous one using LAG, and the classic 'latest row per group', where I use ROW_NUMBER partitioned by the group and keep row number one. In Postgres, DISTINCT ON is a shorter way to do that last one."
+
+**"When would you use JSONB instead of normal columns?"**
+
+> "For data whose shape changes or that I rarely filter on, like settings, custom form answers, or raw webhook payloads. JSONB can be indexed with GIN for containment queries, so it's reasonably fast. But I keep core data in normal columns, because JSONB loses constraints, foreign keys, types, and good planner statistics. If I find myself filtering on a JSONB field all the time, I move it into a column."

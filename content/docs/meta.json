@@ -4,6 +4,7 @@
     "typescript",
     "node-http",
     "nestjs",
+    "postgresql",
     "roadmap"
   ]
 }

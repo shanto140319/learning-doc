@@ -1,0 +1,306 @@
+---
+title: "Lesson 2: Data modelling and constraints"
+description: "From requirements to tables: relationships, normalisation, constraints, foreign key actions, multi-tenant tables with composite foreign keys, soft deletes and the full booking schema."
+---
+
+Good data modelling is the biggest difference between a junior and a senior backend engineer. A bad schema causes bugs forever; a good one makes **invalid data impossible**, so bugs in your code can't corrupt it.
+
+The rule for this lesson: **the database is the last line of defence.** Validation in DTOs is for nice error messages. Constraints in Postgres are for correctness. You need both.
+
+## From requirements to tables
+
+Project 1 requirements, in short:
+
+- A **business** has a name, a URL slug and a time zone.
+- **Users** log in. A user can belong to several businesses, with a role in each (owner, admin, staff).
+- A business has **staff members** (the people customers book) and **services** (haircut, 30 minutes, 500 BDT).
+- Each staff member offers some of the services.
+- **Customers** book a service with a staff member at a time. A booking can be cancelled.
+- A staff member can't have two bookings at the same time.
+
+Steps:
+
+1. **Nouns become tables:** businesses, users, memberships, staff, services, customers, bookings.
+2. **Find the relationships and their cardinality:**
+
+```text
+businesses 1──* staff          a business has many staff
+businesses 1──* services
+businesses 1──* customers
+businesses 1──* bookings
+users      *──* businesses     through memberships (with a role)
+staff      *──* services       through staff_services
+bookings   *──1 service, staff, customer
+```
+
+3. **One-to-many:** a foreign key on the "many" side (`staff.business_id`).
+4. **Many-to-many:** a **join table** with two foreign keys (`staff_services`). If the relationship has its own data (the role), that goes on the join table (`memberships.role`).
+5. **Write the constraints** for every rule you can.
+
+## Normalisation in plain English
+
+Normalisation means **store each fact once**.
+
+- **1NF:** one value per column. No `"Haircut, Shave"` in one column, no `service1`, `service2` columns.
+- **2NF and 3NF:** every column describes **the whole key and nothing else**. `bookings.customer_email` breaks this: the email is a fact about the customer, not the booking. If the customer changes their email, you'd have to update every booking.
+
+### When to break the rule on purpose
+
+Copy data when you need **the value at that moment in history**. `bookings.price_cents` is copied from the service when the booking is made: if the owner raises the price next month, old bookings must keep the old price. That's not duplication, it's a different fact ("the price agreed for this booking").
+
+Other good reasons: a counter for speed (`links.click_count`), or a read model for dashboards (Lesson 7, materialized views). Always know which copy is the source of truth.
+
+## Constraints
+
+| Constraint | Rule it enforces |
+| --- | --- |
+| `not null` | The value must exist |
+| `check (...)` | Any condition on one row: `price_cents >= 0`, `ends_at > starts_at` |
+| `unique` | No two rows with the same value(s). Creates an index |
+| `primary key` | `unique` + `not null`; the row's identity |
+| `references` (foreign key) | The value must exist in the other table |
+| `exclude` | No two rows "conflict" by a rule you define (Lesson 3: overlapping times) |
+
+Name your constraints so error messages are readable and you can map them to HTTP errors: `constraint bookings_time_order check (ends_at > starts_at)`.
+
+### Foreign key actions
+
+What happens to bookings when someone deletes their service?
+
+| `on delete` | Effect | Use when |
+| --- | --- | --- |
+| `no action` / `restrict` (default) | The delete fails with an error | Most relations. Protects history |
+| `cascade` | Child rows are deleted too | The child has no meaning without the parent (a business's memberships) |
+| `set null` | Child's column becomes `null` | Optional link (a staff member linked to a user account who left) |
+
+Be careful with `cascade`: one delete can remove thousands of rows. For bookings (money, history) use the default and **soft delete** the service instead.
+
+<Callout type="warn" title="Foreign keys don't create indexes">
+Postgres indexes the **referenced** column (it's a primary key), but not the **referencing** column. Without an index on `bookings.customer_id`, "this customer's bookings" scans the whole table, and deleting a customer checks every booking. Index your foreign key columns (Lesson 4). This is a very common mistake and interview question.
+</Callout>
+
+## Multi-tenancy: business_id everywhere
+
+The booking platform is **multi-tenant**: many businesses share the same tables. The worst bug you can have is showing one business's data to another.
+
+Layer 1: every tenant-owned table has `business_id`, and every query filters by it (you did this in NestJS with `@CurrentUser('businessId')`).
+
+Layer 2: **composite foreign keys**, so a row can't point at another tenant's data, even if your code has a bug.
+
+```sql
+-- in services: allow other tables to reference (business_id, id) together
+unique (business_id, id)
+
+-- in bookings: the service must belong to the SAME business as the booking
+foreign key (business_id, service_id) references services (business_id, id)
+```
+
+With a simple `service_id references services (id)`, a bug could create a booking for business A that uses business B's service. With the composite key, Postgres rejects it.
+
+Layer 3: row-level security (Lesson 10).
+
+## Soft deletes
+
+A soft delete sets `deleted_at = now()` instead of removing the row.
+
+| Pros | Cons |
+| --- | --- |
+| History stays valid (old bookings still point to their service) | **Every** query must add `where deleted_at is null` |
+| Undo is easy | Unique rules break: a deleted "Haircut" blocks creating a new "Haircut" |
+| | Data you "deleted" is still there (privacy laws may require a real delete) |
+
+Fix for the unique problem: a **partial unique index** (only active rows):
+
+```sql
+create unique index services_business_name_key
+  on services (business_id, lower(name))
+  where deleted_at is null;
+```
+
+When to use what:
+
+- **Soft delete:** things that history points to (services, staff).
+- **Status column:** things with a lifecycle. Bookings are never deleted; they become `cancelled`.
+- **Hard delete:** things nothing points to and nobody needs (expired idempotency keys, sessions), and personal data when a user asks for deletion.
+- **Archive table:** move deleted rows to `services_archive` if you want clean main tables.
+
+## Status: text + CHECK or enum type?
+
+```sql
+-- option 1
+status text not null check (status in ('pending', 'confirmed', 'cancelled'))
+
+-- option 2
+create type booking_status as enum ('pending', 'confirmed', 'cancelled');
+status booking_status not null
+```
+
+Both work. Enums are smaller and type-safe; adding a value is easy (`alter type ... add value`), but removing or renaming one is painful. Text + `check` is easier to change. Prisma `enum`s create Postgres enum types (Lesson 8). Pick one style and stay consistent.
+
+## Timestamps and updated_at
+
+Add `created_at` to every table. Add `updated_at` where rows change. Prisma's `@updatedAt` sets it from the app; if other code also writes to the table, a trigger is safer:
+
+```sql
+create function set_updated_at() returns trigger
+language plpgsql as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+create trigger bookings_set_updated_at
+before update on bookings
+for each row execute function set_updated_at();
+```
+
+## The booking schema
+
+This is the schema you'll use for the rest of the section. Read every line and make sure you can explain it. Save it as `sql/02-schema.sql`.
+
+```sql
+drop table if exists bookings, customers, staff_services, services, staff, memberships, users, businesses cascade;
+
+create table businesses (
+  id         uuid primary key default uuidv7(),
+  name       text not null check (length(name) between 1 and 200),
+  slug       text not null unique check (slug ~ '^[a-z0-9-]{3,60}$'),
+  time_zone  text not null default 'UTC',          -- IANA name, e.g. 'Asia/Dhaka' (Lesson 3)
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table users (
+  id            uuid primary key default uuidv7(),
+  email         text not null,
+  password_hash text not null,
+  created_at    timestamptz not null default now()
+);
+create unique index users_email_key on users (lower(email));   -- 'A@x.com' = 'a@x.com'
+
+create table memberships (                         -- many-to-many with data (role)
+  business_id uuid not null references businesses (id) on delete cascade,
+  user_id     uuid not null references users (id) on delete cascade,
+  role        text not null check (role in ('owner', 'admin', 'staff')),
+  created_at  timestamptz not null default now(),
+  primary key (business_id, user_id)
+);
+create index memberships_user_id_idx on memberships (user_id);  -- "my businesses"
+
+create table staff (
+  id          uuid primary key default uuidv7(),
+  business_id uuid not null references businesses (id) on delete cascade,
+  user_id     uuid references users (id) on delete set null,   -- optional login
+  name        text not null,
+  deleted_at  timestamptz,
+  created_at  timestamptz not null default now(),
+  unique (business_id, id)
+);
+
+create table services (
+  id               uuid primary key default uuidv7(),
+  business_id      uuid not null references businesses (id) on delete cascade,
+  name             text not null check (length(name) between 1 and 200),
+  duration_minutes integer not null check (duration_minutes between 5 and 480),
+  price_cents      integer not null check (price_cents >= 0),
+  currency         char(3) not null default 'USD',
+  deleted_at       timestamptz,
+  created_at       timestamptz not null default now(),
+  unique (business_id, id)
+);
+create unique index services_business_name_key
+  on services (business_id, lower(name)) where deleted_at is null;
+
+create table staff_services (                      -- many-to-many, no extra data
+  business_id uuid not null,
+  staff_id    uuid not null,
+  service_id  uuid not null,
+  primary key (staff_id, service_id),
+  foreign key (business_id, staff_id) references staff (business_id, id) on delete cascade,
+  foreign key (business_id, service_id) references services (business_id, id) on delete cascade
+);
+create index staff_services_service_id_idx on staff_services (service_id);
+
+create table customers (
+  id          uuid primary key default uuidv7(),
+  business_id uuid not null references businesses (id) on delete cascade,
+  email       text not null,
+  name        text not null,
+  phone       text,
+  created_at  timestamptz not null default now(),
+  unique (business_id, id)
+);
+create unique index customers_business_email_key on customers (business_id, lower(email));
+
+create table bookings (
+  id           uuid primary key default uuidv7(),
+  business_id  uuid not null references businesses (id) on delete cascade,
+  service_id   uuid not null,
+  staff_id     uuid not null,
+  customer_id  uuid not null,
+  starts_at    timestamptz not null,
+  ends_at      timestamptz not null,
+  status       text not null default 'confirmed'
+               check (status in ('pending', 'confirmed', 'cancelled')),
+  price_cents  integer not null check (price_cents >= 0),   -- copied: the agreed price
+  notes        text check (length(notes) <= 2000),
+  version      integer not null default 1,                   -- optimistic locking (Lesson 6)
+  cancelled_at timestamptz,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+
+  constraint bookings_time_order check (ends_at > starts_at),
+  constraint bookings_cancelled_consistent
+    check ((status = 'cancelled') = (cancelled_at is not null)),
+  foreign key (business_id, service_id)  references services (business_id, id),
+  foreign key (business_id, staff_id)    references staff (business_id, id),
+  foreign key (business_id, customer_id) references customers (business_id, id)
+);
+create index bookings_customer_idx on bookings (business_id, customer_id);
+create index bookings_service_idx  on bookings (business_id, service_id);
+-- the "no overlapping bookings" rule and the list index come in Lessons 3 and 4
+```
+
+Things to notice:
+
+- `bookings_cancelled_consistent`: a booking is cancelled **if and only if** it has `cancelled_at`. You can't forget one of the two.
+- `staff_services` has `business_id` only so the composite foreign keys can check both sides belong to the same business.
+- Emails are unique **per business** for customers, but **globally** for users.
+- No `on delete` on the bookings foreign keys: you can't delete a service, staff member or customer that has bookings. Soft delete them instead.
+
+## Naming conventions
+
+- Tables: plural, `snake_case` (`staff_services`). "staff" is already plural.
+- Columns: `snake_case`; foreign keys `<thing>_id`; timestamps `<verb>_at`; booleans `is_`/`has_`.
+- Constraints and indexes: `<table>_<columns>_<key|idx|check>`. Postgres creates names like `bookings_pkey` and `services_business_id_id_key` for you.
+
+## Common mistakes
+
+- Validating only in the DTO, with no constraint in the database.
+- A `customer_email` column on bookings (duplication), but **no** `price_cents` copy (lost history).
+- `on delete cascade` on everything.
+- Forgetting the index on a foreign key column.
+- Soft deletes with a normal unique constraint.
+- Tenant tables without `business_id`, or with `business_id` but simple single-column foreign keys.
+
+## Exercises
+
+- **2.1** 🟢 Run `02-schema.sql`. Use `\d bookings` and list every constraint and index you see. Which ones did Postgres name for you?
+- **2.2** 🟡 Try to break the rules. Write one insert or update for each, and copy the error message: (a) a booking that ends before it starts; (b) a cancelled booking without `cancelled_at`; (c) a booking for business A that uses business B's service; (d) two active services called "Haircut" and "haircut" in one business; (e) delete a service that has bookings. Then soft delete the service and create a new "Haircut": it should work.
+- **2.3** 🟡 Design the tables for **Mini-build A (URL shortener)**: users, short links (code, target URL, optional expiry), and click analytics (time, country, referrer, user agent). Decide: IDs, which constraints, soft delete or not, and whether to store every click or only daily counts. Write the `create table` statements and explain each decision in one line.
+- **2.4** 🔴 Add **business hours** to the booking schema: each staff member works certain hours per weekday (Monday 09:00–17:00, maybe a lunch break, maybe days off). Design the table(s) with constraints that stop invalid data (closing before opening, invalid weekday). Hint: `time` columns and `extract(isodow from ...)` in Lesson 3.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you design a database schema for a new feature?"**
+
+> "I start from the requirements and list the entities and how they relate: one-to-many becomes a foreign key on the many side, and many-to-many becomes a join table, with any data about the relationship, like a role, on that table. Then I normalise so each fact is stored once, except when I need history, like copying the price into a booking. Then I add every business rule I can as a constraint: not null, check, unique, foreign keys, and for scheduling, an exclusion constraint. The database is the last line of defence, so even a bug in the code can't create invalid data. Finally I add indexes for the main queries, including foreign key columns."
+
+**"Soft delete or hard delete?"**
+
+> "It depends on whether anything points to the row. For things history depends on, like a service that old bookings reference, I soft delete with a deleted_at column and use a partial unique index so the name can be reused. For things with a lifecycle, like bookings, I use a status instead. For data nobody needs, or personal data a user asks us to remove, I hard delete. The downside of soft deletes is that every query must filter them out, so I keep that logic in the repository layer."

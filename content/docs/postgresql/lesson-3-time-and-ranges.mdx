@@ -1,0 +1,276 @@
+---
+title: "Lesson 3: Time, ranges and no double bookings"
+description: "timestamptz vs timestamp, IANA time zones and DST, range types, the check-then-insert race, exclusion constraints with btree_gist, and availability slots with generate_series."
+---
+
+Two things make booking systems hard: **time zones** and **two people booking the same slot at the same moment**. This lesson solves both in the database, which is exactly what the roadmap means by "no double-booking enforced in Postgres". It's also a great interview story.
+
+## timestamptz vs timestamp
+
+| Type | Stores | Use for |
+| --- | --- | --- |
+| `timestamptz` ("timestamp with time zone") | An **exact moment**, saved as UTC. Input with an offset is converted to UTC; output is shown in the session's time zone | Anything that happened or will happen at a real moment: bookings, `created_at`, `paid_at` |
+| `timestamp` ("without time zone") | A date and wall-clock time with **no zone**: "10:00 on Nov 10, somewhere" | Almost never. Only for local wall-clock data you convert later |
+
+The name is confusing: `timestamptz` does **not** store a time zone. It stores a UTC instant. The zone is only used to read input and show output.
+
+```sql
+show timezone;                                  -- usually 'UTC' in Docker
+select timestamptz '2026-11-10 10:00+06';       -- 2026-11-10 04:00:00+00
+
+set timezone = 'Asia/Dhaka';
+select timestamptz '2026-11-10 10:00+06';       -- 2026-11-10 10:00:00+06  (same moment)
+reset timezone;
+```
+
+**Rule:** columns are `timestamptz`, servers and database run in UTC, and the API speaks ISO 8601 strings with an offset (`2026-11-10T04:00:00Z`). Convert to local time only at the edges: the UI, emails, and "business hours" logic.
+
+## Time zones: always IANA names
+
+Store each business's zone as an **IANA name**: `Asia/Dhaka`, `Europe/London`, `America/New_York`. **Never** store an offset like `+06:00` as "the business's time zone": offsets change with daylight saving time (DST), names don't.
+
+`at time zone` converts in both directions, and the direction depends on the input type:
+
+| Expression | Input | Result | Meaning |
+| --- | --- | --- | --- |
+| `starts_at at time zone 'Asia/Dhaka'` | `timestamptz` | `timestamp` | "What does the clock in Dhaka show at this moment?" |
+| `timestamp '2026-11-10 09:00' at time zone 'Asia/Dhaka'` | `timestamp` | `timestamptz` | "Which moment is 09:00 on a Dhaka clock?" |
+
+```sql
+-- show bookings in the business's local time
+select b.id, b.starts_at at time zone biz.time_zone as local_start
+from bookings b join businesses biz on biz.id = b.business_id;
+
+-- the moment "today" started in the business's zone
+select date_trunc('day', now() at time zone 'Asia/Dhaka') at time zone 'Asia/Dhaka' as day_start;
+```
+
+The last line: take now, see it on a Dhaka clock, cut it to midnight, then turn that Dhaka midnight back into a moment. It's the pattern for "today's bookings" for a business.
+
+### Daylight saving time (DST)
+
+Bangladesh has no DST, but your customers in the US, UK and Europe do. Twice a year:
+
+- **Spring forward:** in New York on 2027-03-14, clocks jump from 02:00 to 03:00. **02:30 doesn't exist.**
+- **Fall back:** on 2027-11-07, 01:00–02:00 happens **twice**.
+
+```sql
+select timestamp '2027-03-14 02:30' at time zone 'America/New_York';
+-- Postgres quietly moves it to a real moment (shown as 03:30 local). No error.
+```
+
+Consequences for a booking system:
+
+- Generate slots from **local** business hours per day, then convert each one to a moment. Don't take Monday's moments and add `24 hours`: across a DST change, the slot moves by an hour.
+- `interval '1 day'` added to a `timestamptz` respects the session zone's DST; `interval '24 hours'` doesn't. Know which one you mean.
+- Reminder "24 hours before" is a fixed duration: use `starts_at - interval '24 hours'`.
+
+### In TypeScript
+
+```typescript
+// API input: require an offset, otherwise "10:00" is ambiguous
+const CreateBooking = z.object({
+  startsAt: z.iso.datetime({ offset: true }),   // "2026-11-10T10:00:00+06:00" or "...Z"
+});
+
+// display in the business's zone
+new Intl.DateTimeFormat('en-GB', {
+  timeZone: business.timeZone, dateStyle: 'medium', timeStyle: 'short',
+}).format(booking.startsAt);
+```
+
+## Range types
+
+A booking is a **range of time**. Postgres has range types and operators for them:
+
+```sql
+select tstzrange('2026-11-10 10:00+06', '2026-11-10 10:30+06', '[)');
+```
+
+`'[)'` means "includes the start, excludes the end". That's what you want: a booking 10:00–10:30 and one 10:30–11:00 **don't** overlap.
+
+| Operator | Meaning | Example |
+| --- | --- | --- |
+| `&&` | Overlaps | Two bookings clash |
+| `@>` | Contains | The working day contains the booking |
+| `<@` | Is contained by | The booking is inside business hours |
+| `-\|-` | Is adjacent to | Back-to-back bookings |
+
+```sql
+select tstzrange('2026-11-10 10:00+06', '2026-11-10 10:30+06', '[)')
+    && tstzrange('2026-11-10 10:30+06', '2026-11-10 11:00+06', '[)');   -- false
+
+select tstzrange('2026-11-10 10:00+06', '2026-11-10 10:30+06', '[)')
+    && tstzrange('2026-11-10 10:15+06', '2026-11-10 10:45+06', '[)');   -- true
+```
+
+Other range types: `daterange` (hotel nights), `int4range`, `numrange`. Multiranges (`tstzmultirange`) can hold "09:00–12:00 and 13:00–17:00" in one value.
+
+## The race: check, then insert
+
+The obvious way to stop double bookings:
+
+```typescript
+const clash = await repo.findOverlapping(staffId, startsAt, endsAt);
+if (clash) throw new ConflictException('slot-taken');
+await repo.insert(booking);
+```
+
+Try this with two `psql` windows (A and B), using real IDs from your data:
+
+```sql
+-- A                                          -- B
+begin;
+select count(*) from bookings
+where staff_id = '<staff>' and status <> 'cancelled'
+  and tstzrange(starts_at, ends_at, '[)')
+   && tstzrange('2026-11-10 10:00+06', '2026-11-10 10:30+06', '[)');
+-- 0, free!
+                                              begin;
+                                              -- same select → 0, free!
+insert into bookings (...) values (...);
+                                              insert into bookings (...) values (...);
+commit;
+                                              commit;
+-- two bookings for the same staff at the same time
+```
+
+Both transactions checked before either one inserted. Neither saw the other's row. This is called a **race condition**, and the "check, then act" pattern always has it. Your NestJS check makes it rare, not impossible. With real traffic (or one customer double-clicking "Book"), it happens.
+
+Lesson 6 shows other fixes (locks, `serializable`). The simplest and strongest one is a constraint.
+
+## Exclusion constraints: the database says no
+
+A `unique` constraint says "no two rows have **equal** values". An **exclusion constraint** says "no two rows have values that match **this operator**". We want: no two active bookings with **equal** `staff_id` **and** **overlapping** time.
+
+```sql
+create extension if not exists btree_gist;   -- lets a GiST index handle "=" on uuid
+
+alter table bookings
+  add constraint bookings_no_overlap
+  exclude using gist (
+    staff_id with =,
+    tstzrange(starts_at, ends_at, '[)') with &&
+  )
+  where (status <> 'cancelled');
+```
+
+Read it as: "Exclude any two rows where `staff_id` is equal and the time ranges overlap, counting only rows that aren't cancelled."
+
+- `using gist`: the constraint is backed by a GiST index, which understands ranges. The `btree_gist` extension adds support for `=` on normal types like `uuid`.
+- `where (...)`: cancelled bookings don't block the slot. (Exclusion constraints can be partial; unique constraints can't, which matters below.)
+- We don't need a range column: the constraint uses an **expression** on `starts_at` and `ends_at`.
+
+Now the second insert fails:
+
+```text
+ERROR:  conflicting key value violates exclusion constraint "bookings_no_overlap"
+DETAIL:  Key (staff_id, tstzrange(starts_at, ends_at, '[)'))=(...) conflicts with existing key (...).
+```
+
+And in the race from before? Session B's insert **waits** until A commits (Postgres can't decide yet whether A's row will exist), then fails. If A rolls back, B succeeds. Exactly one booking wins, every time, whatever your application code does.
+
+### Mapping the error to HTTP 409
+
+The SQLSTATE error code for an exclusion violation is `23P01`. With `pg`:
+
+```typescript
+import { DatabaseError } from 'pg';
+
+try {
+  await pool.query(insertBookingSql, values);
+} catch (err) {
+  if (err instanceof DatabaseError && err.code === '23P01' && err.constraint === 'bookings_no_overlap') {
+    throw new SlotTakenError();   // your domain error → 409 problem+json "slot-taken"
+  }
+  throw err;
+}
+```
+
+Useful codes to know: `23505` unique violation, `23503` foreign key violation, `23514` check violation, `23502` not-null violation, `23P01` exclusion violation, `40001` serialization failure, `40P01` deadlock.
+
+**Keep the check in the service too.** It gives a nice fast error in the normal case. The constraint is the guarantee for the rare race.
+
+### PostgreSQL 18: WITHOUT OVERLAPS
+
+PostgreSQL 18 added **temporal** primary and unique keys:
+
+```sql
+-- needs a range column, e.g. during tstzrange
+alter table bookings add constraint bookings_no_overlap_v18
+  unique (staff_id, during without overlaps);
+```
+
+It's neat, but a unique constraint can't have a `where`, so **cancelled bookings would still block the slot**. For our case, the exclusion constraint is better. Know that both exist.
+
+## Availability: free slots with generate_series
+
+`generate_series` creates rows from nothing. With timestamps, it creates a timeline:
+
+```sql
+select generate_series(
+  timestamptz '2026-11-10 09:00+06',
+  timestamptz '2026-11-10 16:30+06',
+  interval '30 minutes'
+) as slot_start;
+-- 16 rows: 09:00, 09:30, … 16:30
+```
+
+Free 30-minute slots for one staff member on one local date:
+
+```sql
+-- $1 staff_id, $2 local date ('2026-11-10'), $3 time zone ('Asia/Dhaka')
+with slots as (
+  select s as starts_at, s + interval '30 minutes' as ends_at
+  from generate_series(
+    ($2::date + time '09:00') at time zone $3,
+    ($2::date + time '17:00') at time zone $3 - interval '30 minutes',
+    interval '30 minutes'
+  ) as s
+)
+select slots.starts_at, slots.ends_at
+from slots
+where slots.starts_at > now()
+  and not exists (
+    select 1 from bookings b
+    where b.staff_id = $1
+      and b.status <> 'cancelled'
+      and tstzrange(b.starts_at, b.ends_at, '[)') && tstzrange(slots.starts_at, slots.ends_at, '[)')
+  )
+order by slots.starts_at;
+```
+
+`date + time` gives a `timestamp` (local wall time), and `at time zone $3` turns it into a real moment for that zone. This is the DST-safe way: each day's slots are built from that day's local hours.
+
+The availability query is for **showing** free slots. Between showing and booking, someone else may take the slot; the exclusion constraint still protects you.
+
+## Common mistakes
+
+- `timestamp` columns, or a server/database in local time.
+- Storing `+06:00` as a business's time zone.
+- Adding `24 hours` to move to "the same time tomorrow".
+- Ranges with `'[]'` (both ends included), so back-to-back bookings clash.
+- Relying only on a check in the service to prevent double bookings.
+- Forgetting `where (status <> 'cancelled')`, so cancelled bookings block slots forever.
+- Catching every database error as "slot taken".
+
+## Exercises
+
+- **3.1** 🟢 With `set timezone` to `UTC`, `Asia/Dhaka` and `America/New_York`, select the same `timestamptz` value. Then convert `2026-11-10 09:00` Dhaka time to UTC, and a UTC booking time to Dhaka local time. Write down which direction of `at time zone` you used each time.
+- **3.2** 🟡 Reproduce the race from this lesson with two `psql` windows **before** adding the constraint (two overlapping bookings succeed). Then add `bookings_no_overlap` (delete the duplicate first, or the constraint can't be created) and repeat. Write down what session B does and when.
+- **3.3** 🟡 Prove these with inserts: (a) back-to-back bookings 10:00–10:30 and 10:30–11:00 for one staff member both succeed; (b) the same time for two **different** staff members succeeds; (c) a new booking over a **cancelled** one succeeds; (d) un-cancelling the old one (`update ... set status = 'confirmed', cancelled_at = null`) fails. Why does (d) fail?
+- **3.4** 🔴 Turn the availability query into a function of your business-hours table from exercise 2.4: slots come from each staff member's hours for that weekday (use `extract(isodow from $2::date)`), slot length is the service's `duration_minutes`, and a lunch break isn't bookable. Test it on a date with a DST change in `America/New_York` (2027-03-14) and check that the slots stay at the right local times.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you prevent double bookings?"**
+
+> "I enforce it in the database, because a check in the application has a race condition: two requests can both check, both see the slot is free, and both insert. In PostgreSQL I use an exclusion constraint with a GiST index: no two active bookings can have the same staff member and overlapping time ranges. I use a half-open range so back-to-back bookings are allowed, and a WHERE clause so cancelled bookings don't count. If two requests race, the second insert waits for the first and then fails with error code 23P01, which I map to a 409 'slot taken' response. I still check in the service first, so the normal case gets a fast, friendly error."
+
+**"How do you handle time zones?"**
+
+> "I store every moment as timestamptz, which is UTC internally, and run servers in UTC. The API accepts and returns ISO 8601 strings with an offset. Each business has an IANA time zone name like Asia/Dhaka, never a fixed offset, because offsets change with daylight saving. I convert to local time only at the edges: in the UI, in emails, and when I turn local business hours into real moments, which I do day by day so DST changes are handled correctly."

@@ -1,0 +1,354 @@
+---
+title: "Lesson 6: Transactions, isolation and locking"
+description: "ACID, MVCC, isolation levels and their anomalies, lost updates, write skew, SELECT FOR UPDATE, NOWAIT and SKIP LOCKED, optimistic locking, deadlocks, retries, upserts and the transactional outbox."
+---
+
+"Two requests change the same data at the same time. What happens?" This is one of the most important backend interview questions, and most candidates answer it badly. After this lesson you can answer it with examples from your own booking platform.
+
+Open **two `psql` windows** (call them A and B) for this lesson. Most examples only make sense when you run them side by side.
+
+## Transactions and ACID
+
+A transaction groups statements so they succeed or fail **together**.
+
+```sql
+begin;
+insert into bookings (...) values (...);
+update customers set credit_cents = credit_cents - 50000 where id = '...';
+commit;      -- or rollback; to undo everything
+```
+
+| Letter | Meaning | In plain English |
+| --- | --- | --- |
+| **A**tomicity | All or nothing | If the second statement fails, the first one is undone |
+| **C**onsistency | Constraints always hold | You can't commit data that breaks a constraint |
+| **I**solation | Concurrent transactions don't see each other's half-done work | How much they see depends on the **isolation level** |
+| **D**urability | Committed means saved | Even if the server crashes one millisecond later (thanks to the write-ahead log, WAL) |
+
+Without `begin`, every statement is its own transaction ("autocommit").
+
+## How Postgres does it: MVCC
+
+Postgres uses **MVCC (multi-version concurrency control)**. An `update` doesn't overwrite a row: it writes a **new version** and marks the old one as expired. Each transaction sees a **snapshot**: the versions that were committed when its snapshot was taken.
+
+```sql
+select xmin, xmax, ctid, id, name from customers limit 1;
+update customers set name = name where id = '<that id>';
+select xmin, xmax, ctid, id, name from customers where id = '<that id>';
+-- new ctid (physical location) and new xmin (the transaction that created this version)
+```
+
+Consequences:
+
+- **Readers never block writers, and writers never block readers.** A long report doesn't stop bookings.
+- **Writers block writers** on the **same row**: the second `update` waits until the first transaction ends.
+- Old versions ("dead tuples") stay until **VACUUM** removes them (Lesson 9). Long-running transactions stop VACUUM from cleaning up, which is one reason to keep them short.
+
+## Isolation levels
+
+| Level | Sees | Problems still possible |
+| --- | --- | --- |
+| Read uncommitted | (same as read committed in Postgres) | |
+| **Read committed** (default) | A new snapshot for **each statement** | Non-repeatable reads, phantoms, lost updates (with read-then-write code), write skew |
+| **Repeatable read** | One snapshot for the **whole transaction** | Write skew |
+| **Serializable** | As if transactions ran one after another | None, but some transactions fail with error `40001` and must be **retried** |
+
+The problems, with booking examples:
+
+- **Non-repeatable read:** you read a booking twice in one transaction and get different statuses, because someone cancelled it between your two reads.
+- **Phantom:** you count today's bookings twice and get different numbers, because someone added one.
+- **Lost update:** two transactions read the same value, both calculate a new value, and the second write silently overwrites the first.
+- **Write skew:** two transactions read the same data, each makes a decision based on it, and each writes a **different** row. Together they break a rule that each one checked. The double booking race in Lesson 3 is write skew.
+
+```sql
+begin isolation level repeatable read;
+-- ...
+commit;
+```
+
+## Lost updates
+
+Add prepaid credit to customers (a gift card balance):
+
+```sql
+alter table customers add column credit_cents integer not null default 0
+  check (credit_cents >= 0);
+update customers set credit_cents = 100000 where email = 'customer1@business-1.test';
+```
+
+A customer pays 50,000 from their credit, written as "read, then write" in the app:
+
+```typescript
+const { credit_cents } = await getCustomer(id);              // reads 100000
+if (credit_cents < price) throw new InsufficientCreditError();
+await setCredit(id, credit_cents - price);                   // writes 50000
+```
+
+Two payments at the same time, A and B: both read 100,000, both write 50,000. The customer paid twice and lost only 50,000. Read committed doesn't prevent this, because each statement is fine on its own.
+
+### Fix 1: do it in one atomic statement (best)
+
+```sql
+update customers
+set credit_cents = credit_cents - $2
+where id = $1 and credit_cents >= $2
+returning credit_cents;
+-- 0 rows → not enough credit
+```
+
+Run it in A and B at the same time: B **waits** for A's row lock, then re-checks the `where` against the **new** version of the row. One update wins, the other sees the new balance. The `check (credit_cents >= 0)` is the last line of defence.
+
+### Fix 2: lock the row first (when the logic is too complex for one statement)
+
+```sql
+begin;
+select credit_cents from customers where id = $1 for update;   -- B waits here until A commits
+-- application logic: check rules, calculate discounts...
+update customers set credit_cents = $2 where id = $1;
+commit;
+```
+
+### Fix 3: repeatable read
+
+Under `repeatable read`, B's update of a row that A changed after B's snapshot fails with `40001: could not serialize access due to concurrent update`. You must retry B (see "Retrying" below).
+
+## Write skew: when there's no row to lock
+
+Lesson 3's double booking: both transactions check "is there an overlapping booking?" and both insert. `for update` can't help, because **the row you're worried about doesn't exist yet**. Repeatable read doesn't help either: each transaction writes a different, new row.
+
+Your options, best first:
+
+| Fix | How | Trade-off |
+| --- | --- | --- |
+| **Constraint** | Exclusion or unique constraint (Lesson 3) | The best when the rule fits a constraint |
+| **Lock a parent row** | `select 1 from staff where id = $1 for update;` before checking | Serialises all bookings for that staff member. Simple and clear |
+| **Advisory lock** | `select pg_advisory_xact_lock(hashtextextended($1::text, 0));` | A lock on any number you choose, released at commit. Good when there's no natural row to lock |
+| **Serializable** | `begin isolation level serializable;` | No code changes to the logic, but you must retry `40001` errors, and it adds overhead |
+
+Try serializable with the race from Lesson 3 (drop the exclusion constraint for a moment, or use a different table): one of the two commits fails with `40001` instead of creating a double booking.
+
+## Row lock types
+
+| Lock | Use when | Blocks |
+| --- | --- | --- |
+| `for update` | You'll update or delete the row | Other `for update`, `update`, `delete` of that row |
+| `for no key update` | You'll update non-key columns | Weaker: doesn't block inserts in child tables that reference this row |
+| `for share` | The row must not change until you commit | Writers |
+| `for key share` | (Used by foreign key checks) | Only deletes and key changes |
+
+Options:
+
+- `for update nowait`: don't wait, fail immediately with `55P03`. Good for "someone else is editing this".
+- `for update skip locked`: skip rows other transactions have locked. Perfect for **job queues**.
+
+## A job queue with SKIP LOCKED
+
+Booking reminders need a queue. In Month 2 you'll use BullMQ (Redis), but Postgres can be a solid queue for moderate volume, with no extra infrastructure. Libraries like pg-boss and Graphile Worker work this way.
+
+```sql
+create table jobs (
+  id         bigint generated always as identity primary key,
+  queue      text not null,
+  payload    jsonb not null,
+  run_at     timestamptz not null default now(),
+  status     text not null default 'pending'
+             check (status in ('pending', 'running', 'done', 'failed')),
+  attempts   integer not null default 0,
+  locked_at  timestamptz,
+  last_error text
+);
+create index jobs_ready_idx on jobs (queue, run_at) where status = 'pending';
+
+-- a worker claims one job; many workers can run this at the same time
+update jobs
+set status = 'running', locked_at = now(), attempts = attempts + 1
+where id = (
+  select id from jobs
+  where queue = 'reminders' and status = 'pending' and run_at <= now()
+  order by run_at
+  for update skip locked
+  limit 1
+)
+returning *;
+```
+
+Each worker gets a **different** job, and nobody waits. After the work: `status = 'done'`, or on error back to `pending` with a later `run_at` (backoff) until `attempts` reaches a limit, then `failed` (a dead-letter state). A worker that crashes leaves its job `running`, so a cleanup job resets jobs with an old `locked_at`.
+
+## The transactional outbox
+
+When a booking is created, you want to save it **and** send a "booking.created" event (to a queue, a webhook, email). Two separate writes can't be atomic:
+
+- Save, then publish: if the process crashes between them, the event is lost.
+- Publish, then save: if the save fails, you sent an event for a booking that doesn't exist.
+
+The **outbox pattern** writes the event into a table **in the same transaction**:
+
+```sql
+create table outbox (
+  id           bigint generated always as identity primary key,
+  topic        text not null,
+  payload      jsonb not null,
+  created_at   timestamptz not null default now(),
+  published_at timestamptz
+);
+create index outbox_unpublished_idx on outbox (id) where published_at is null;
+
+begin;
+insert into bookings (...) values (...) returning id;
+insert into outbox (topic, payload)
+values ('booking.created', jsonb_build_object('bookingId', '<id>', 'businessId', '<business>'));
+commit;   -- both or neither
+```
+
+A relay worker reads unpublished rows (`for update skip locked`, in `id` order), publishes them, and sets `published_at`. If it crashes after publishing but before marking, the event is sent again, so delivery is **at least once** and consumers must be idempotent. Mini-build B (webhooks) uses exactly this.
+
+## Optimistic locking
+
+Locks are **pessimistic**: "assume a conflict, block others". For edits that happen through a UI ("reschedule this booking"), where the user may take a minute, you can't hold a lock. Use **optimistic locking** with the `version` column:
+
+```sql
+-- the client loaded the booking with version 3
+update bookings
+set starts_at = $2, ends_at = $3, version = version + 1, updated_at = now()
+where id = $1 and business_id = $4 and version = $5     -- $5 = 3
+returning version;
+-- 0 rows: someone changed it since you loaded it → 409 Conflict (or 412 with If-Match)
+```
+
+This fits HTTP nicely: return the version as an `ETag`, require `If-Match` on `PATCH`, and answer `412 Precondition Failed` if it doesn't match.
+
+| | Pessimistic (`for update`) | Optimistic (`version`) |
+| --- | --- | --- |
+| Conflicts are | Common | Rare |
+| Wait or fail | Waits | Fails, client retries or shows "someone else changed this" |
+| Holds locks | During the transaction | Never |
+| Good for | Money, stock, counters in one request | Edits in a UI, long "think time" |
+
+## Deadlocks
+
+```sql
+-- A                                         -- B
+begin;                                       begin;
+update customers set name = 'x' where id = '<c1>';
+                                             update customers set name = 'y' where id = '<c2>';
+update customers set name = 'x' where id = '<c2>';   -- waits for B
+                                             update customers set name = 'y' where id = '<c1>';   -- waits for A
+```
+
+Each waits for the other forever. Postgres detects it (after `deadlock_timeout`, 1 second) and kills one with `40P01: deadlock detected`. Prevent deadlocks by **locking rows in the same order** everywhere (`... where id = any($1) order by id for update`), keeping transactions short, and retrying.
+
+## Retrying, in TypeScript
+
+`40001` (serialization failure) and `40P01` (deadlock) mean "nothing is wrong with your request, try again". Retry the **whole transaction**, not just the last statement:
+
+```typescript
+import { DatabaseError, type Pool, type PoolClient } from 'pg';
+import { setTimeout as sleep } from 'node:timers/promises';
+
+type Isolation = 'read committed' | 'repeatable read' | 'serializable';
+const RETRYABLE = new Set(['40001', '40P01']);
+
+export async function withTransaction<T>(
+  pool: Pool,
+  fn: (client: PoolClient) => Promise<T>,
+  { isolation = 'read committed', retries = 3 }: { isolation?: Isolation; retries?: number } = {},
+): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    const client = await pool.connect();          // one connection for the whole transaction
+    try {
+      await client.query(`begin isolation level ${isolation}`);   // safe: a fixed union type
+      const result = await fn(client);
+      await client.query('commit');
+      return result;
+    } catch (err) {
+      await client.query('rollback').catch(() => undefined);
+      const retryable = err instanceof DatabaseError && RETRYABLE.has(err.code ?? '');
+      if (!retryable || attempt > retries) throw err;
+      await sleep(attempt * 25 + Math.random() * 25);              // small backoff with jitter
+    } finally {
+      client.release();
+    }
+  }
+}
+```
+
+Important: every query in the transaction must use the **same `client`**. `pool.query` inside `fn` would run on a different connection, outside the transaction. This is a very common bug.
+
+## Upserts with ON CONFLICT
+
+"Create the customer if new, otherwise update the name" in one atomic statement:
+
+```sql
+insert into customers (business_id, email, name)
+values ($1, $2, $3)
+on conflict (business_id, lower(email)) do update set name = excluded.name
+returning id;
+```
+
+`excluded` is the row you tried to insert. `on conflict do nothing` skips silently; add `returning` to know whether you inserted (no row comes back if nothing was inserted).
+
+This is how you store **idempotency keys** in Postgres (Node Lesson 7, NestJS practice project):
+
+```sql
+create table idempotency_keys (
+  scope           text not null,         -- business ID or 'public' + route
+  key             text not null,
+  request_hash    text not null,
+  status          text not null check (status in ('processing', 'completed')),
+  response_status integer,
+  response_body   jsonb,
+  created_at      timestamptz not null default now(),
+  primary key (scope, key)
+);
+
+insert into idempotency_keys (scope, key, request_hash, status)
+values ($1, $2, $3, 'processing')
+on conflict (scope, key) do nothing
+returning key;
+-- a row came back → you own this key, do the work
+-- no row → someone already used it: select it and compare hash / status
+```
+
+Two identical requests racing can't both "win": the primary key decides.
+
+## Rules for transactions in real apps
+
+- **Keep them short.** Locks are held until commit.
+- **Never call external services inside a transaction** (Stripe, email, HTTP). If Stripe takes 10 seconds, you hold locks and a connection for 10 seconds, and a rollback can't undo the charge. Pattern: save a `pending` booking → commit → call Stripe → update in a new transaction (or use the outbox).
+- **Set timeouts** so one stuck transaction can't freeze everything: `set local lock_timeout = '3s'; set local statement_timeout = '10s';` inside the transaction, and `idle_in_transaction_session_timeout` on the server.
+- Prefer, in order: a **constraint**, an **atomic statement**, a **row lock**, then **serializable with retries**.
+
+## Common mistakes
+
+- Read, calculate in JS, write back (lost update).
+- Queries inside a "transaction" that use `pool.query` instead of the transaction's client.
+- Calling Stripe or sending emails inside a transaction.
+- `for update` to "fix" a race where the conflicting row doesn't exist yet.
+- Using serializable without retry logic.
+- Locking rows in different orders in different code paths.
+- Thinking a higher isolation level is always "safer" without knowing what it costs.
+
+## Exercises
+
+- **6.1** 🟢 With two `psql` windows, reproduce a **non-repeatable read** under read committed (A reads a booking's status twice; B cancels it in between). Then repeat with `repeatable read` and describe the difference.
+- **6.2** 🟡 Write a TypeScript script that fires **20 concurrent** "pay 50,000 from credit" requests for a customer with 100,000 credit, using the read-then-write version. How many succeed, and what's the final balance? Then fix it with (a) the atomic update and (b) `for update` inside `withTransaction`. Each fix must end with exactly 2 successes and a balance of 0.
+- **6.3** 🟡 Create a deadlock on purpose with two `psql` windows and copy the error. Then write the safe version of "update two customers in one transaction" that can't deadlock.
+- **6.4** 🔴 Build the `jobs` queue: a script that inserts 1,000 reminder jobs, and a worker script you can start 3 times in parallel. Each worker claims jobs with `skip locked`, "processes" them (wait 10 ms, fail randomly 10% of the time with retry and backoff, give up after 3 attempts) and marks them done. Prove that no job was processed twice (log `job id + worker id` to the database) and that every job ends as `done` or `failed`.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you handle concurrent updates to the same data?"**
+
+> "It depends on the case. My first choice is to let the database enforce the rule: a unique or exclusion constraint, like the one that stops double bookings, or a single atomic statement such as UPDATE ... SET balance = balance minus the amount WHERE balance is at least the amount. If the logic is too complex for one statement, I lock the row with SELECT FOR UPDATE inside a short transaction. For edits through a UI, where a user may take a while, I use optimistic locking with a version column and return 409 if the version changed. And if I use repeatable read or serializable isolation, I retry the whole transaction on serialization failures. I also keep transactions short and never call external APIs like Stripe inside them."
+
+**"Explain the isolation levels in PostgreSQL."**
+
+> "Postgres uses MVCC, so each transaction reads from a snapshot and readers don't block writers. The default is read committed: each statement sees data committed before it started, so two reads in the same transaction can give different results. Repeatable read uses one snapshot for the whole transaction, so reads are stable, and a concurrent update to the same row causes a serialization error. But it still allows write skew, where two transactions each check a rule and write different rows. Serializable prevents all of these by detecting dangerous patterns and failing one transaction, so the application must retry. I use read committed by default, with constraints and explicit locks where needed, and serializable for complex rules that don't fit a constraint."
+
+**"How would you publish an event reliably when a record is created?"**
+
+> "I'd use the transactional outbox pattern. In the same transaction that creates the booking, I insert the event into an outbox table, so both are saved or neither is. A separate worker reads unpublished outbox rows with FOR UPDATE SKIP LOCKED, publishes them to the queue, and marks them as published. Delivery is at least once, so consumers must be idempotent, for example by storing the event ID they've already processed."

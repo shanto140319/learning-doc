@@ -1,0 +1,289 @@
+---
+title: "Lesson 9: Migrations, pooling and operations"
+description: "Migration workflow, seeding, zero-downtime migrations (locks, lock_timeout, CONCURRENTLY, NOT VALID, expand and contract, batched backfills), connection pooling and PgBouncer, timeouts, VACUUM, backups, monitoring and database roles."
+---
+
+Writing a migration is easy. Running it on a busy production database **without taking the app down** is a senior skill. This lesson covers what happens after `git push`: migrations in production, connection limits, and the basic operations every backend engineer on a small team is expected to handle.
+
+## Migration workflow rules
+
+1. **Every schema change is a migration file**, committed to Git and reviewed like code.
+2. **Never edit a migration that has run anywhere else** (staging, production, a teammate's laptop). Write a new one.
+3. **Local:** `prisma migrate dev`. **CI and production:** `prisma migrate deploy` only.
+4. **Run migrations as a separate deploy step**, before the new app version starts. Not inside every app instance's startup (Prisma takes an advisory lock so two runs can't clash, but a slow migration then delays every instance).
+5. **No "down" migrations in practice.** Prisma doesn't generate them. If something goes wrong, **roll forward** with a new migration. That's why the next rule matters.
+6. **Every migration must work with both the old and the new app version**, because during a rolling deploy both run at the same time.
+
+## Seeding
+
+There are three kinds of seed data. Keep them separate:
+
+| Kind | Example | Where it runs |
+| --- | --- | --- |
+| **Reference data** the app needs | Plans (`free`, `pro`), countries | A **migration** (`insert ... on conflict do nothing`), so every environment has it |
+| **Development data** | Demo businesses, 50 bookings | `prisma db seed`, local only |
+| **Test fixtures** | The exact rows one test needs | Created inside the test (Month 2) |
+
+Seeds must be **idempotent**: running them twice gives the same result. Use `upsert` or `on conflict`.
+
+## Zero-downtime migrations
+
+### Why a "quick" migration can take the app down
+
+Most `alter table` statements take an **`ACCESS EXCLUSIVE` lock**: nobody can read or write the table until it finishes. Even a change that takes 1 ms can cause an outage:
+
+```text
+10:00:00  A long report query is reading bookings          (holds a read lock)
+10:00:01  Migration: alter table bookings add column ...   (waits for the report)
+10:00:01  Every new select/insert on bookings              (waits behind the migration!)
+...       The API's connection pool fills up, requests time out → outage
+```
+
+Locks wait in a **queue**. The migration can't start until the report ends, and everyone else queues behind the migration.
+
+**Fix: always set a `lock_timeout` in migrations.** If the lock isn't free quickly, the migration fails (and you retry later) instead of blocking everyone:
+
+```sql
+set lock_timeout = '5s';
+alter table bookings add column source text;
+```
+
+### Safe and unsafe changes
+
+| Change | Problem | Safe way |
+| --- | --- | --- |
+| Add a nullable column | None | Just do it (with `lock_timeout`) |
+| Add a column with a constant default | None since PostgreSQL 11 | Just do it. A **volatile** default (`gen_random_uuid()`, `clock_timestamp()`) rewrites the whole table |
+| Create an index | Blocks writes while it builds | `create index concurrently` |
+| Add a foreign key or check constraint | Scans the whole table under lock | Add it `not valid`, then `validate constraint` in a separate step |
+| Make a column `not null` | Scans the table under lock | Add `check (col is not null) not valid`, validate it, then `set not null` (Postgres uses the valid check and skips the scan), then drop the check |
+| Change a column's type | Usually rewrites the table | Expand and contract (below) |
+| Rename a column or table | Instant, but the **old app version** breaks | Expand and contract |
+| Drop a column | Instant, but the old app version may still select it | First deploy code that doesn't use it, then drop it |
+
+```sql
+-- index on a big, busy table
+create index concurrently bookings_upcoming_confirmed_idx
+  on bookings (starts_at) where status = 'confirmed';
+-- can't run inside a transaction; put it alone in its own migration file.
+-- if it fails, it leaves an INVALID index: drop it and try again.
+
+-- foreign key without a long lock
+alter table bookings add constraint bookings_staff_fk
+  foreign key (business_id, staff_id) references staff (business_id, id) not valid;   -- instant
+alter table bookings validate constraint bookings_staff_fk;                            -- scans, but allows reads and writes
+```
+
+If your migration tool wraps each file in a transaction, `concurrently` fails with "cannot run inside a transaction block". Then run that statement as a separate deploy step.
+
+### Expand and contract
+
+To rename `bookings.notes` to `customer_notes` with no downtime, never do a rename in one step. Do it in phases, each its own deploy:
+
+1. **Expand:** add `customer_notes` (nullable). The app **writes both** columns, reads `notes`.
+2. **Backfill:** copy old data in batches (below).
+3. **Switch reads:** the app reads `customer_notes`, still writes both.
+4. **Stop writing the old column:** the app only uses `customer_notes`.
+5. **Contract:** drop `notes`.
+
+It feels slow, but each step is safe, and you can stop or go back at any point. The same pattern changes column types, splits tables and moves data.
+
+### Backfilling in batches
+
+`update bookings set customer_notes = notes;` on 1 million rows is one huge transaction: it locks every row, creates a million dead row versions at once, and can't be stopped halfway. Do it in small batches instead:
+
+```sql
+-- repeat until it updates 0 rows (a small script or a job does this)
+update bookings
+set customer_notes = notes
+where id in (
+  select id from bookings
+  where customer_notes is null and notes is not null
+  limit 5000
+);
+```
+
+Each batch is a short transaction. Pause between batches if the database is busy.
+
+## Connection pooling
+
+Every Postgres connection is a **separate server process** that uses memory. Postgres handles a few hundred connections well, not thousands. The default `max_connections` is 100.
+
+A **pool** keeps a few connections open and lends them to requests. You already use one: `pg.Pool`, and Prisma 7's `PrismaPg` adapter uses `pg.Pool` underneath (`max: 10` in Lesson 8).
+
+### How big should the pool be?
+
+Smaller than you think. A database with 4 CPU cores can only run a handful of queries truly at the same time; more connections just wait for each other. A common starting point is **about 2 × CPU cores** for the whole database, then measure.
+
+The total is what matters:
+
+```text
+API:      3 instances × pool 10  = 30
+Workers:  2 instances × pool 5   = 10
+Migrations, admin, monitoring    ≈  5
+                                  ----
+                                   45   ≤  max_connections (100), with room to scale up
+```
+
+When you add instances (autoscaling, serverless functions), the total grows. This is how teams run out of connections.
+
+### Pool exhaustion
+
+Symptoms: requests get slow, then fail with "timeout acquiring connection", while the database itself isn't busy. Causes:
+
+- Long transactions (an HTTP call inside a transaction, Lesson 6).
+- A client from `pool.connect()` that's never `release()`d (always use `finally`).
+- N+1 queries under load.
+
+Make it fail fast instead of hanging: `new Pool({ max: 10, connectionTimeoutMillis: 3000, idleTimeoutMillis: 30000 })`.
+
+### PgBouncer and serverless
+
+When many app instances (or serverless functions) need connections, put an external pooler in front of Postgres: **PgBouncer**, **AWS RDS Proxy**, or the "pooled" connection string that Neon and Supabase give you.
+
+PgBouncer in **transaction mode** gives a client a server connection only for the duration of a transaction. That's very efficient, but session features break:
+
+| Doesn't work in transaction mode | Use instead |
+| --- | --- |
+| `set ...` for the session | `set local ...` or `set_config(..., true)` inside a transaction (Lesson 10 needs this) |
+| Session advisory locks (`pg_advisory_lock`) | `pg_advisory_xact_lock` |
+| `listen` / `notify` | A direct connection |
+| Prepared statements (older PgBouncer) | PgBouncer 1.21+ with `max_prepared_statements` set |
+
+Run migrations through the **direct** (non-pooled) connection string.
+
+## Timeouts
+
+Protect the database from runaway queries and forgotten transactions. Set them on the app's role so they apply to every connection:
+
+```sql
+alter role booking_app set statement_timeout = '15s';
+alter role booking_app set idle_in_transaction_session_timeout = '30s';
+alter role booking_app set lock_timeout = '5s';
+```
+
+A report or migration that needs longer can raise it for itself with `set local statement_timeout = '5min'`.
+
+## VACUUM and autovacuum
+
+Remember MVCC (Lesson 6): updates and deletes leave **dead row versions**. **VACUUM** marks their space as reusable and updates the visibility map (which makes index-only scans work). **Autovacuum** runs it automatically, and also runs `analyze`.
+
+Things to know:
+
+- **Bloat:** if dead rows build up faster than autovacuum cleans them, tables and indexes grow and queries slow down. Busy queue tables (`jobs`, `outbox`) are the usual victims. Tune them: `alter table jobs set (autovacuum_vacuum_scale_factor = 0.01);`.
+- **Long-running transactions block cleanup** for the whole database, because their snapshot may still need the old versions. Another reason for `idle_in_transaction_session_timeout`.
+- `vacuum full` rewrites the table under an exclusive lock. Don't run it on a live production table (use `pg_repack` if you must).
+- Postgres must also vacuum to prevent "transaction ID wraparound". Autovacuum handles it; just never turn autovacuum off.
+
+```sql
+select relname, n_live_tup, n_dead_tup, last_autovacuum, last_autoanalyze
+from pg_stat_user_tables
+order by n_dead_tup desc;
+```
+
+## Backups
+
+| Kind | How | Good for |
+| --- | --- | --- |
+| Logical | `pg_dump` / `pg_restore` | Small databases, copying data between environments or providers |
+| Physical + WAL (**point-in-time recovery**) | Managed providers do it automatically | Restoring to "10:42, just before the bad deploy" |
+
+Two terms interviewers use: **RPO** (how much data you can afford to lose: "5 minutes") and **RTO** (how long recovery may take: "1 hour").
+
+**A backup you've never restored isn't a backup.** Practise a restore into a new database at least once.
+
+```powershell
+docker exec booking-pg pg_dump -U postgres -Fc booking_api > booking_api.dump
+docker exec -i booking-pg pg_restore -U postgres -d booking_restore --clean --if-exists < booking_api.dump
+```
+
+## Monitoring: what's happening right now?
+
+```sql
+-- running and stuck queries
+select pid, now() - query_start as running_for, state, wait_event_type, left(query, 80) as query
+from pg_stat_activity
+where state <> 'idle' and pid <> pg_backend_pid()
+order by running_for desc;
+
+-- who is blocking whom
+select pid, pg_blocking_pids(pid) as blocked_by, left(query, 80) as query
+from pg_stat_activity
+where cardinality(pg_blocking_pids(pid)) > 0;
+
+select pg_cancel_backend(12345);      -- cancel the query, keep the connection
+select pg_terminate_backend(12345);   -- close the connection
+```
+
+Watch `idle in transaction` sessions: an app holding a transaction open while doing something else.
+
+Metrics to have on a dashboard (Month 3): CPU, memory, free disk, connections in use, slowest queries (`pg_stat_statements`), dead rows, replication lag (if you have replicas), and cache hit ratio (should be above about 99% for a web app).
+
+## Database roles: least privilege
+
+The app should **not** connect as `postgres` (a superuser can do anything, including bypassing row-level security in Lesson 10).
+
+```sql
+create role booking_migrator login password 'change-me';   -- owns the schema, runs migrations
+create role booking_app      login password 'change-me';   -- the API: data only, no DDL
+
+create database booking_prod owner booking_migrator;
+\c booking_prod
+
+grant connect on database booking_prod to booking_app;
+grant usage on schema public to booking_app;
+-- tables the migrator creates from now on are usable by the app
+alter default privileges for role booking_migrator in schema public
+  grant select, insert, update, delete on tables to booking_app;
+alter default privileges for role booking_migrator in schema public
+  grant usage, select on sequences to booking_app;
+```
+
+The app can read and write data but can't `drop table`. A read-only role for analytics or an AI agent's SQL tool (Phase 2) gets only `select`.
+
+## Managed Postgres
+
+You won't run Postgres on your own servers. Common choices:
+
+| Provider | Notes |
+| --- | --- |
+| **AWS RDS / Aurora** | The default in companies on AWS (Month 3) |
+| **Neon** | Serverless, scales to zero, database **branches** per pull request |
+| **Supabase** | Postgres plus auth, storage and an API; row-level security is central |
+| Google Cloud SQL, Azure | Same idea on other clouds |
+| Railway, Render | Simple, good for side projects |
+
+A new major version comes out every year (around September). Managed providers make upgrades easier, but you still test them on staging first.
+
+## Common mistakes
+
+- Migrations without `lock_timeout`.
+- `create index` (not `concurrently`) on a big production table.
+- Renaming a column in one deploy.
+- One giant `update` to backfill data.
+- Editing an applied migration.
+- A pool of 50 per instance "to be safe".
+- Calling `pool.connect()` without `release()` in `finally`.
+- The app connecting as `postgres`.
+- Never testing a restore.
+
+## Exercises
+
+- **9.1** 🟢 Create `booking_migrator` and `booking_app` roles for your `booking_api` database. Run Prisma migrations as the migrator and the NestJS app as `booking_app`. Prove the app role can insert a booking but can't `drop table bookings`.
+- **9.2** 🟡 Reproduce the **lock queue** on the 1M-row `bookings` table with three `psql` windows: A starts a transaction and selects from `bookings` (keep it open); B runs `alter table bookings add column x text;`; C runs a simple `select ... limit 1`. What happens to C? Use the "who is blocking whom" query to see it. Then repeat with `set lock_timeout = '2s'` in B.
+- **9.3** 🟡 Rename `bookings.notes` to `customer_notes` with **expand and contract**: write each migration, the batched backfill, and note what the app code does at each step. Time the backfill on 1M rows with batches of 5,000 vs one big `update`.
+- **9.4** 🔴 Pool exhaustion: in the NestJS app, make a test endpoint that holds a transaction for 1 second (`select pg_sleep(1)` inside `$transaction`). Set the adapter's `max: 5` and send 50 concurrent requests (`npx autocannon -c 50 -a 50 http://localhost:3000/...`). Measure response times. Then calculate a pool size for: 3 API instances, 2 workers, `max_connections` 100, and explain your numbers.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you run database migrations without downtime?"**
+
+> "First, every migration must work with both the old and the new version of the app, because during a rolling deploy both run at the same time. I set a lock timeout so a migration fails fast instead of queueing behind a long query and blocking all traffic. I create indexes concurrently, add foreign keys and check constraints as NOT VALID and validate them separately, and avoid anything that rewrites a big table. For renames or type changes, I use expand and contract: add the new column, write to both, backfill in small batches, switch reads, stop writing the old one, and finally drop it, each as a separate deploy. Migrations run as their own step in the pipeline, and we roll forward rather than back."
+
+**"What is connection pooling and how do you size a pool?"**
+
+> "Each Postgres connection is a separate process, so opening one per request is slow and the server can only handle a limited number. A pool keeps a small set of connections open and lends them to requests. Bigger isn't better: the database can only run a few queries at once per CPU core, so too many connections just compete. I start small, around ten per app instance, and make sure the total across all instances, workers and admin tools stays below max_connections. With many instances or serverless functions, I add an external pooler like PgBouncer or RDS Proxy in transaction mode, and I keep transactions short so connections are returned quickly."
