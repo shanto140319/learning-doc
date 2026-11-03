@@ -1,0 +1,355 @@
+---
+title: "Lesson 2: Sessions, JWT and cookies"
+description: "Authentication vs authorisation, server sessions vs JWTs, how a JWT is built and the mistakes that break it, signing and verifying with @nestjs/jwt, where to keep tokens in the browser, cookie attributes, same-site vs cross-site, and the Next.js + NestJS setup for Project 1."
+---
+
+After Lesson 1, you can check a password. But HTTP has no memory: the next request doesn't know that the user logged in a second ago. This lesson is about **proving "I'm still the same logged-in user" on every request**, and about where that proof lives in the browser. The second part is one of the most common full-stack interview questions.
+
+## Two words: authentication and authorisation
+
+| | Authentication (AuthN) | Authorisation (AuthZ) |
+| --- | --- | --- |
+| Question | **Who** are you? | What are you **allowed** to do? |
+| Example | Email + password, Google login | "Staff can't delete services" |
+| Failure status | **401 Unauthorized** (the name is old and confusing; it means "not authenticated") | **403 Forbidden** (we know who you are; the answer is no) |
+| This section | Lessons 1–5, 9 | Lesson 6 |
+
+## Two ways to remember a login
+
+### Server sessions
+
+```text
+login OK → server creates a session row { id: 'random', userId, expiresAt }
+         → sends the session ID in a cookie
+next request → cookie: sid=random → server looks it up → knows the user
+logout   → server deletes the row → the cookie is now useless
+```
+
+### JWT (JSON Web Token)
+
+```text
+login OK → server signs a token { sub: userId, exp: in 15 minutes } with a secret
+         → sends the token
+next request → token → server checks the signature and expiry → knows the user, no database lookup
+logout   → ? the token stays valid until it expires
+```
+
+A JWT has three parts separated by dots: `header.payload.signature`. Paste one into [jwt.io](https://jwt.io) and you'll see:
+
+```json
+{ "alg": "HS256", "typ": "JWT" }
+{ "sub": "0193f…", "sid": "0193f…", "iat": 1793782800, "exp": 1793783700, "iss": "booking-api", "aud": "booking-web" }
+```
+
+<Callout type="warn" title="Signed is not encrypted">
+Anyone can read a JWT's payload: it's only base64url, not secret. The signature only proves **the server created it and nobody changed it**. Never put passwords, emails, phone numbers or anything private in a JWT.
+</Callout>
+
+### Which one?
+
+| | Server session | JWT |
+| --- | --- | --- |
+| Check per request | Database or Redis lookup | Signature check only (fast, no I/O) |
+| Log out / ban a user right now | Easy: delete the row | Hard: the token works until `exp` |
+| Data changes (role removed) | Seen on the next request | Old data inside the token until it expires |
+| Many services verify the user | Each needs the session store | Each only needs the public key |
+| Size | Small ID | Hundreds of bytes on every request |
+
+The honest answer: for **one backend and one web app**, sessions are simpler and safer. JWTs shine when many services or mobile apps verify users without a shared session store.
+
+Most job codebases use a **combination**, and so will you:
+
+- A short-lived **access token** (JWT, 15 minutes) proves who you are on each request, without a database lookup.
+- A **session row** in Postgres is the source of truth: it can be revoked and listed ("your devices").
+- A long-lived **refresh token** (Lesson 3), tied to the session, gets a new access token every 15 minutes. If the session was revoked, the refresh fails and the user is logged out within 15 minutes at most.
+
+## JWT rules that prevent real attacks
+
+| Rule | The attack it stops |
+| --- | --- |
+| **Pin the algorithm** when verifying (`algorithms: ['HS256']`) | `alg: none` (no signature) and "algorithm confusion" (a token signed with the public key as an HMAC secret) |
+| A secret of **at least 32 random bytes** | Weak secrets like `secret123` can be cracked offline from one token |
+| Always check `exp`, `iss` and `aud` | Tokens from another environment or another app (for example a 2FA token, Lesson 9) being accepted as access tokens |
+| Small payload: `sub` (user ID) and `sid` (session ID) only | Stale roles inside tokens; private data readable by anyone |
+| Short expiry for access tokens (5–15 minutes) | A stolen token is useful for minutes, not weeks |
+| Never accept tokens from the URL (`?token=...`) | URLs end up in logs, browser history and `Referer` headers |
+
+**HS256 vs RS256/EdDSA:** HS256 uses one shared secret to sign **and** verify, which is fine when one service does both. If other services must verify tokens, use an asymmetric algorithm (RS256 or EdDSA): the auth service keeps the private key, and others download the **public** key from a JWKS URL. Google's ID tokens (Lesson 5) work this way.
+
+## The session table
+
+```prisma
+model Session {
+  id              String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  userId          String    @map("user_id") @db.Uuid
+  userAgent       String?   @map("user_agent")
+  ip              String?
+  authenticatedAt DateTime  @default(now()) @map("authenticated_at") @db.Timestamptz(3)  // last password/2FA check (Lesson 9)
+  lastUsedAt      DateTime  @default(now()) @map("last_used_at") @db.Timestamptz(3)
+  expiresAt       DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt       DateTime? @map("revoked_at") @db.Timestamptz(3)
+  revokedReason   String?   @map("revoked_reason")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+```
+
+Add `sessions Session[]` to `User`.
+
+## Signing and verifying in NestJS
+
+```typescript
+// src/auth/auth.module.ts (imports)
+JwtModule.registerAsync({
+  inject: [ConfigService],
+  useFactory: (config: ConfigService<Env, true>) => ({
+    secret: config.get('JWT_SECRET', { infer: true }),
+    signOptions: { algorithm: 'HS256', expiresIn: '15m', issuer: 'booking-api', audience: 'booking-web' },
+    verifyOptions: { algorithms: ['HS256'], issuer: 'booking-api', audience: 'booking-web' },
+  }),
+}),
+```
+
+```typescript
+// src/auth/token.service.ts
+export type AccessTokenPayload = { sub: string; sid: string };
+
+@Injectable()
+export class TokenService {
+  constructor(private readonly jwt: JwtService) {}
+
+  signAccessToken(userId: string, sessionId: string): Promise<string> {
+    return this.jwt.signAsync({ sub: userId, sid: sessionId } satisfies AccessTokenPayload);
+  }
+
+  verifyAccessToken(token: string): Promise<AccessTokenPayload> {
+    return this.jwt.verifyAsync<AccessTokenPayload>(token);   // checks signature, alg, exp, iss, aud; throws if anything is wrong
+  }
+}
+```
+
+```typescript
+// src/auth/sessions.service.ts
+const SESSION_TTL_MS = 30 * 24 * 60 * 60_000;     // 30 days (Lesson 3 makes it sliding)
+
+export type ClientMeta = { ip?: string; userAgent?: string };
+
+@Injectable()
+export class SessionsService {
+  constructor(private readonly prisma: PrismaService, private readonly tokens: TokenService) {}
+
+  async start(userId: string, meta: ClientMeta): Promise<{ sessionId: string; accessToken: string }> {
+    const session = await this.prisma.session.create({
+      data: {
+        userId,
+        ip: meta.ip,
+        userAgent: meta.userAgent?.slice(0, 300),        // don't store unlimited user input
+        expiresAt: new Date(Date.now() + SESSION_TTL_MS),
+      },
+    });
+    const accessToken = await this.tokens.signAccessToken(userId, session.id);
+    return { sessionId: session.id, accessToken };
+  }
+}
+```
+
+Every login creates a **new** session. Never reuse a session ID from before login: that's an attack called **session fixation** (the attacker plants a known session ID in the victim's browser, then waits for them to log in).
+
+## Where do tokens live in the browser?
+
+| Where | Can JavaScript read it? | Sent automatically? | Main risk |
+| --- | --- | --- | --- |
+| `localStorage` | Yes | No (you add the header) | **XSS steals the token** and uses it from the attacker's machine for its whole lifetime |
+| JS memory (a variable) | Yes, but lost on reload | No | XSS can still use it while the page is open; you need a refresh token stored somewhere else |
+| **`httpOnly` cookie** | **No** | Yes, by the browser | **CSRF** (another site makes the browser send it), which `SameSite` and an Origin check stop (Lesson 7) |
+
+An XSS bug is bad in every option: the attacker's script can send requests **as the user** while the page is open. The difference is that with `localStorage`, the attacker can also **copy** the token and keep using it later, from anywhere. With an `httpOnly` cookie, they can't take it away.
+
+**For a web app, use `httpOnly` cookies.** For a mobile app, keep tokens in the platform's secure storage (Keychain, Keystore) and send `Authorization: Bearer ...`.
+
+### Cookie attributes
+
+```http
+Set-Cookie: access_token=eyJ...; Path=/; Max-Age=900; HttpOnly; Secure; SameSite=Lax
+```
+
+| Attribute | Meaning | Your setting |
+| --- | --- | --- |
+| `HttpOnly` | JavaScript can't read it (`document.cookie` doesn't show it) | Always for auth cookies |
+| `Secure` | Only sent over HTTPS (browsers make an exception for `http://localhost`) | Always |
+| `SameSite=Lax` | Not sent on cross-site requests, **except** top-level `GET` navigations (clicking a link) | Access token |
+| `SameSite=Strict` | Never sent on cross-site requests | Refresh token (Lesson 3) |
+| `SameSite=None` | Always sent (requires `Secure`) | Avoid for auth; it's how CSRF happens |
+| `Path` | Only sent to URLs under this path | `/` for access, `/v1/auth` for refresh |
+| `Domain` | Not set: only this exact host. Set to `example.com`: all subdomains too | Leave it out unless you must share with subdomains |
+| `Max-Age` | Lifetime in seconds; without it, the cookie dies when the browser closes | Match the token's lifetime |
+| `__Host-` name prefix | The browser enforces `Secure`, `Path=/` and no `Domain` | A good hardening step for the access cookie in production |
+
+### Same-origin vs same-site
+
+These two words decide whether your cookies work at all:
+
+- **Origin** = scheme + host + port. `https://app.example.com` and `https://api.example.com` are **different origins**.
+- **Site** = scheme + the registrable domain. Those two are the **same site** (`example.com`).
+- `https://myapp.vercel.app` and `https://myapi.onrender.com` are **different sites**. Browsers increasingly block cookies in that setup ("third-party cookies"), and `SameSite=Lax` cookies aren't sent with your `fetch` calls at all.
+
+Three ways to deploy Project 1:
+
+| Setup | Cookies | CORS needed? | Verdict |
+| --- | --- | --- | --- |
+| Frontend and API on unrelated domains | Blocked or need `SameSite=None` | Yes | Avoid |
+| `app.example.com` + `api.example.com` | Work (same site); the Next.js server can't see API cookies unless you set `Domain=example.com` | Yes, with `credentials: true` | OK |
+| **Next.js proxies `/v1/*` to the API** (one origin) | Work, and the Next.js server sees them | No | **Recommended for Project 1** |
+
+The proxy setup is one setting in Next.js:
+
+```typescript
+// next.config.ts (frontend)
+import type { NextConfig } from 'next';
+
+const nextConfig: NextConfig = {
+  async rewrites() {
+    return [{ source: '/v1/:path*', destination: `${process.env.API_INTERNAL_URL}/v1/:path*` }];
+  },
+};
+export default nextConfig;
+```
+
+The browser only talks to `app.example.com`. Next.js forwards `/v1/...` requests to the NestJS API. Cookie paths stay the same (`/v1/auth` in the browser is `/v1/auth` on the API), and there's no CORS to configure.
+
+## Login with cookies
+
+```typescript
+// src/auth/auth-cookies.ts
+import type { Response } from 'express';
+
+export const ACCESS_COOKIE = 'access_token';
+const ACCESS_MAX_AGE_MS = 15 * 60_000;
+
+export function setAccessCookie(res: Response, token: string): void {
+  res.cookie(ACCESS_COOKIE, token, { httpOnly: true, secure: true, sameSite: 'lax', path: '/', maxAge: ACCESS_MAX_AGE_MS });
+}
+
+export function clearAccessCookie(res: Response): void {
+  res.clearCookie(ACCESS_COOKIE, { httpOnly: true, secure: true, sameSite: 'lax', path: '/' });   // same path, or it isn't cleared
+}
+```
+
+```typescript
+// src/main.ts
+import cookieParser from 'cookie-parser';
+app.use(cookieParser(config.get('COOKIE_SECRET', { infer: true })));   // the secret is for signed cookies (Lesson 5)
+```
+
+```typescript
+// src/auth/auth.controller.ts
+@Controller('auth')
+export class AuthController {
+  constructor(private readonly accounts: AccountsService, private readonly sessions: SessionsService) {}
+
+  @Public()
+  @Post('login')
+  @HttpCode(200)
+  async login(@Body() dto: LoginDto, @Req() req: Request, @Res({ passthrough: true }) res: Response) {
+    const user = await this.accounts.verifyCredentials(dto.email, dto.password);
+    const { accessToken } = await this.sessions.start(user.id, { ip: req.ip, userAgent: req.get('user-agent') });
+    setAccessCookie(res, accessToken);
+    return { user: toUserResponse(user) };          // never return passwordHash (NestJS Lesson 8: response mapping)
+  }
+}
+```
+
+`@Res({ passthrough: true })` lets you set cookies while Nest still sends your return value as JSON. Without `passthrough`, you must send the response yourself.
+
+## The real `AuthGuard`
+
+Replace the fake guard from NestJS Lesson 4. The type changes too: after this guard, you know the user and the session, but **not** the business or role. Those come from a second guard in Lesson 6.
+
+```typescript
+// src/common/auth/auth.guard.ts
+export type SessionUser = { id: string; sessionId: string };
+
+@Injectable()
+export class AuthGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector, private readonly tokens: TokenService) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [context.getHandler(), context.getClass()]);
+    if (isPublic) return true;
+
+    const req = context.switchToHttp().getRequest<Request & { user?: SessionUser }>();
+    const token: unknown = req.cookies?.[ACCESS_COOKIE];
+    if (typeof token !== 'string') throw new UnauthorizedException('Not logged in');
+
+    try {
+      const payload = await this.tokens.verifyAccessToken(token);
+      req.user = { id: payload.sub, sessionId: payload.sid };
+      return true;
+    } catch {
+      throw new UnauthorizedException('Invalid or expired token');   // the client will try to refresh (Lesson 3)
+    }
+  }
+}
+```
+
+Add a `GET /v1/me` route that returns the current user and their memberships. The frontend calls it on page load to know who's logged in.
+
+### Calling the API from Next.js server components
+
+With the proxy setup, the browser sends cookies to Next.js. When a **server component** calls the API, it must forward them itself:
+
+```typescript
+// app/dashboard/page.tsx (frontend)
+import { cookies } from 'next/headers';
+import { redirect } from 'next/navigation';
+
+export default async function DashboardPage() {
+  const cookieHeader = (await cookies()).getAll().map((c) => `${c.name}=${c.value}`).join('; ');
+  const res = await fetch(`${process.env.API_INTERNAL_URL}/v1/me`, {
+    headers: { cookie: cookieHeader },
+    cache: 'no-store',                                 // per-user data: never cache it
+  });
+  if (res.status === 401) redirect('/login');
+  const me = await res.json();
+  // ...
+}
+```
+
+Server components can't **set** cookies, so they can't refresh an expired access token. A common approach: on 401, redirect to a small client page that refreshes (Lesson 3) and comes back.
+
+## Mistakes to avoid
+
+- Storing JWTs in `localStorage` "because the tutorial did".
+- Putting the user's role, email or plan inside the JWT.
+- Verifying without pinning the algorithm, or with a short, human-made secret.
+- Access tokens that live for days.
+- Thinking a JWT can be "logged out" by deleting it in the browser (the server still accepts it).
+- `clearCookie` with a different `path` than `cookie` (the cookie isn't removed).
+- `SameSite=None` to "fix" cookies between unrelated domains, instead of fixing the deployment.
+- Reusing a session ID across login (session fixation).
+- Caching per-user API responses in Next.js.
+
+## Exercises
+
+- **2.1** 🟢 Log in, copy the `access_token` cookie from DevTools (Application → Cookies) and decode it on jwt.io. Which fields can anyone read? Change one character in the payload and send it to `GET /v1/me` with curl. What happens, and which part of the token caught it?
+- **2.2** 🟡 Add the `Session` model, `TokenService`, `SessionsService.start` and the cookie login. Replace the fake `AuthGuard`. Check in DevTools that the cookie has `HttpOnly`, `Secure`, `SameSite=Lax` and `Max-Age=900`, and that `document.cookie` in the console doesn't show it.
+- **2.3** 🟡 **Attack it.** Write a Node script that creates a token signed with the wrong secret, one with `alg: none`, one with an `exp` in the past, and one with `aud: 'booking-mfa'`. Send each to `/v1/me`. All four must return 401. Which `verifyOptions` line stops each one?
+- **2.4** 🔴 Write a one-page design note (`docs/auth-design.md` in your repo) for Project 1: sessions or JWT, where each token lives, cookie settings, and which deployment setup you'll use. Give a reason for each choice. Send it to Claude as an interviewer and ask for three follow-up questions.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"Sessions or JWT?"**
+
+> "With sessions, the server stores the login and the browser only holds a random ID, so logging out or banning a user takes effect immediately, but every request needs a lookup. A JWT is a signed token the server can verify without any lookup, which is great when many services need to check the user, but you can't easily revoke it before it expires. For a single web app, sessions are the simplest safe choice. In my booking platform, I combine them: a 15-minute JWT access token for fast checks, a session row in Postgres that can be revoked, and a refresh token tied to that session. So a revoked session stops working within 15 minutes, and the user can see and log out their devices."
+
+**"Where do you store the JWT on the frontend?"**
+
+> "In an httpOnly, Secure cookie with SameSite set to Lax or Strict, not in localStorage. If the site ever has an XSS bug, a script can read localStorage and send the token to the attacker, who can then use it from anywhere until it expires. JavaScript can't read an httpOnly cookie. Cookies bring CSRF risk instead, which SameSite and an Origin header check handle. I also keep the frontend and API on the same site; in Next.js I proxy the API through the app's own domain, so cookies just work and I don't need CORS."

@@ -1,0 +1,321 @@
+---
+title: "Lesson 3: Refresh tokens, rotation and logout"
+description: "Why access tokens need a refresh token, opaque refresh tokens stored as hashes, rotation with reuse detection, the two-tabs race and a grace period, sliding sessions, logout, logout everywhere, a device list, and a frontend fetch wrapper that refreshes once."
+---
+
+After Lesson 2, users are logged out every 15 minutes. That's safe but unusable. A **refresh token** keeps them logged in for weeks while access tokens stay short. Done badly, it's a weeks-long key for attackers. Done well, it can even **detect** that it was stolen.
+
+## The flow
+
+```text
+login
+  → access token (JWT, 15 min)       in cookie access_token,  Path=/
+  → refresh token (random, 30 days)  in cookie refresh_token, Path=/v1/auth, SameSite=Strict
+
+normal request → access token is valid → 200
+
+after 15 min   → access token expired → 401
+               → POST /v1/auth/refresh (browser sends the refresh cookie)
+               → server checks it, marks it used, issues a NEW access token AND a NEW refresh token
+               → retry the original request → 200
+```
+
+Why the refresh cookie has `Path=/v1/auth`: it's only sent to the auth endpoints, not with every API call. Fewer places it can leak (logs, proxies, a bug in another route).
+
+## The refresh token is not a JWT
+
+The refresh token is just **32 random bytes**. All its meaning lives in the database:
+
+- It must be revocable anyway, so you look it up every time. A signature adds nothing.
+- Random bytes can't be decoded, so they reveal nothing.
+
+Store only its **SHA-256 hash**, never the token itself. If the `refresh_tokens` table leaks, the attacker can't use the hashes.
+
+Why SHA-256 and not argon2 like passwords? A password is a guessable human choice, so its hash must be slow. 32 random bytes is 256 bits of randomness: nobody can guess it, fast hash or not. The same rule applies to every random token in this section (reset links, invites, API keys).
+
+```typescript
+// src/auth/crypto.ts
+import { createHash, randomBytes } from 'node:crypto';
+
+export const randomToken = (bytes = 32): string => randomBytes(bytes).toString('base64url');
+export const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
+```
+
+```prisma
+model RefreshToken {
+  id        String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  sessionId String    @map("session_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@map("refresh_tokens")
+}
+```
+
+Add `refreshTokens RefreshToken[]` to `Session`.
+
+## Rotation and reuse detection
+
+**Rotation:** every refresh gives the client a **new** refresh token and marks the old one as used. Each token works **once**.
+
+That makes theft visible. A session's refresh tokens form a chain. Suppose an attacker steals token T1 (from a malware-infected laptop, a log file, a backup):
+
+```text
+Case 1: the attacker uses T1 first   → gets T2'. Later the real user sends T1 → T1 is already used → REUSE
+Case 2: the user refreshes first     → gets T2.  Later the attacker sends T1 → T1 is already used → REUSE
+```
+
+Either way, someone presents a token that was already used. The server can't tell which side is the attacker, so it **revokes the whole session**. Both sides are logged out; the real user logs in again with their password, and the attacker can't.
+
+### The two-tabs problem
+
+There's a normal case that looks like reuse: the user has **two tabs** open, both get a 401 at the same moment, and both send the **same** refresh token. The first wins; the second looks like a thief, and the user is logged out for no reason.
+
+Two defences, use both:
+
+1. **On the server, a short grace period.** If the token was used less than about 10 seconds ago, don't revoke anything; just return 401. With cookies, the winning tab's response has already put the new tokens into the browser's cookie jar, so the losing tab retries and succeeds.
+2. **On the client, refresh only once at a time** (the fetch wrapper below).
+
+## The refresh service
+
+```typescript
+// src/auth/sessions.service.ts (additions)
+const REUSE_GRACE_MS = 10_000;
+
+export type IssuedTokens = { accessToken: string; refreshToken: string };
+
+type RefreshResult =
+  | { kind: 'ok'; tokens: IssuedTokens }
+  | { kind: 'invalid' }
+  | { kind: 'grace' }
+  | { kind: 'reuse'; userId: string; sessionId: string };
+
+// start() from Lesson 2 now also creates the first refresh token:
+async start(userId: string, meta: ClientMeta): Promise<IssuedTokens> {
+  return this.prisma.$transaction(async (tx) => {
+    const session = await tx.session.create({
+      data: { userId, ip: meta.ip, userAgent: meta.userAgent?.slice(0, 300), expiresAt: new Date(Date.now() + SESSION_TTL_MS) },
+    });
+    return this.issue(tx, userId, session.id);
+  });
+}
+
+private async issue(tx: Prisma.TransactionClient, userId: string, sessionId: string): Promise<IssuedTokens> {
+  const refreshToken = randomToken();
+  await tx.refreshToken.create({ data: { sessionId, tokenHash: sha256(refreshToken) } });
+  const accessToken = await this.tokens.signAccessToken(userId, sessionId);
+  return { accessToken, refreshToken };
+}
+
+async refresh(rawToken: string): Promise<IssuedTokens> {
+  const result = await this.prisma.$transaction(async (tx): Promise<RefreshResult> => {
+    const tokenHash = sha256(rawToken);
+
+    // 1. Claim the token. Only ONE request can turn used_at from null to now (PostgreSQL Lesson 6)
+    const claimed = await tx.refreshToken.updateMany({
+      where: { tokenHash, usedAt: null },
+      data: { usedAt: new Date() },
+    });
+
+    const token = await tx.refreshToken.findUnique({ where: { tokenHash }, include: { session: true } });
+    if (!token) return { kind: 'invalid' };
+
+    const { session } = token;
+    if (session.revokedAt || session.expiresAt <= new Date()) return { kind: 'invalid' };
+
+    // 2. Already used: a second tab (just now) or a stolen token (later)
+    if (claimed.count === 0) {
+      const usedAgoMs = Date.now() - (token.usedAt?.getTime() ?? 0);
+      if (usedAgoMs < REUSE_GRACE_MS) return { kind: 'grace' };
+
+      await tx.session.update({
+        where: { id: session.id },
+        data: { revokedAt: new Date(), revokedReason: 'refresh_token_reuse' },
+      });
+      return { kind: 'reuse', userId: session.userId, sessionId: session.id };   // commit the revoke!
+    }
+
+    // 3. Normal case: extend the session (sliding expiry) and issue new tokens
+    await tx.session.update({
+      where: { id: session.id },
+      data: { lastUsedAt: new Date(), expiresAt: new Date(Date.now() + SESSION_TTL_MS) },
+    });
+    return { kind: 'ok', tokens: await this.issue(tx, session.userId, session.id) };
+  });
+
+  switch (result.kind) {
+    case 'ok':
+      return result.tokens;
+    case 'reuse':
+      this.logger.warn({ userId: result.userId, sessionId: result.sessionId }, 'Refresh token reuse: session revoked');
+      // Lesson 9: write an audit event and email the user
+      throw new UnauthorizedException('Session ended');
+    default:
+      throw new UnauthorizedException('Session ended');
+  }
+}
+```
+
+The most important detail is **where the errors are thrown**. If you `throw` inside `$transaction`, Prisma **rolls back** everything, including the `revokedAt` update. Then reuse detection silently does nothing. So the transaction **returns** a result, it commits, and only then does the code throw. This is a very easy bug to write and a great thing to mention in a code review interview.
+
+Why the claim works under concurrency: two requests with the same token both run the `updateMany`. The second one waits for the first one's row lock. When the first commits, the second re-checks `used_at is null`, finds it's no longer null, and updates 0 rows.
+
+### Sliding vs absolute expiry
+
+The code above uses a **sliding** session: each refresh pushes `expiresAt` 30 days forward, so an active user stays logged in forever, and an inactive one is logged out after 30 days. Banks and admin tools also set an **absolute** limit (for example "log in again every 90 days, whatever happens") with a second column. Choose based on the product; for Project 1, sliding is fine.
+
+## The controller
+
+```typescript
+// src/auth/auth-cookies.ts (additions)
+export const REFRESH_COOKIE = 'refresh_token';
+const REFRESH_PATH = '/v1/auth';
+
+export function setAuthCookies(res: Response, tokens: IssuedTokens): void {
+  setAccessCookie(res, tokens.accessToken);
+  res.cookie(REFRESH_COOKIE, tokens.refreshToken, {
+    httpOnly: true, secure: true, sameSite: 'strict', path: REFRESH_PATH, maxAge: SESSION_TTL_MS,
+  });
+}
+
+export function clearAuthCookies(res: Response): void {
+  clearAccessCookie(res);
+  res.clearCookie(REFRESH_COOKIE, { httpOnly: true, secure: true, sameSite: 'strict', path: REFRESH_PATH });
+}
+```
+
+```typescript
+// src/auth/auth.controller.ts (additions)
+@Public()
+@Post('refresh')
+@HttpCode(204)
+async refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response): Promise<void> {
+  const raw: unknown = req.cookies?.[REFRESH_COOKIE];
+  if (typeof raw !== 'string') throw new UnauthorizedException('Not logged in');
+  try {
+    setAuthCookies(res, await this.sessions.refresh(raw));
+  } catch (err) {
+    clearAuthCookies(res);            // a dead refresh token is useless; remove it
+    throw err;
+  }
+}
+```
+
+One problem remains: with the grace period, the losing tab must **not** have its cookies cleared, or it deletes the new tokens the winning tab just received. Exercise 3.3 asks you to fix this.
+
+## Logout, logout everywhere, and a device list
+
+```typescript
+// in SessionsService
+async revoke(userId: string, sessionId: string, reason: string): Promise<void> {
+  // userId in the where: a user can only revoke their OWN sessions (Lesson 6: IDOR)
+  await this.prisma.session.updateMany({
+    where: { id: sessionId, userId, revokedAt: null },
+    data: { revokedAt: new Date(), revokedReason: reason },
+  });
+}
+
+async revokeAll(userId: string, reason: string, exceptSessionId?: string): Promise<void> {
+  await this.prisma.session.updateMany({
+    where: { userId, revokedAt: null, ...(exceptSessionId ? { id: { not: exceptSessionId } } : {}) },
+    data: { revokedAt: new Date(), revokedReason: reason },
+  });
+}
+```
+
+| Endpoint | What it does |
+| --- | --- |
+| `POST /v1/auth/logout` | Revoke the current session (`req.user.sessionId`), clear both cookies, 204 |
+| `POST /v1/auth/logout-all` | Revoke every session of the user, clear cookies, 204 |
+| `GET /v1/auth/sessions` | The user's active sessions: device (from user agent), IP, last used, and which one is "this device" |
+| `DELETE /v1/auth/sessions/:id` | Log out one other device |
+
+**When to call `revokeAll` automatically:** after a password change (keep the current session), after a password reset (revoke all), after refresh token reuse (just that session), and when an admin disables an account.
+
+### "But the access token still works after logout"
+
+True: a revoked session's access token stays valid for up to 15 minutes. Three options:
+
+| Option | Cost |
+| --- | --- |
+| Accept it (most apps do) | Up to 15 minutes of access after logout |
+| Shorter access tokens (5 minutes) | More refresh requests |
+| Check the session in `AuthGuard` on every request | A database or Redis lookup per request, which is basically server sessions again |
+
+A good middle ground: accept it for normal routes, and check the session **fresh from the database** only for sensitive actions (change password, delete the business, create an API key). Lesson 9 adds this as "step-up" authentication.
+
+## The frontend: refresh once, then retry
+
+```typescript
+// lib/api.ts (frontend, client side)
+let refreshing: Promise<boolean> | null = null;
+
+function refreshOnce(): Promise<boolean> {
+  // If a refresh is already running, wait for it instead of starting a second one
+  refreshing ??= fetch('/v1/auth/refresh', { method: 'POST', credentials: 'include' })
+    .then((res) => res.ok)
+    .catch(() => false)
+    .finally(() => { refreshing = null; });
+  return refreshing;
+}
+
+export async function api(path: string, init: RequestInit = {}): Promise<Response> {
+  const send = () => fetch(path, { ...init, credentials: 'include' });
+
+  const res = await send();
+  if (res.status !== 401 || path.startsWith('/v1/auth/')) return res;
+
+  if (await refreshOnce()) return send();       // retry exactly once
+  window.location.assign('/login');
+  return res;
+}
+```
+
+This stops two calls **in one tab** from refreshing twice. Across **tabs**, the [Web Locks API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) (`navigator.locks.request('auth-refresh', ...)`) can make tabs wait for each other. The server's grace period covers what's left.
+
+## Clean-up
+
+Used refresh tokens and old sessions pile up. A daily job (BullMQ in Month 2; a cron script for now):
+
+```sql
+delete from sessions where expires_at < now() - interval '7 days' or revoked_at < now() - interval '30 days';
+-- refresh_tokens rows go with them (on delete cascade)
+```
+
+Keep revoked sessions for a while: they're useful when investigating an incident.
+
+## Mistakes to avoid
+
+- Storing refresh tokens in plain text in the database.
+- Using a long-lived JWT as the refresh token, so it can't be revoked.
+- Rotation without reuse detection, or reuse detection without a grace period (users get logged out randomly).
+- Throwing inside the transaction after revoking, so the revoke is rolled back.
+- Checking "is it used?" with a `select` and then an `update` (two tabs both pass the check). Claim it in one statement.
+- Refresh cookie with `Path=/` and `SameSite=Lax`: sent everywhere, for no reason.
+- `logout` that only clears the cookie in the browser and leaves the session active.
+- A session list or `DELETE /sessions/:id` without `userId` in the query.
+
+## Exercises
+
+- **3.1** 🟢 Draw the token chain on paper for this story: login (T1), refresh (T2), refresh (T3), then an attacker uses a copy of T2. Which tokens exist in the table, which are used, and what happens to each side?
+- **3.2** 🟡 Implement `RefreshToken`, `start`, `refresh`, the cookies, `logout` and `logout-all`. Test by hand: set the access token lifetime to `30s`, wait, call `/v1/me`, see 401, call `/v1/auth/refresh`, call `/v1/me` again.
+- **3.3** 🟡 Fix the cookie problem: in the `grace` case, the controller must return 401 **without** clearing cookies. Change `refresh()` so the controller can tell the difference (a custom error class or a result type).
+- **3.4** 🔴 **Attack it.** Write a script that logs in, saves the refresh token, refreshes once (now it's used), waits 11 seconds and sends the **old** token. Show that (a) it gets 401, (b) the session has `revoked_reason = 'refresh_token_reuse'`, and (c) the **new** refresh token from the first refresh also stops working. Then send 5 refreshes with the same token in parallel (`Promise.all`) and show that exactly one gets 204 and the session is **not** revoked.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do refresh tokens work, and how do you keep them secure?"**
+
+> "The access token is a short-lived JWT, around 15 minutes, so a stolen one isn't useful for long. The refresh token is a long-lived random value, stored in an httpOnly, SameSite Strict cookie that's only sent to the auth endpoints, and in the database I store only its SHA-256 hash. When the access token expires, the client calls refresh, and the server rotates: it marks the old refresh token as used and issues a new pair. If a used token is ever presented again, that means it was copied, so I revoke the whole session, which logs out both the attacker and the user. I allow a few seconds of grace for two tabs refreshing at the same moment, and the frontend only runs one refresh at a time."
+
+**"How do you log a user out of all devices?"**
+
+> "Every login creates a session row in Postgres, and refresh tokens belong to a session. Logging out everywhere marks all of the user's sessions as revoked, so no refresh works anymore, and their access tokens expire within 15 minutes. I do this automatically after a password reset, and after a password change I keep only the current session. For sensitive actions, I check the session in the database directly, so a revoked session can't use them even inside those 15 minutes."

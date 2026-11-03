@@ -1,0 +1,202 @@
+---
+title: "Practice project: real auth for the booking API"
+description: "Replace the fake login in the booking API with real sign-up, email verification, password and Google login, rotating refresh tokens, invites, roles per business, CSRF and rate-limit protection, an audit log and optional 2FA, then attack it with a written checklist."
+---
+
+Replace the fake `token-owner` login in your booking API (the version on PostgreSQL + Prisma) with everything from this section. When you finish, real people can sign up, invite their team and stay logged in for weeks, and you have a written list of the attacks you tried and why they failed.
+
+This becomes the auth system of **Project 1**, so build it properly. It's also your best security interview story: "I built auth from scratch, including refresh token reuse detection, and here's how I tested it."
+
+Time: one Friday block (about 4 hours) plus three or four weekday sessions. It's the biggest practice project so far; it's fine to split it over two weeks.
+
+## Requirements
+
+### Endpoints
+
+| Endpoint | Who | Notes |
+| --- | --- | --- |
+| `POST /v1/auth/signup` | Public | Always 202; verify-email or already-registered email (Lesson 1, 4) |
+| `POST /v1/auth/verify-email` | Public | `{ token }`, 204 |
+| `POST /v1/auth/resend-verification` | Public | Always 202, 3 per hour |
+| `POST /v1/auth/login` | Public | Cookies, or `{ mfaRequired, mfaToken }` (Lesson 9) |
+| `POST /v1/auth/2fa/verify` | Public (with `mfaToken`) | Stretch |
+| `POST /v1/auth/refresh` | Refresh cookie | Rotation + reuse detection + grace period (Lesson 3) |
+| `POST /v1/auth/logout`, `POST /v1/auth/logout-all` | Logged in | 204, cookies cleared |
+| `GET /v1/auth/sessions`, `DELETE /v1/auth/sessions/:id` | Logged in | Own sessions only |
+| `POST /v1/auth/forgot-password`, `POST /v1/auth/reset-password` | Public | Lesson 4 |
+| `POST /v1/auth/change-password` | Logged in, step-up | Revokes other sessions |
+| `POST /v1/auth/reauthenticate` | Logged in | Sets `authenticatedAt` (Lesson 9) |
+| `GET /v1/auth/google`, `GET /v1/auth/google/callback` | Public | Lesson 5 |
+| `GET /v1/me` | Logged in, no business | User + memberships with business names and roles |
+| `POST /v1/businesses` | Logged in, no business | Create a business; the creator becomes its owner |
+| `POST /v1/invitations`, `GET /v1/invitations`, `DELETE /v1/invitations/:id` | owner, admin | Role rules from Lesson 4 |
+| `POST /v1/invitations/accept` | Logged in, no business | Email must match |
+| `GET /v1/members`, `PATCH /v1/members/:userId`, `DELETE /v1/members/:userId`, `DELETE /v1/members/me` | See the role matrix | Last-owner rule with a lock (Lesson 6) |
+| `GET /v1/audit-log` | owner | Keyset pagination |
+| `POST /v1/api-keys`, `GET /v1/api-keys`, `DELETE /v1/api-keys/:id` | owner, step-up for create | Stretch (Lesson 8) |
+| All existing booking and service routes | As before | Now with `X-Business-Id` and the role matrix |
+
+### Quality checklist
+
+- [ ] Prisma models: `User`, `Membership`, `Session`, `RefreshToken`, `OneTimeToken`, `Invitation`, `UserIdentity`, `AuditEvent` (+ `ApiKey`, `RecoveryCode` for stretch goals), with the check constraints and the partial unique index for pending invites
+- [ ] Passwords: argon2id with chosen settings (numbers and reason in the README), 12–128 characters, breached-password check, `needsRehash` on login
+- [ ] No user enumeration: identical responses (and similar timing) for login, sign-up, resend and forgot-password
+- [ ] Access token: HS256 JWT, 15 minutes, `sub` + `sid` only, algorithm, issuer and audience pinned
+- [ ] Cookies: `HttpOnly`, `Secure`, `SameSite=Lax` (access) / `Strict` + `Path=/v1/auth` (refresh)
+- [ ] Refresh tokens: random, SHA-256 hashed, rotated, reuse revokes the session (**committed**, not rolled back), 10-second grace, sliding 30-day session
+- [ ] All one-time tokens: 32 random bytes, hashed, purpose, expiry, consumed atomically, links built from `APP_URL` with the token in the fragment
+- [ ] Password reset and Google account claiming revoke sessions
+- [ ] Google login with `openid-client`: state, nonce, PKCE, `email_verified` required, linking rules for unverified accounts, safe `returnTo`
+- [ ] Guards in order: `OriginGuard`, `ThrottlerGuard`, `AuthGuard`, `MembershipGuard`, `RolesGuard` (+ `RecentAuthGuard` where used)
+- [ ] Every booking query uses `visibleBookings(actor)`; no `businessId`, `userId` or `role` taken from request bodies
+- [ ] Invitations: role rules, email match, atomic accept, rate-limited
+- [ ] Last-owner rule with `for update`
+- [ ] Rate limits: global, login (per IP and per email), sign-up, forgot-password, resend, invites
+- [ ] `trust proxy` set to the real number of proxies
+- [ ] Helmet on; CORS off (proxy setup) or an exact origin list
+- [ ] Pino redacts cookies, authorization, passwords and tokens
+- [ ] Audit events (in the same transaction) for every event in the Lesson 9 table you implemented
+- [ ] Emails in Mailpit: verify, already registered, reset, password changed, invite
+- [ ] `SECURITY.md` in the repo (see below)
+- [ ] Stretch: TOTP 2FA with recovery codes; API keys; a Next.js login page using the `/v1` proxy
+
+## Scaffold: the login service
+
+Fill in the `TODO`s. It connects Lessons 1, 2, 3 and 9:
+
+```typescript
+// src/auth/auth.service.ts
+export type LoginResult =
+  | { kind: 'session'; tokens: IssuedTokens; user: User }
+  | { kind: 'mfa'; mfaToken: string };
+
+@Injectable()
+export class AuthService {
+  constructor(
+    private readonly accounts: AccountsService,
+    private readonly sessions: SessionsService,
+    private readonly tokens: TokenService,
+    private readonly audit: AuditService,
+  ) {}
+
+  async login(email: string, password: string, meta: ClientMeta): Promise<LoginResult> {
+    let user: User;
+    try {
+      user = await this.accounts.verifyCredentials(email, password);
+    } catch (err) {
+      // TODO 1: record 'auth.login.failed' (no actor; hash the email, don't store it raw), then rethrow
+      throw err;
+    }
+
+    // TODO 2: if user.totpEnabledAt is set, return { kind: 'mfa', mfaToken }.
+    //         The mfaToken is a JWT with purpose 'mfa', audience 'booking-mfa', 5 minutes.
+    //         Which options must be DIFFERENT from the access token, and why?
+
+    const tokens = await this.sessions.start(user.id, meta);
+    // TODO 3: record 'auth.login.succeeded' with the actor and the new session ID
+    // TODO 4: if this IP + user agent hasn't been seen for this user in 90 days, send a "new login" email
+    //         (in the background; never make the login wait for the email)
+    return { kind: 'session', tokens, user };
+  }
+}
+```
+
+And the controller:
+
+```typescript
+@Public()
+@Throttle({ default: { limit: 10, ttl: 60_000 } })
+@UseGuards(LoginEmailThrottlerGuard)
+@Post('login')
+@HttpCode(200)
+async login(@Body() dto: LoginDto, @Req() req: Request, @Res({ passthrough: true }) res: Response) {
+  const result = await this.auth.login(dto.email, dto.password, { ip: req.ip, userAgent: req.get('user-agent') });
+  // TODO 5: for 'session', set both cookies and return { user }; for 'mfa', set NO cookies and return { mfaRequired: true, mfaToken }
+}
+```
+
+## SECURITY.md
+
+Write it as you go. It's the document you'll show in interviews and link from your README:
+
+1. **Design decisions:** sessions + short JWT + rotating refresh token; cookie settings; the `/v1` proxy; argon2 settings; password policy; enumeration choice for sign-up; Google linking rule (automatic or "log in first"). One reason each.
+2. **Threat table:** for each attack in this section, one line on what stops it in your code (with a file link).
+3. **Attack log:** the table from the checklist below, with what you tried and what happened.
+4. **Known limits:** what you chose not to do yet, and why (for example "access tokens stay valid up to 15 minutes after logout").
+
+## Attack checklist
+
+Try each one against your own API. Expected result in brackets. Record the actual result in `SECURITY.md`.
+
+**Passwords and login**
+
+1. Log in with an unknown email and with a wrong password: compare the bodies and the timing over 20 requests each [same message; similar timing].
+2. 15 logins for one email from one IP [429 after 10].
+3. Sign up with an existing email [202, and an "already registered" email in Mailpit].
+4. Sign up with `password123456` [400, breached].
+
+**Tokens and sessions**
+
+5. Change one character of the access token cookie [401].
+6. Send a JWT signed with another secret, with `alg: none`, and an expired one [401 each].
+7. Reuse an old refresh token after 11 seconds [401, session revoked, the newer token also dead].
+8. Five refreshes in parallel with the same token [one 204, session still active].
+9. Log out, then use the old refresh token [401].
+10. Reset the password, then use a refresh token from before [401].
+
+**Email links**
+
+11. Use a reset link twice; use a verify-email token as a reset token; use the first of two reset links [all fail with the same message].
+12. Send `forgot-password` with the header `Host: evil.com` [the email still links to `APP_URL`].
+13. Accept an invite while logged in as a different email [403]. Accept the same invite twice in parallel [one success, one membership].
+
+**Google**
+
+14. Change the `state` in the callback URL [redirect to `/login?error=google`].
+15. `returnTo=//evil.com` and `returnTo=https://evil.com` [land on `/dashboard`].
+16. Sign up with a password (unverified), then sign in with Google using the same email [password removed, old sessions revoked].
+
+**Authorisation**
+
+17. As the owner of business A, read, cancel and export a booking of business B by ID [404].
+18. Send `X-Business-Id` of business B [403].
+19. As staff: read a colleague's booking [404], create a service [403], invite someone [403].
+20. As admin: invite someone as owner [403]; change your own role [403].
+21. Two owners leave at the same moment [one 204, one 409; one owner remains].
+22. Send `"businessId"` or `"role"` in a request body [400, `forbidNonWhitelisted`].
+
+**Browser**
+
+23. A form on `http://localhost:5000` that posts to `/v1/auth/logout` and `/v1/bookings/:id/cancel` [403 from `OriginGuard`, or no cookies sent].
+24. A customer name with `<img src=x onerror=alert(1)>` shown in the dashboard [shown as text].
+
+## Test checklist
+
+Run the [PostgreSQL project's checks](/docs/postgresql/practice-project#test-checklist) again: they must still pass with real users. Update the race script to log in first and send `X-Business-Id`. Then:
+
+1. Full journey: sign up → verify (Mailpit) → log in → create a business → invite a teammate (second browser profile) → they sign up through the invite and appear as staff.
+2. Leave the browser for 20 minutes, then click around: the refresh happens without the user noticing.
+3. Restart the API: users are still logged in (sessions are in Postgres).
+4. `GET /v1/auth/sessions` shows both browsers; delete the other one; that browser is logged out within 15 minutes, immediately on its next refresh.
+5. `GET /v1/audit-log` shows the events from steps 1–4 with IPs and request IDs.
+6. As `booking_app` in `psql`: `delete from audit_events;` fails.
+7. Logs contain no passwords, tokens or cookies (search the log output for `password`, `eyJ` and `refresh_token=`).
+
+## Part 2 (stretch): the Next.js side
+
+If you have time, build a minimal frontend for the auth flows in your Next.js practice app. It's very good practice for Phase 3 frontend interviews:
+
+- `next.config.ts` rewrite of `/v1/*` to the API (Lesson 2).
+- Pages: `/login`, `/signup`, `/verify-email`, `/forgot-password`, `/reset-password`, `/invite`, `/dashboard`.
+- The `api()` fetch wrapper with single-flight refresh (Lesson 3).
+- Token pages read the fragment and remove it from the URL (Lesson 4).
+- The CSP from Lesson 7 in `proxy.ts`, enforcing, with no violations.
+- A business switcher that sets `X-Business-Id`.
+
+## When you're done
+
+1. Push to GitHub with the README (how to run: `docker compose up` with Postgres and Mailpit, migrate, seed, start) and `SECURITY.md`.
+2. Paste `SessionsService`, `AccountsService`, the guards and `SECURITY.md` into Claude for a **scored security review**. Ask it to act as a penetration tester and find three things you missed.
+3. Ask Claude for a **10-question auth and security quiz**: at least one each on token storage, refresh rotation, CSRF vs CORS, XSS in React, IDOR, OAuth/PKCE and password storage. **Score 8 or more** to move on to the Testing section.
+4. Blog post idea: "Refresh token rotation with reuse detection in NestJS and Postgres" (the chain diagram, the two-tabs problem, and the transaction rollback bug). Specific, practical, and rare: most tutorials stop at "store the refresh token".
+5. Update the progress box on the [section home page](/docs/auth-security).

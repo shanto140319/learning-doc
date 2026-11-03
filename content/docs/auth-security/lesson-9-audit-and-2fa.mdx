@@ -1,0 +1,317 @@
+---
+title: "Lesson 9: Audit log, step-up checks and two-factor login"
+description: "An append-only audit log in Postgres and what to record, security notification emails, asking for the password again before risky actions, TOTP two-factor login from enrolment to recovery codes, encrypting secrets at rest with AES-256-GCM, and a short look at passkeys."
+---
+
+The last lesson adds three things that separate a real SaaS from a demo: a record of **who did what** (the audit log), a second check before **dangerous actions**, and a **second factor** so a stolen password isn't enough. Project 1 lists an audit log as a requirement, and B2B customers ask for 2FA.
+
+## The audit log
+
+An **application log** (Pino) is for developers: noisy, kept for days, may be sampled. An **audit log** is for owners, support and security: every important action, who did it, when, from where. It's kept for months or years, and nobody can edit it.
+
+What to record in Project 1:
+
+| Area | Events |
+| --- | --- |
+| Accounts | `auth.login.succeeded`, `auth.login.failed`, `auth.password.changed`, `auth.password.reset`, `auth.2fa.enabled`, `auth.2fa.disabled`, `auth.session.revoked`, `auth.refresh_token.reused` |
+| Team | `member.invited`, `member.joined`, `member.role_changed`, `member.removed` |
+| Business data | `booking.created`, `booking.cancelled`, `service.price_changed`, `business.settings_changed` |
+| Access | `api_key.created`, `api_key.revoked` |
+
+For each event: **who** (user, API key or system), **what** (action and target), **when**, **where** (IP, user agent, request ID), and **details** (for changes, the old and new value of important fields).
+
+```sql
+create table audit_events (
+  id            bigint generated always as identity primary key,
+  business_id   uuid,                     -- no foreign keys on purpose: keep the history
+  actor_type    text not null check (actor_type in ('user', 'api_key', 'system')),
+  actor_id      uuid,                     -- even after the business or user is deleted
+  action        text not null,            -- 'member.role_changed'
+  target_type   text,
+  target_id     text,
+  ip            inet,
+  user_agent    text,
+  request_id    text,
+  metadata      jsonb not null default '{}',
+  created_at    timestamptz not null default now()
+);
+create index audit_events_business_created_idx on audit_events (business_id, created_at desc);
+create index audit_events_actor_created_idx on audit_events (actor_id, created_at desc);
+
+-- Append-only: the app may add and read, never change or delete (PostgreSQL Lesson 9 roles)
+revoke update, delete, truncate on audit_events from booking_app;
+```
+
+Add the matching `AuditEvent` model to `schema.prisma` (use `String? @db.Inet` for `ip` and `Json` for `metadata`), and add `ip` and `userAgent` to the `RequestContext` from NestJS Lesson 8 (fill them in the same middleware that sets `requestId`).
+
+```typescript
+// src/audit/audit.service.ts
+export type AuditEvent = {
+  action: string;
+  businessId?: string;
+  actor: { type: 'user' | 'api_key' | 'system'; id?: string };
+  target?: { type: string; id: string };
+  metadata?: Record<string, unknown>;
+};
+
+@Injectable()
+export class AuditService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  /** Pass the transaction client, so the event is saved together with the change (or not at all). */
+  async record(event: AuditEvent, tx: Prisma.TransactionClient = this.prisma): Promise<void> {
+    const ctx = currentContext();                       // AsyncLocalStorage from NestJS Lesson 8
+    await tx.auditEvent.create({
+      data: {
+        action: event.action,
+        businessId: event.businessId,
+        actorType: event.actor.type,
+        actorId: event.actor.id,
+        targetType: event.target?.type,
+        targetId: event.target?.id,
+        ip: ctx?.ip,
+        userAgent: ctx?.userAgent?.slice(0, 300),
+        requestId: ctx?.requestId,
+        metadata: (event.metadata ?? {}) as Prisma.InputJsonValue,
+      },
+    });
+  }
+}
+```
+
+```typescript
+// in MembersService.changeRole (Lesson 6), inside the same transaction
+await this.audit.record({
+  action: 'member.role_changed',
+  businessId: actor.businessId,
+  actor: { type: 'user', id: actor.id },
+  target: { type: 'user', id: targetUserId },
+  metadata: { from: target.role, to: newRole },
+}, tx);
+```
+
+Rules:
+
+- **Same transaction** as the change. If the change commits, the event exists; if it rolls back, there's no false event. (For events where there's no transaction, like a failed login, write it directly.)
+- **No secrets and little personal data** in `metadata`: IDs, roles and changed field names, not passwords, tokens or full customer records.
+- Failed logins for unknown emails: record them with no actor and the email **hashed**, or just count them. Don't fill the table with attacker-chosen strings.
+- **Retention:** decide how long you keep it (for example 1 year) and delete older rows with a scheduled job. With huge volumes, partition by month (PostgreSQL Lesson 10).
+- Show it to owners: `GET /v1/audit-log` with keyset pagination and filters (action, user, date). It replaces the in-memory audit log from the NestJS section.
+
+### Security notification emails
+
+Some events should reach the user **right away**, because they might not be the user's own actions:
+
+- "Your password was changed" (Lesson 4)
+- "Two-factor authentication was turned off"
+- "New login from Chrome on Windows, Dhaka" (when the device or IP is new for this user)
+- "Someone tried to use an old login token; we logged you out for safety" (refresh token reuse, Lesson 3)
+
+Each one says: "If this wasn't you, reset your password." Send them through the email queue in Month 2.
+
+## Step-up: ask again before risky actions
+
+A logged-in session might be a laptop left open in a café. For a few dangerous actions, require **recent** proof:
+
+- Change email or password
+- Turn 2FA off, regenerate recovery codes
+- Create an API key
+- Change billing, delete the business, transfer ownership
+
+Lesson 2's session row has `authenticatedAt`. Set it at login and update it when the user re-enters their password (or 2FA code). A guard checks it **in the database**, which also catches revoked sessions (Lesson 3).
+
+```typescript
+// src/common/auth/recent-auth.guard.ts
+export const RecentAuth = Reflector.createDecorator<number>();   // maximum age in ms
+
+@Injectable()
+export class RecentAuthGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector, private readonly prisma: PrismaService) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const maxAgeMs = this.reflector.get(RecentAuth, context.getHandler());
+    if (!maxAgeMs) return true;
+
+    const { user } = context.switchToHttp().getRequest<{ user: SessionUser }>();
+    const session = await this.prisma.session.findUnique({ where: { id: user.sessionId } });
+    if (!session || session.revokedAt) throw new UnauthorizedException('Session ended');
+    if (Date.now() - session.authenticatedAt.getTime() > maxAgeMs) {
+      throw new AppError('Please confirm your password', 403, 'REAUTHENTICATION_REQUIRED');   // type: reauthentication-required
+    }
+    return true;
+  }
+}
+```
+
+```typescript
+@RecentAuth(10 * 60_000)              // within the last 10 minutes
+@Roles(['owner'])
+@Post('api-keys')
+createApiKey() {}
+```
+
+`POST /v1/auth/reauthenticate { password }` (or `{ code }` for 2FA) checks the credential and sets `authenticatedAt = now()`. The frontend shows a "Confirm your password" dialog when it gets `reauthentication-required`, then retries.
+
+## Two-factor login with TOTP
+
+**TOTP** (time-based one-time password) is the 6-digit code in Google Authenticator, 1Password or Authy. It changes every 30 seconds.
+
+How it works:
+
+1. The server creates a random **secret** and shows it as a QR code. The app on the phone saves it.
+2. Both sides compute `HMAC-SHA1(secret, current 30-second window number)` and turn it into 6 digits.
+3. At login, the user types the code from the phone; the server computes the same and compares.
+
+Nothing is sent over the network to generate a code: both sides just share the secret and the time. Here's the whole algorithm, so it's not magic:
+
+```typescript
+// For understanding only. In the project, use a maintained library (for example otplib),
+// which also handles base32 encoding and the otpauth:// URI for the QR code.
+import { createHmac } from 'node:crypto';
+
+export function totp(secret: Buffer, step = Math.floor(Date.now() / 30_000)): string {
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(step));
+  const hmac = createHmac('sha1', secret).update(counter).digest();
+  const offset = hmac[hmac.length - 1] & 0x0f;                          // "dynamic truncation" (RFC 4226)
+  const code = (hmac.readUInt32BE(offset) & 0x7fffffff) % 1_000_000;
+  return code.toString().padStart(6, '0');
+}
+```
+
+### Storing the secret: encrypt, don't hash
+
+Unlike passwords, the server needs the TOTP secret **back** to compute codes, so it can't be hashed. Encrypt it with a key that's **not** in the database (`ENCRYPTION_KEY` in the environment). Then a database leak alone doesn't give the attacker everyone's second factor.
+
+```typescript
+// src/common/security/encryption.ts
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+
+export class Encryptor {
+  constructor(private readonly key: Buffer) {             // 32 bytes: Buffer.from(env.ENCRYPTION_KEY, 'base64')
+    if (key.length !== 32) throw new Error('ENCRYPTION_KEY must be 32 bytes');
+  }
+
+  encrypt(plain: string): string {
+    const iv = randomBytes(12);                            // new random IV every time; never reuse one with the same key
+    const cipher = createCipheriv('aes-256-gcm', this.key, iv);
+    const data = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();                       // detects any change to the ciphertext
+    return ['v1', iv.toString('base64url'), tag.toString('base64url'), data.toString('base64url')].join('.');
+  }
+
+  decrypt(payload: string): string {
+    const [version, iv, tag, data] = payload.split('.');
+    if (version !== 'v1' || !iv || !tag || !data) throw new Error('Unknown ciphertext format');
+    const decipher = createDecipheriv('aes-256-gcm', this.key, Buffer.from(iv, 'base64url'));
+    decipher.setAuthTag(Buffer.from(tag, 'base64url'));
+    return Buffer.concat([decipher.update(Buffer.from(data, 'base64url')), decipher.final()]).toString('utf8');
+  }
+}
+```
+
+The `v1` prefix lets you change the algorithm or key later and still read old values.
+
+### The tables
+
+```prisma
+// on User
+totpSecretEncrypted String?   @map("totp_secret_encrypted")       // set during setup, before it's confirmed
+totpEnabledAt       DateTime? @map("totp_enabled_at") @db.Timestamptz(3)
+totpLastStep        BigInt?   @map("totp_last_step")              // stops the same code being used twice
+
+model RecoveryCode {
+  id       String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  userId   String    @map("user_id") @db.Uuid
+  codeHash String    @map("code_hash")
+  usedAt   DateTime? @map("used_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("recovery_codes")
+}
+```
+
+### Enrolment
+
+```text
+POST /v1/auth/2fa/setup          (step-up required)
+  → new secret, saved encrypted in totp_secret_encrypted (2FA is NOT on yet)
+  → returns the otpauth:// URI (the frontend shows it as a QR code) and the secret as text
+
+POST /v1/auth/2fa/enable { code }
+  → the code must match the saved secret: proves the phone really has it
+  → totp_enabled_at = now()
+  → create 10 recovery codes, store their SHA-256 hashes, return them ONCE
+  → audit event + email "2FA was turned on"
+```
+
+The confirmation step matters. If you turn 2FA on before the user proves their app works (wrong QR scan, wrong account), they're locked out on their next login.
+
+**Recovery codes** are for a lost phone: 10 random codes like `7KQ4-M9XD-2PLT`, each usable **once**. Hash them (they're random, so SHA-256 is enough), and tell the user to save them in their password manager.
+
+### Login with 2FA
+
+Login now has two steps. After a correct password, the user is **not** logged in yet:
+
+```text
+POST /v1/auth/login { email, password }
+  2FA off → session + cookies (as before)
+  2FA on  → 200 { mfaRequired: true, mfaToken }
+            mfaToken: a JWT { sub, purpose: 'mfa' } with aud 'booking-mfa', valid 5 minutes. No session yet.
+
+POST /v1/auth/2fa/verify { mfaToken, code }
+  → verify mfaToken (audience 'booking-mfa', so it's useless as an access token: Lesson 2, exercise 2.3)
+  → check the code: the current window ±1 (allows 30 seconds of clock difference)
+     and step > totp_last_step (the same code can't be used twice)
+  → or check a recovery code: hash it, find an unused one, mark it used (one atomic update)
+  → session + cookies; authenticated_at = now()
+```
+
+Rules:
+
+- **Rate-limit code attempts** hard (for example 5 per `mfaToken`, and per user). A 6-digit code has only a million possibilities.
+- Google login (Lesson 5) for a user with 2FA must also go through the code step.
+- Turning 2FA **off** requires step-up and a valid code, and sends a notification email.
+- An owner of a business may later **require** 2FA for all members. That's a nice extra feature for Project 1.
+
+## Passkeys: a short preview
+
+**Passkeys** (WebAuthn) replace passwords with a key pair stored on the user's device or password manager, unlocked with a fingerprint, face or PIN. The server stores only the **public** key. They resist phishing completely: the browser only uses a passkey on the exact site it was created for, so a fake login page gets nothing.
+
+They're becoming common (Google, GitHub and Apple support them). You don't need to build them now, but know how to describe them in an interview. When a job needs them, a library like **SimpleWebAuthn** handles the hard parts.
+
+## Mistakes to avoid
+
+- Writing audit events outside the transaction (events for changes that rolled back, or missing events).
+- An audit table the app can update or delete.
+- Passwords, tokens or whole request bodies in audit metadata.
+- Dangerous actions without step-up.
+- Turning 2FA on before the user confirms a code.
+- Storing TOTP secrets in plain text (or hashing them, which makes them useless).
+- Reusing the same IV with AES-GCM, or a hard-coded encryption key.
+- Accepting the same TOTP code twice, or no rate limit on code checks.
+- An `mfaToken` that's also accepted as an access token.
+- Recovery codes stored in plain text or usable more than once.
+
+## Exercises
+
+- **9.1** 🟢 Write the list of audit events for Project 1 (start from the table above), with the `metadata` you'd store for each. Mark which ones also send an email to the user.
+- **9.2** 🟡 Build `audit_events` with the append-only permissions, `AuditService`, and record at least: login succeeded/failed, password changed and reset, refresh token reuse, member invited/joined/role changed, booking cancelled. Add `GET /v1/audit-log` (owner only, keyset pagination). As `booking_app` in `psql`, try `delete from audit_events;`: it must fail.
+- **9.3** 🟡 Add `RecentAuthGuard`, `POST /v1/auth/reauthenticate`, and use step-up on change password, create API key and (later) delete business. Test: log in, set `authenticatedAt` to 20 minutes ago in `psql`, try to create an API key (403 `reauthentication-required`), re-authenticate, try again (201).
+- **9.4** 🔴 Build TOTP 2FA with a library: setup, enable with confirmation, recovery codes, the two-step login, disable with step-up. Scan the QR code with a real authenticator app. Then **attack it**: use the same code twice, use a code from 2 minutes ago, use an `mfaToken` as an access token cookie, use a recovery code twice, and send 10 wrong codes quickly.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How would you design an audit log?"**
+
+> "It's a separate, append-only table, not the application logs. Each event has the actor, which can be a user, an API key or the system, the action, the target, the tenant, the IP, user agent and request ID, and a small JSON field with details like the old and new role. I write the event in the same database transaction as the change, so they're always consistent, and the application's database role can only insert and read, not update or delete. I keep personal data and secrets out of it, index it by tenant and time for the owner's audit page, and delete old events after a retention period. Security-sensitive events, like a password change or 2FA being turned off, also send an email to the user."
+
+**"How does two-factor authentication with an authenticator app work?"**
+
+> "It's TOTP. During setup the server generates a random secret and shows it as a QR code; the authenticator app stores it. Both sides compute an HMAC of the secret and the current 30-second time window and turn it into six digits, so nothing is sent to generate a code. I only enable 2FA after the user enters a valid code, and I give them one-time recovery codes, stored hashed. The secret itself has to be recoverable, so I encrypt it with AES-GCM using a key that isn't in the database. At login, a correct password returns a short-lived token for the second step instead of a session; I accept the current window plus or minus one, reject a code that was already used, and rate-limit attempts because there are only a million possible codes."

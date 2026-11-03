@@ -1,0 +1,273 @@
+---
+title: "Lesson 6: Authorisation: roles, ownership and tenants"
+description: "Broken access control and IDOR, the layers of authorisation, choosing the active business with a membership guard, a role matrix, ownership rules inside queries, policy functions, 404 vs 403, field-level rules and mass assignment, privilege escalation, and the last-owner race."
+---
+
+Authentication tells you **who** is calling. Authorisation decides **what they may do**. It's OWASP's number 1 risk ("Broken Access Control") because it isn't one check in one place: it's a small decision on **every** endpoint, and forgetting one is enough.
+
+The most common bug has a name: **IDOR** (insecure direct object reference). You change an ID in the URL and see someone else's data:
+
+```http
+GET /v1/bookings/0193f2a1-...   → your booking
+GET /v1/bookings/0193f2a2-...   → another business's booking (should be 404!)
+```
+
+UUIDs don't fix IDOR. They're hard to guess, but IDs leak all the time: in URLs people share, in emails, in logs, in other API responses. **Every access must be checked**, whatever the ID looks like.
+
+## The layers
+
+| Layer | Question | Where in NestJS |
+| --- | --- | --- |
+| 1. Authenticated? | Is there a valid session? | `AuthGuard` (Lesson 2) |
+| 2. Tenant | Is this user a member of the business they're acting in? | `MembershipGuard` (below) |
+| 3. Role | Does their role allow this **kind** of action? | `RolesGuard` + `@Roles()` (NestJS Lesson 4) |
+| 4. Resource | Is **this specific** booking theirs to see or change? | In the query, or a policy function |
+| 5. Field | May they change **this field** (price, role)? | DTOs per role, policy checks |
+
+Guards handle layers 1–3 well because they only need the request. Layers 4–5 need the data, so they belong in services and queries.
+
+## Choosing the active business
+
+In Lesson 2, the access token stopped containing `businessId` and `role`. A user can belong to several businesses (a stylist who works at two salons), and roles change. So the client says **which business** it's acting in on each request, and the server checks the membership.
+
+Options:
+
+| Where | Example | Notes |
+| --- | --- | --- |
+| URL path | `/v1/businesses/:businessId/bookings` | Very clear, shows in logs; GitHub (`/orgs/:org`) does this. Changes every route |
+| **Header** | `X-Business-Id: 0193...` | Keeps your existing routes; Stripe (`Stripe-Account`) does this |
+| In the token | `{ sub, businessId }` | Switching business needs a new token; stale roles |
+
+For your existing API, use the **header**. The frontend stores the selected business (in the URL of the frontend page, like `/b/[businessId]/bookings`) and sends the header.
+
+```typescript
+// src/common/auth/membership.guard.ts
+export type AuthUser = SessionUser & { businessId: string; role: Role };   // the same name your services already use
+
+export const SKIP_BUSINESS_KEY = 'skipBusiness';
+export const SkipBusiness = () => SetMetadata(SKIP_BUSINESS_KEY, true);  // routes like /v1/me, /v1/auth/*, accept invite
+
+@Injectable()
+export class MembershipGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector, private readonly prisma: PrismaService) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const targets = [context.getHandler(), context.getClass()];
+    if (this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, targets)) return true;
+    if (this.reflector.getAllAndOverride<boolean>(SKIP_BUSINESS_KEY, targets)) return true;
+
+    const req = context.switchToHttp().getRequest<Request & { user: SessionUser | AuthUser }>();
+    const businessId = req.header('x-business-id');
+    if (!businessId || !isUUID(businessId)) {
+      throw new BadRequestException('The X-Business-Id header is required');
+    }
+
+    const membership = await this.prisma.membership.findUnique({
+      where: { businessId_userId: { businessId, userId: req.user.id } },
+      select: { role: true },
+    });
+    if (!membership) throw new ForbiddenException('You are not a member of this business');
+
+    req.user = { ...req.user, businessId, role: membership.role };
+    return true;
+  }
+}
+```
+
+```typescript
+// src/app.module.ts: global guards run in this order
+providers: [
+  { provide: APP_GUARD, useClass: AuthGuard },        // who are you?
+  { provide: APP_GUARD, useClass: MembershipGuard },  // which business, which role?
+  { provide: APP_GUARD, useClass: RolesGuard },       // is the role enough for this route?
+],
+```
+
+Now `@CurrentUser('businessId')` and `RolesGuard` from the NestJS section work again, unchanged, with real data. Fill `userId` and `businessId` in the `requestContext` (NestJS Lesson 8) here too, so logs and the audit log (Lesson 9) have them.
+
+The membership lookup is a primary-key read, so it's fast. And because the role is read fresh on every request, **removing someone's role works immediately**, not when their token expires. That's the main reason roles don't go in the JWT.
+
+## The role matrix
+
+Write it down before you code it. This is also a great table for your README:
+
+| Action | owner | admin | staff |
+| --- | --- | --- | --- |
+| See all bookings | ✅ | ✅ | Only their own |
+| Create a booking for a customer | ✅ | ✅ | ✅ (for themselves) |
+| Cancel a booking | ✅ | ✅ | Only their own |
+| Create, edit, delete services | ✅ | ✅ | ❌ |
+| Change service prices | ✅ | ✅ | ❌ |
+| Invite people | ✅ (any role) | ✅ (staff only) | ❌ |
+| Change roles, remove members | ✅ | ❌ | ❌ |
+| Billing, delete the business | ✅ | ❌ | ❌ |
+| See the audit log | ✅ | ❌ | ❌ |
+
+## Ownership: put the rule in the query
+
+"Staff only see their own bookings" is a **resource** rule. The safest place for it is the `where` clause, so a forbidden booking is never even loaded:
+
+```typescript
+// src/bookings/booking.policy.ts
+import type { Prisma } from '../generated/prisma/client';
+
+/** The bookings this person may see. Every booking query starts from this. */
+export function visibleBookings(actor: AuthUser): Prisma.BookingWhereInput {
+  const base: Prisma.BookingWhereInput = { businessId: actor.businessId };
+  return actor.role === 'staff' ? { ...base, staff: { userId: actor.id } } : base;
+}
+```
+
+```typescript
+// in BookingsRepository
+findOne(actor: AuthUser, id: string) {
+  return this.prisma.booking.findFirst({ where: { ...visibleBookings(actor), id } });   // null → 404
+}
+
+list(actor: AuthUser, query: ListBookingsQuery) {
+  return this.prisma.booking.findMany({ where: { ...visibleBookings(actor), ...filters(query) }, /* keyset paging */ });
+}
+```
+
+(The `Staff` model needs its `userId` field and a relation to `User`. The SQL schema had `staff.user_id` from the start; add it to Prisma now.)
+
+Both list and detail use the same function, so they can never disagree. A common bug is a correct list endpoint and a detail endpoint that only checks `businessId`.
+
+### Policy functions for actions
+
+Some rules depend on the role **and** the resource **and** the state. Keep them in small, pure functions, so they're easy to read and to unit test (you'll test them in the next section):
+
+```typescript
+// src/bookings/booking.policy.ts
+type BookingForPolicy = { businessId: string; startsAt: Date; staff: { userId: string | null } };
+
+export function canCancel(actor: AuthUser, booking: BookingForPolicy): boolean {
+  if (booking.businessId !== actor.businessId) return false;
+  if (actor.role === 'owner' || actor.role === 'admin') return true;
+  return booking.staff.userId === actor.id && booking.startsAt > new Date();   // staff: own, future bookings only
+}
+```
+
+```typescript
+// in BookingsService.cancel (findOne includes `staff: { select: { userId: true } }`)
+const booking = await this.bookings.findOne(actor, id);
+if (!booking) throw new NotFoundException('Booking not found');
+if (!canCancel(actor, booking)) throw new ForbiddenException('You cannot cancel this booking');
+```
+
+Libraries like **CASL** do the same thing with a rule language. For a handful of roles, plain functions are clearer. Know that CASL exists, because you'll see it in existing codebases.
+
+## 404 or 403?
+
+| Situation | Status | Why |
+| --- | --- | --- |
+| The booking belongs to **another business** | **404** | Don't confirm that it exists. To this user, it doesn't |
+| Staff opens a booking of a colleague in the same business | 404 or 403 | They know colleagues have bookings; either is fine, be consistent |
+| The user **can see** it but can't do this action (staff deleting a service) | **403** | They know it exists; tell them the truth so the UI makes sense |
+| Not a member of the business in `X-Business-Id` | 403 | Business IDs aren't secret here; 404 is also fine |
+
+Rule of thumb: if the user **shouldn't know it exists**, 404. If they can see it but can't touch it, 403.
+
+## Field-level rules and mass assignment
+
+**Mass assignment** means copying the request body straight into the database:
+
+```typescript
+// ❌ The client sends { "name": "Haircut", "businessId": "<another business>" } or { "role": "owner" }
+await this.prisma.service.update({ where: { id }, data: req.body });
+```
+
+Your global `ValidationPipe` with `whitelist: true` and `forbidNonWhitelisted: true` (NestJS Lesson 5) already blocks unknown fields. But it doesn't stop **known** fields that only some roles may change. Two good patterns:
+
+- **Separate DTOs or endpoints** for sensitive changes: `PATCH /v1/services/:id` (name, description) for admins, and price changes through a separate `PATCH /v1/services/:id/price` with `@Roles('owner', 'admin')`.
+- **Never** take `businessId`, `userId`, `role`, `status` or `createdById` from the body when the server knows them. Always use `actor.businessId` and `actor.id`.
+
+## Privilege escalation
+
+Privilege escalation is a user getting more power than they should. Checks for Project 1:
+
+- An admin can't make anyone an owner, including themselves (Lesson 4's invite rules, and the same rule on role changes).
+- Nobody can change their **own** role.
+- An admin can't remove an owner.
+- Staff can't see or change other members.
+- **The last owner can't leave or be demoted.** A business without an owner can't be billed or recovered.
+
+The last rule has a race condition you already know from PostgreSQL Lesson 6 (**write skew**). A business has two owners. Both click "Remove my owner role" at the same moment. Each transaction counts **two** owners, so each allows the change, and the business ends up with **zero**.
+
+```typescript
+// src/members/members.service.ts
+async changeRole(actor: AuthUser, targetUserId: string, newRole: Role): Promise<void> {
+  if (actor.role !== 'owner') throw new ForbiddenException('Only owners can change roles');
+  if (targetUserId === actor.id) throw new ForbiddenException('You cannot change your own role');   // stops self-promotion and self-demotion
+
+  await this.prisma.$transaction(async (tx) => {
+    // Lock all owner rows of this business, so concurrent changes wait for each other
+    const owners = await tx.$queryRaw<{ user_id: string }[]>`
+      select user_id from memberships
+      where business_id = ${actor.businessId}::uuid and role = 'owner'
+      for update`;
+
+    const target = await tx.membership.findUnique({
+      where: { businessId_userId: { businessId: actor.businessId, userId: targetUserId } },
+    });
+    if (!target) throw new NotFoundException('Member not found');
+
+    if (target.role === 'owner' && newRole !== 'owner' && owners.length <= 1) {
+      throw new ConflictException('A business must have at least one owner');
+    }
+    await tx.membership.update({
+      where: { businessId_userId: { businessId: actor.businessId, userId: targetUserId } },
+      data: { role: newRole },
+    });
+  });
+}
+```
+
+The `::uuid` cast: Prisma sends raw-query parameters as text, and Postgres won't compare `uuid = text` without it.
+
+"Leave business" (`DELETE /v1/members/me`) needs the same check. Exercise 6.4 asks you to write it.
+
+## Don't forget the other doors
+
+Authorisation bugs often hide in places that aren't normal CRUD endpoints:
+
+- **Exports and reports** (`GET /v1/bookings/export`, `GET /v1/reports/daily`): same `visibleBookings` rules.
+- **Search and autocomplete** endpoints that return names of other businesses' customers.
+- **File URLs** (Month 3, S3): signed URLs only after the same checks.
+- **WebSocket events** (Month 3): only send a new-booking event to members of that business.
+- **Background jobs**: a job created by a user should store the business ID and check it again when it runs.
+- **Admin or support tools**: they bypass tenants on purpose, so they need their own strong auth and an audit log.
+- **The AI agent in Project 2**: its tools must run with the **user's** permissions, never with an all-powerful service account.
+
+## Mistakes to avoid
+
+- Checking `businessId` in the list query but not in `findOne`, `update` or `delete`.
+- Loading a resource by ID first and checking the tenant afterwards (one missed `if` = data leak). Put the tenant in the `where`.
+- Thinking UUIDs prevent IDOR.
+- Putting roles in the JWT, so removing a role takes effect only when the token expires.
+- Taking `businessId`, `role` or `userId` from the request body.
+- Letting admins grant owner, or users change their own role.
+- Counting owners without a lock (write skew).
+- 403 for another tenant's resource (confirms it exists).
+- Forgetting exports, search, files, sockets and jobs.
+
+## Exercises
+
+- **6.1** 🟢 Look at every route in your booking API and fill in the role matrix for it (owner / admin / staff, and any resource rule). Mark any route where you aren't sure. That list is your to-do list.
+- **6.2** 🟡 Build `MembershipGuard`, `@SkipBusiness()` and `visibleBookings`. Register the three guards globally. Add `userId` to `Staff` in Prisma. Make sure `GET /v1/me` works without the header and `GET /v1/bookings` fails without it.
+- **6.3** 🟡 **Attack it.** Create two businesses with an owner each, and a staff member in business A. As each user, try: reading, cancelling and exporting bookings of the other business; staff reading a colleague's booking; staff creating a service; sending `"businessId"` in a request body; sending another business's ID in `X-Business-Id`. Write a table: request, expected status, actual status.
+- **6.4** 🔴 Build `changeRole` and `DELETE /v1/members/me` (leave the business) with the last-owner rule. Prove the race: remove the `for update`, then run two "leave" requests from two owners in parallel with `Promise.all` until the business has zero owners. Put the lock back and show that one request now gets 409.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you implement authorisation in a multi-tenant SaaS?"**
+
+> "In layers. A guard checks the session. A second guard reads which business the user is acting in, from a header, and loads their membership and role from the database, so role changes apply immediately instead of waiting for a token to expire. A roles guard checks route-level rules, like only owners and admins can create services. Then resource rules go into the query itself: every booking query starts from a function that adds the business ID and, for staff, their own user ID, so another tenant's data is never even loaded and returns 404. Rules that depend on state live in small policy functions that I unit test. And I never take the business or user ID from the request body. As a safety net, Postgres row-level security filters by tenant too."
+
+**"What is IDOR and how do you prevent it?"**
+
+> "Insecure direct object reference: the API takes an ID from the request and returns or changes that object without checking the caller is allowed to. For example, changing a booking ID in the URL shows another company's booking. Unguessable IDs like UUIDs don't fix it, because IDs leak. The fix is to check ownership on every access, and the most reliable way is to include the tenant and owner in the database query, so the object simply isn't found. I also test it explicitly, by trying each endpoint as a user from another tenant."

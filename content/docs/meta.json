@@ -5,6 +5,7 @@
     "node-http",
     "nestjs",
     "postgresql",
+    "auth-security",
     "roadmap"
   ]
 }

@@ -1,0 +1,119 @@
+---
+title: "Cheat sheet"
+description: "One page to revise the whole Auth and security section before an interview."
+---
+
+## Passwords
+
+- **argon2id** (OWASP minimum: 19 MiB, t=2, p=1); bcrypt OK in old systems; never SHA-256/MD5 alone; never encryption
+- Salt and settings live inside the hash string → `needsRehash` on login upgrades old hashes
+- Policy (NIST): length (15+ alone, 8+ with 2FA; Project 1: 12), max 128, **breached-password check** (HIBP k-anonymity), no composition rules, no forced rotation
+- Hashing costs RAM and thread-pool time → rate-limit login
+
+## No user enumeration
+
+- Login: one message ("Invalid email or password") + **dummy hash** when the user doesn't exist
+- Sign-up, resend, forgot-password: always 202 "check your email"; the email says what happened
+- Send emails in the background so timing is equal
+
+## Sessions vs JWT
+
+| | Session | JWT |
+| --- | --- | --- |
+| Check | Lookup | Signature only |
+| Revoke now | Easy | Wait for `exp` |
+| Best for | One app | Many services, mobile |
+
+Project 1: **15-min JWT** (`sub`, `sid`) + **session row** + **rotating refresh token**.
+
+JWT rules: pin `algorithms`, 32+ random byte secret, check `exp`/`iss`/`aud`, tiny payload, never in URLs. HS256 = one secret; RS256/EdDSA + JWKS when others verify.
+
+## Cookies
+
+| Cookie | Settings |
+| --- | --- |
+| `access_token` | `HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=900` |
+| `refresh_token` | `HttpOnly; Secure; SameSite=Strict; Path=/v1/auth; Max-Age=30 days` |
+| OIDC state | `HttpOnly; Secure; SameSite=Lax; signed; 10 min` (Lax: the callback is cross-site) |
+
+- `localStorage` → XSS can **steal** tokens; `httpOnly` cookie → XSS can only **use** them while the page is open
+- **Origin** = scheme+host+port; **site** = registrable domain. `app.x.com` + `api.x.com` = same site
+- Next.js **rewrite `/v1/*` → API**: one origin, cookies work, no CORS
+
+## Refresh tokens
+
+- 32 random bytes, store **SHA-256**; random tokens don't need argon2
+- **Rotate** every refresh; claim with `updateMany where usedAt: null` (one statement)
+- Used token again → **revoke the session** (return a result from the transaction, throw **after** commit)
+- **Grace period** ~10 s for two tabs; client refreshes once at a time
+- Logout = revoke session; logout-all after password reset; device list = sessions
+- Access token lives ≤15 min after logout → check the session in DB for sensitive actions
+
+## One-time links (verify, reset, invite)
+
+- Random 32 bytes, hashed, purpose, expiry (24 h / 30 min / 7 days), single use (atomic `update ... returning`), new link kills old ones
+- Links from `APP_URL`, **never `Host`**; token in the **fragment** (`#token=`); page POSTs it (email scanners do GETs)
+- Reset: check password first → consume → new hash → revoke all sessions → "password changed" email
+- Change email: verify the new address first, notify the old one
+- Invites: nobody grants a role ≥ their own (admins invite staff only); email must match; accept atomically
+
+## Google login (OIDC)
+
+- OAuth 2.0 = authorisation; **OIDC** = authentication (ID token)
+- Code flow + **PKCE** (stolen code) + **state** (login CSRF) + **nonce** (replay); token exchange on the server
+- Identity key = `(provider, sub)`, never email; require `email_verified`
+- Existing **unverified** account with that email → remove password, revoke sessions, then link (pre-account takeover)
+- `returnTo`: only `/path`, not `//`, `/\`, `https:` (open redirect)
+- Build vs buy: own code / Better Auth / Auth.js / Clerk, Auth0, WorkOS
+
+## Authorisation
+
+- 401 = not authenticated; 403 = authenticated but not allowed; **404** for other tenants' resources
+- Guards: `OriginGuard` → `ThrottlerGuard` → `AuthGuard` → `MembershipGuard` (`X-Business-Id` → role) → `RolesGuard`
+- Roles read from DB per request, **not** in the JWT
+- Resource rules **in the `where`** (`visibleBookings(actor)`); state rules in pure policy functions
+- **IDOR**: UUIDs don't fix it; check every access
+- Never take `businessId`, `userId`, `role` from the body; `whitelist` + `forbidNonWhitelisted`
+- Last owner: `select ... for update` on owners (write skew)
+- Don't forget: exports, search, files, WebSockets, jobs, admin tools, AI tools
+
+## Browser
+
+- **XSS**: React escapes `{}`; danger: `dangerouslySetInnerHTML`, `href={userUrl}`, Markdown, SVG uploads. Escape at output; DOMPurify; http/https only
+- **CSP**: nonce + `'strict-dynamic'`, `object-src 'none'`, `base-uri 'self'`, `frame-ancestors 'none'`; start with Report-Only; Next.js 16: `proxy.ts`
+- **CSRF** (cookie auth only): SameSite, no state change on GET, **Origin / `Sec-Fetch-Site` check**, JSON only; sibling subdomains are same-site
+- **CORS** relaxes the same-origin policy for reading; not an API protection; exact origins; never reflect origin + credentials
+- **Helmet**: HSTS, nosniff, frame options, Referrer-Policy, CORP; Swagger needs CSP care
+- **Clickjacking**: `frame-ancestors 'none'`
+
+## Abuse and secrets
+
+- Throttler: global + per route; 429 + `Retry-After`; `trust proxy` = number of proxies (not `true`); Redis storage for many instances
+- Credential stuffing: per-account limits, no permanent lockout, CAPTCHA, breached passwords, 2FA, new-login emails
+- **SSRF**: https only, resolve DNS, block private/loopback/link-local (169.254.169.254), connect to the checked IP, no blind redirects, timeouts, size limits, IMDSv2
+- **HMAC webhooks**: sign `timestamp.rawBody`, `timingSafeEqual`, 5-min tolerance, idempotent handler
+- **API keys**: prefix + random, hash, show once, scopes, last used, revoke, two keys for rotation; key-only routes
+- Secrets: not in git (rotate if leaked), validated at startup, per environment, never `NEXT_PUBLIC_*`, gitleaks + push protection
+- Logs: redact cookies, authorization, passwords, tokens
+- Supply chain: lockfile + `npm ci`, Dependabot/Renovate + tests, `npm audit`, careful with install scripts, 2FA on npm/GitHub
+
+## Audit and 2FA
+
+- Audit log: append-only (revoke update/delete), same transaction, actor/action/target/IP/request ID/metadata, no secrets, retention
+- **Step-up**: `authenticatedAt` within 10 min for email/password change, API keys, 2FA off, billing
+- **TOTP**: HMAC-SHA1(secret, 30-s step) → 6 digits; confirm before enabling; ±1 step; no reuse (`totpLastStep`); rate-limit; secret **encrypted** (AES-256-GCM, random IV, key outside DB); recovery codes hashed, single use
+- Login with 2FA: password → `mfaToken` (aud `booking-mfa`, 5 min) → code → session
+- Passkeys: public-key, phishing-resistant; SimpleWebAuthn
+
+## Top interview questions
+
+1. Sessions or JWT? → one app: sessions; hybrid with short JWT + revocable session + refresh rotation.
+2. Where do you store the JWT? → httpOnly Secure SameSite cookie; XSS vs CSRF trade-off.
+3. How do refresh tokens work? → rotation, hash in DB, reuse detection revokes the session.
+4. How do you store passwords? → argon2id, salt inside, rehash on login, breached check, rate limit.
+5. CSRF vs CORS? → attack vs read permission; SameSite + Origin check; exact CORS origins.
+6. XSS in React? → escape holes; DOMPurify; CSP with nonces.
+7. Multi-tenant authorisation / IDOR? → membership guard, tenant in every `where`, 404, RLS safety net.
+8. How does Sign in with Google work? → OIDC code flow, PKCE, state, nonce, `sub`, safe linking.
+9. Protect a login page? → per-IP and per-account limits, no lockout, CAPTCHA, 2FA, breached passwords.
+10. Webhook security? → HMAC over raw body + timestamp, constant-time compare, idempotency.

@@ -1,0 +1,133 @@
+---
+title: "Auth and security"
+description: "Real authentication and authorisation for the booking API: passwords, sessions and JWTs, refresh token rotation, email flows, Google login, roles and tenants, web security (XSS, CSRF, CORS, CSP), abuse protection, secrets, audit logs and 2FA. Phase 1, Month 2."
+---
+
+Until now, your booking API used a fake login: the token `token-owner` was just a user ID. In this section you replace it with **real authentication** (who are you?) and **real authorisation** (what are you allowed to do?), and you learn the attacks that break both.
+
+Security questions appear in almost every full-stack interview: "Where do you store the JWT?", "How do refresh tokens work?", "What is CSRF and how do you stop it?", "How do you stop one customer seeing another customer's data?". After this section, you can answer each one with code you wrote.
+
+All examples build on the **booking API** from the [PostgreSQL practice project](/docs/postgresql/practice-project) (NestJS + Prisma 7 + PostgreSQL 18).
+
+<Callout title="My progress">
+- Lesson 1 (passwords and sign-up): not started
+- Lesson 2 (sessions, JWT and cookies): not started
+- Lesson 3 (refresh tokens and logout): not started
+- Lesson 4 (email verification, password reset, invites): not started
+- Lesson 5 (Google login with OAuth and OpenID Connect): not started
+- Lesson 6 (authorisation: roles, ownership, tenants): not started
+- Lesson 7 (browser security: XSS, CSP, CSRF, CORS, headers): not started
+- Lesson 8 (abuse, webhooks, API keys and secrets): not started
+- Lesson 9 (audit log and two-factor login): not started
+- Practice project: not started
+</Callout>
+
+## Before you start
+
+Finish the [PostgreSQL practice project](/docs/postgresql/practice-project) first: this section adds tables to that schema and replaces the fake `AuthGuard` from [NestJS Lesson 4](/docs/nestjs/lesson-4-request-lifecycle). Lesson 6 of PostgreSQL (atomic updates, `for update`, transactions) is used again in Lessons 3, 4 and 6.
+
+## What you will learn
+
+| Lesson | Topic | You will be able to… |
+| --- | --- | --- |
+| 1 | Passwords and sign-up | Hash passwords with argon2id, set a modern password policy, and stop attackers finding out which emails have accounts |
+| 2 | Sessions, JWT and cookies | Explain sessions vs JWTs, sign and verify JWTs safely, and choose where tokens live in the browser |
+| 3 | Refresh tokens and logout | Rotate refresh tokens, detect a stolen one, log out of one device or all devices |
+| 4 | Email flows | Build email verification, password reset and team invites with safe one-time links |
+| 5 | Google login | Add "Sign in with Google" with OpenID Connect, PKCE and `state`, and link accounts without account takeover; decide build vs buy |
+| 6 | Authorisation | Pick the active business, check roles and ownership, stop IDOR bugs, choose 404 vs 403 |
+| 7 | Browser security | Prevent XSS, write a Content Security Policy, stop CSRF, configure CORS and security headers |
+| 8 | Abuse, webhooks, API keys, secrets | Rate-limit logins, block SSRF, sign webhooks with HMAC, issue API keys, keep secrets out of code and logs |
+| 9 | Audit log and 2FA | Record security events, add TOTP two-factor login with recovery codes, ask for the password again before risky actions |
+
+### Topics added beyond the roadmap
+
+The roadmap lists argon2, sessions vs JWT, refresh rotation, Google OAuth, email verification and password reset, RBAC, ownership checks, multi-tenant isolation, and the OWASP basics (SQL injection, XSS, CSRF, CORS, Helmet, secrets, rate limiting). All of them are covered. SQL injection and row-level security were already covered in [PostgreSQL Lesson 10](/docs/postgresql/lesson-10-multi-tenancy-and-scaling), so here they get only a short reminder.
+
+These are added because **your projects need them** or **interviews ask about them**:
+
+| Added topic | Why | Lesson |
+| --- | --- | --- |
+| Breached-password check, NIST password rules | Modern password policy; "must contain a symbol" rules are outdated | 1 |
+| User enumeration and timing attacks | Login and reset pages often leak which emails have accounts | 1, 4 |
+| **Where to store tokens in the browser**, cookie attributes, same-site vs cross-site | A top interview question; it also decides your CSRF defence and your Next.js setup | 2 |
+| **Refresh token reuse detection**, logout everywhere, session list | Plain rotation doesn't catch a stolen token | 3 |
+| **Safe one-time links** and **team invites** | Project 1 needs invites; the same rules protect verification and reset links | 4 |
+| OIDC details: PKCE, `state`, `nonce`, **safe account linking**, open redirects | Wrong linking lets an attacker take over accounts | 5 |
+| Build vs buy (Better Auth, Auth.js, Clerk, Auth0) | A common senior-level interview question | 5 |
+| Active business selection, policy functions, **IDOR**, last-owner rule | Broken access control is OWASP's number 1 risk | 6 |
+| **Content Security Policy** in Next.js, mass assignment, clickjacking | Real-world XSS defence beyond "React escapes for you" | 6, 7 |
+| Login brute force and credential stuffing | Rate limiting per IP alone doesn't stop them | 8 |
+| **SSRF** | Mini-build B sends requests to URLs that users give you | 8 |
+| **HMAC signatures** and **API keys** | Stripe webhooks, Mini-build B, machine-to-machine access | 8 |
+| Supply chain safety, secret scanning, safe logging | npm attacks are real and recent | 8 |
+| **Audit log**, step-up authentication, two-factor login (TOTP) | Project 1 needs an audit log; 2FA is expected in SaaS | 9 |
+
+### Topics left for later (on purpose)
+
+| Topic | When |
+| --- | --- |
+| Automated tests for all of this (Jest, Supertest, Testcontainers) | Next section, Testing |
+| Redis-backed rate limiting and session cache | Month 2, caching |
+| Sending emails through a queue (BullMQ) | Month 2, background work |
+| AWS IAM, Secrets Manager, WAF | Month 3 |
+| Prompt injection and AI safety | Phase 2 |
+| Passkeys (WebAuthn) in depth, enterprise SSO (SAML), SCIM | Only if a job needs it; a short preview is in Lesson 9 |
+
+## Setup
+
+You need the booking API from the PostgreSQL project, plus a local email inbox. **Mailpit** catches every email your app sends and shows it in a web page, so you never send real emails while learning. Add it to the `docker-compose.yml` that runs Postgres:
+
+```yaml
+  mail:
+    image: axllent/mailpit
+    container_name: booking-mail
+    ports:
+      - "1025:1025"   # SMTP: your app sends here
+      - "8025:8025"   # web UI: open http://localhost:8025
+```
+
+Install the packages you'll use in this section:
+
+```powershell
+npm i argon2 @nestjs/jwt cookie-parser @nestjs/throttler helmet openid-client nodemailer
+npm i -D @types/cookie-parser @types/nodemailer
+```
+
+Add these to your Zod `EnvSchema` from [NestJS Lesson 6](/docs/nestjs/lesson-6-config-and-decorators) (and to `.env.example` without real values):
+
+```typescript
+APP_URL: z.string().url(),                   // the frontend, e.g. http://localhost:3001
+JWT_SECRET: z.string().min(32),              // already there
+COOKIE_SECRET: z.string().min(32),           // signs short-lived cookies (Lesson 5)
+SMTP_URL: z.string().url(),                  // smtp://localhost:1025 for Mailpit
+GOOGLE_CLIENT_ID: z.string().min(1),         // Lesson 5
+GOOGLE_CLIENT_SECRET: z.string().min(1),
+GOOGLE_REDIRECT_URI: z.string().url(),
+ENCRYPTION_KEY: z.string().length(44),       // 32 random bytes in base64 (Lesson 9)
+```
+
+Generate random secrets like this (never type them yourself):
+
+```powershell
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
+```
+
+## How each lesson works
+
+Same as before: type the examples yourself, do the exercises without help, send them to Claude for a scored review, then check the [Solutions](/docs/auth-security/solutions). Write your mistakes in each page's notes box and practise the interview answers out loud.
+
+Security has one extra rule: **attack your own code**. Most exercises end with "now try to break it". Write down what you tried, even when it failed. That list becomes the security section of your README, and it's great interview material.
+
+## Schedule (about 3 weeks)
+
+| When | What |
+| --- | --- |
+| Week 1 | Lessons 1, 2, 3 (Lesson 3 is the hardest; take two sessions) |
+| Week 2 | Lessons 4, 5, 6 (Lesson 6 is the most important for Project 1) |
+| Week 3 | Lessons 7, 8, 9 |
+| Week 3, Friday block | [Practice project](/docs/auth-security/practice-project) |
+
+Then: the Testing section, where you write automated tests for everything you built here.
+
+**Done means:** a real person can sign up, verify their email, log in with a password or Google, invite a teammate and stay logged in for weeks; a stolen refresh token is detected; one business can never read or change another's data; and you can explain sessions vs JWT, token storage, CSRF, CORS and XSS in English without notes.

@@ -1,0 +1,383 @@
+---
+title: "Lesson 4: Email verification, password reset and invites"
+description: "Rules for safe one-time links, a reusable token service, sending email to Mailpit, link scanners and the URL fragment trick, email verification, forgot and reset password without enumeration, changing email, and team invites with role rules."
+---
+
+Three features that every SaaS has, and that are full of security bugs in real code: **verify your email**, **forgot password** and **invite a teammate**. They all work the same way: the server emails a link with a secret token, and whoever has the link can do one specific thing. Get the token rules right once and all three are safe.
+
+## Rules for one-time links
+
+| Rule | Why |
+| --- | --- |
+| **32 random bytes** from `crypto.randomBytes` | `Math.random()`, user IDs, timestamps or UUID v7 (which contains the time) can be guessed |
+| Store only the **SHA-256 hash** | A database leak doesn't give working links |
+| **Expire** them: verify 24 h, reset 30–60 min, invite 7 days | An old email in a hacked inbox shouldn't still work |
+| **Single use**, claimed in **one statement** | Two clicks at the same moment must not both succeed |
+| **One purpose** per token | A verify-email token must not work as a reset token |
+| Creating a new one **invalidates older ones** of the same purpose | Only the most recent email works |
+| Build links from `APP_URL` in config, **never from the request's `Host` header** | Otherwise an attacker sends a reset request with `Host: evil.com`, and the victim's reset email points to the attacker's site (**host header injection**) |
+| Keep the token out of logs and `Referer` | See "Link scanners and the URL fragment" below |
+
+## The token table and service
+
+```prisma
+model OneTimeToken {
+  id        String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  purpose   String                                           // 'verify_email' or 'reset_password'
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+  @@map("one_time_tokens")
+}
+```
+
+```sql
+-- in the migration (create-only, then add):
+alter table one_time_tokens add constraint one_time_tokens_purpose_check
+  check (purpose in ('verify_email', 'reset_password'));
+```
+
+```typescript
+// src/auth/one-time-token.service.ts
+export type TokenPurpose = 'verify_email' | 'reset_password';
+
+@Injectable()
+export class OneTimeTokenService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async create(userId: string, purpose: TokenPurpose, ttlMs: number, tx: Prisma.TransactionClient = this.prisma): Promise<string> {
+    const token = randomToken();
+    await tx.oneTimeToken.deleteMany({ where: { userId, purpose, usedAt: null } });   // older links stop working
+    await tx.oneTimeToken.create({
+      data: { userId, purpose, tokenHash: sha256(token), expiresAt: new Date(Date.now() + ttlMs) },
+    });
+    return token;                                   // the only place the raw token exists: it goes into the email
+  }
+
+  /** Marks the token as used and returns its user ID, or null if it's wrong, expired, used or for another purpose. */
+  async consume(token: string, purpose: TokenPurpose, tx: Prisma.TransactionClient = this.prisma): Promise<string | null> {
+    const rows = await tx.$queryRaw<{ user_id: string }[]>`
+      update one_time_tokens
+      set used_at = now()
+      where token_hash = ${sha256(token)}
+        and purpose = ${purpose}
+        and used_at is null
+        and expires_at > now()
+      returning user_id`;
+    return rows[0]?.user_id ?? null;
+  }
+}
+```
+
+`consume` checks everything **and** marks the token used in one `update ... returning`. Two clicks at the same moment: one gets the user ID, the other gets `null`.
+
+Notice that `consume` never says **why** a token failed (expired? used? wrong?). The user sees one message: "This link is invalid or has expired."
+
+## Sending email
+
+For now, send directly with Nodemailer to Mailpit. In Month 2, the same class puts a job on a BullMQ queue instead.
+
+```typescript
+// src/auth/auth-emails.ts
+import nodemailer, { type Transporter } from 'nodemailer';
+
+@Injectable()
+export class AuthEmails {
+  private readonly transport: Transporter;
+  private readonly appUrl: string;
+
+  constructor(config: ConfigService<Env, true>) {
+    this.transport = nodemailer.createTransport(config.get('SMTP_URL', { infer: true }));
+    this.appUrl = config.get('APP_URL', { infer: true });       // never req.headers.host
+  }
+
+  private link(path: string, token: string): string {
+    const url = new URL(path, this.appUrl);
+    url.hash = `token=${token}`;                                // fragment: see below
+    return url.href;
+  }
+
+  async sendVerifyEmail(to: string, name: string, token: string): Promise<void> {
+    const link = this.link('/verify-email', token);
+    await this.transport.sendMail({
+      from: 'Booking <no-reply@booking.test>',
+      to,
+      subject: 'Verify your email',
+      text: `Hi ${name},\n\nConfirm your email address: ${link}\n\nThis link expires in 24 hours.`,
+    });
+  }
+
+  // sendAlreadyRegistered, sendPasswordReset, sendPasswordChanged, sendInvite: same pattern
+}
+```
+
+<Callout type="warn" title="User input in emails">
+`name` comes from the user. In a **text** email it's harmless, but in an **HTML** email, escape it, or someone signs up with the name `<a href="https://evil.com">Click to claim your prize</a>` and your server sends that link to whoever they invite. Also never put user input in the subject line without removing new lines.
+</Callout>
+
+### Link scanners and the URL fragment
+
+Two real-world problems with links in emails:
+
+1. **Email security scanners** (Outlook, corporate gateways) open every link in an email to check it for malware. If `GET /verify?token=...` consumes the token, the scanner uses it before the user does, and a password reset link is "already used" when the user clicks it.
+2. **Tokens in the query string leak.** They're written to server and proxy logs, and sent in the `Referer` header to any third-party script or image on the page.
+
+The fix for both:
+
+- Put the token in the **fragment** (`/reset-password#token=abc`). Browsers never send the part after `#` to any server, so it's not in logs or `Referer`.
+- The page is a normal frontend page. Its JavaScript reads `location.hash`, removes it from the address bar, and sends the token with a **POST** when the user submits the form (or, for email verification, automatically after the page loads).
+- Scanners that only do a `GET` see a page and consume nothing.
+
+```typescript
+// app/reset-password/page.tsx (frontend, simplified)
+'use client';
+export default function ResetPasswordPage() {
+  const [token] = useState(() => new URLSearchParams(window.location.hash.slice(1)).get('token'));
+  useEffect(() => { history.replaceState(null, '', window.location.pathname); }, []);   // remove the token from the URL bar
+  // form: new password → POST /v1/auth/reset-password { token, password }
+}
+```
+
+## Email verification
+
+```text
+sign-up (Lesson 1) → create user → token (verify_email, 24 h) → email
+user opens link    → page → POST /v1/auth/verify-email { token } → set email_verified_at → "Verified! Log in"
+```
+
+```typescript
+// in AccountsService (sign-up from Lesson 1 now creates the token in the same transaction)
+async verifyEmail(token: string): Promise<void> {
+  await this.prisma.$transaction(async (tx) => {
+    const userId = await this.tokens.consume(token, 'verify_email', tx);
+    if (!userId) throw new BadRequestException('This link is invalid or has expired');
+    await tx.user.update({ where: { id: userId }, data: { emailVerifiedAt: new Date() } });
+  });
+}
+```
+
+Also add `POST /v1/auth/resend-verification { email }`: always 202, and it only sends if the user exists **and** isn't verified yet. Rate-limit it (Lesson 8), because every call sends an email from your domain.
+
+What unverified users can do is a product decision. In Project 1, they can't log in at all (Lesson 1). A softer option: let them in but block anything that sends email to others or proves identity (inviting, accepting invites, connecting Stripe).
+
+## Forgot and reset password
+
+```text
+POST /v1/auth/forgot-password { email }
+  → always 202 "If an account exists for this email, we sent a link."
+  user exists → token (reset_password, 30 min) → email
+  no user     → nothing (or an email saying "someone asked to reset; you don't have an account")
+
+POST /v1/auth/reset-password { token, password }
+  → check the new password (length, breached)
+  → hash it
+  → transaction: consume token, update password_hash, set email_verified_at if empty, revoke ALL sessions
+  → email "Your password was changed. If this wasn't you, contact us."
+  → 204; the user logs in with the new password
+```
+
+```typescript
+async resetPassword(token: string, newPassword: string): Promise<void> {
+  if (await isBreachedPassword(newPassword)) throw new BadRequestException('This password has appeared in a data breach.');
+  const passwordHash = await this.passwords.hash(newPassword);       // slow work outside the transaction
+
+  const user = await this.prisma.$transaction(async (tx) => {
+    const userId = await this.tokens.consume(token, 'reset_password', tx);
+    if (!userId) throw new BadRequestException('This link is invalid or has expired');
+
+    await tx.session.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date(), revokedReason: 'password_reset' },
+    });
+    const current = await tx.user.findUniqueOrThrow({ where: { id: userId } });
+    return tx.user.update({
+      where: { id: userId },
+      data: { passwordHash, emailVerifiedAt: current.emailVerifiedAt ?? new Date() },   // the link proved they own the email
+    });
+  });
+
+  await this.emails.sendPasswordChanged(user.email, user.name);
+}
+```
+
+Details that matter:
+
+- The password checks run **before** `consume`, so a weak password doesn't burn the link.
+- Throwing inside this transaction is fine: there's nothing to keep if the token is bad. (Compare Lesson 3, where the revoke had to be kept.)
+- **Revoke all sessions**: if an attacker was logged in, they're out now.
+- **Timing:** for an existing email, `forgot-password` writes a token and talks to the SMTP server, so it's slower than for an unknown email. Don't `await` the email in the request (send it in the background and log errors), and in Month 2 put it on a queue. Then both paths take the same time.
+
+## Changing the email address
+
+Easy to get wrong, so here are the rules even though you won't build it now:
+
+1. Require the current password (or a fresh login, Lesson 9).
+2. Don't change `email` yet. Send a verification link to the **new** address.
+3. When the link is used, change the email, and send a notice to the **old** address ("Your email was changed to n\*\*\*@gmail.com. Not you? Contact us.").
+
+If you change the email immediately, anyone who steals a session can move the account to their own address and then reset the password.
+
+## Team invites
+
+Project 1 says "invite teammates by email". An invitation is a one-time link with extra data: **which business** and **which role**.
+
+```prisma
+model Invitation {
+  id           String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  businessId   String    @map("business_id") @db.Uuid
+  email        String                                       // lowercase
+  role         Role
+  tokenHash    String    @unique @map("token_hash")
+  invitedById  String    @map("invited_by_id") @db.Uuid
+  expiresAt    DateTime  @map("expires_at") @db.Timestamptz(3)
+  acceptedAt   DateTime? @map("accepted_at") @db.Timestamptz(3)
+  acceptedById String?   @map("accepted_by_id") @db.Uuid
+  revokedAt    DateTime? @map("revoked_at") @db.Timestamptz(3)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  business  Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  invitedBy User     @relation(fields: [invitedById], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@map("invitations")
+}
+```
+
+```sql
+-- at most one pending invitation per person per business
+create unique index invitations_pending_key on invitations (business_id, email)
+  where accepted_at is null and revoked_at is null;
+```
+
+### Who can invite whom
+
+| Inviter | Can invite as |
+| --- | --- |
+| owner | owner, admin, staff |
+| admin | staff only |
+| staff | nobody |
+
+The rule behind it: **nobody can give a role higher than their own** (or, for admins, equal to it). Otherwise an admin could invite their own second email as owner and take over the business. This is called **privilege escalation**, and Lesson 6 has more examples.
+
+```typescript
+// src/invitations/invitations.service.ts
+const INVITE_TTL_MS = 7 * 24 * 60 * 60_000;
+
+async invite(actor: AuthUser, dto: InviteDto): Promise<void> {          // dto.email is lowercased by the DTO
+  if (actor.role === 'admin' && dto.role !== 'staff') {
+    throw new ForbiddenException('Admins can only invite staff');
+  }
+
+  const token = randomToken();
+  const invitation = await this.prisma.$transaction(async (tx) => {
+    const member = await tx.membership.findFirst({
+      where: { businessId: actor.businessId, user: { email: dto.email } },
+      select: { userId: true },
+    });
+    if (member) throw new ConflictException('This person is already a member');
+
+    // Re-inviting replaces the old pending invitation (and its link)
+    await tx.invitation.updateMany({
+      where: { businessId: actor.businessId, email: dto.email, acceptedAt: null, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    return tx.invitation.create({
+      data: {
+        businessId: actor.businessId, email: dto.email, role: dto.role,
+        tokenHash: sha256(token), invitedById: actor.id,
+        expiresAt: new Date(Date.now() + INVITE_TTL_MS),
+      },
+      select: { business: { select: { name: true } } },
+    });
+  });
+
+  await this.emails.sendInvite(dto.email, invitation.business.name, token);
+}
+```
+
+### Accepting an invite
+
+The person may already have an account, or not:
+
+```text
+link → /invite#token=... page
+  logged in                 → POST /v1/invitations/accept { token }
+  has an account, logged out → log in first, then accept
+  no account                 → sign up (the invite page passes the token along), then accept
+```
+
+```typescript
+async accept(token: string, user: SessionUser): Promise<{ businessId: string }> {
+  return this.prisma.$transaction(async (tx) => {
+    const invitation = await tx.invitation.findUnique({ where: { tokenHash: sha256(token) } });
+    if (!invitation || invitation.acceptedAt || invitation.revokedAt || invitation.expiresAt <= new Date()) {
+      throw new BadRequestException('This invitation is invalid or has expired');
+    }
+
+    const me = await tx.user.findUniqueOrThrow({ where: { id: user.id } });
+    if (me.email !== invitation.email) {
+      throw new ForbiddenException('This invitation was sent to a different email address');
+    }
+
+    // Claim it: only one request can accept (two clicks, two tabs)
+    const claimed = await tx.invitation.updateMany({
+      where: { id: invitation.id, acceptedAt: null, revokedAt: null },
+      data: { acceptedAt: new Date(), acceptedById: me.id },
+    });
+    if (claimed.count === 0) throw new BadRequestException('This invitation is invalid or has expired');
+
+    await tx.membership.upsert({
+      where: { businessId_userId: { businessId: invitation.businessId, userId: me.id } },
+      create: { businessId: invitation.businessId, userId: me.id, role: invitation.role },
+      update: {},                                           // already a member: keep the current role
+    });
+    if (!me.emailVerifiedAt) {
+      await tx.user.update({ where: { id: me.id }, data: { emailVerifiedAt: new Date() } });  // the link proved the email
+    }
+    return { businessId: invitation.businessId };
+  });
+}
+```
+
+Why check that the email matches? Invitation links get forwarded, pasted into Slack, or seen over someone's shoulder. Without the check, **anyone with the link** joins the business with the invited role. Some products allow "anyone with the link"; that must be a conscious product choice, not an accident.
+
+Also add `GET /v1/invitations` (pending list) and `DELETE /v1/invitations/:id` (revoke) for owners and admins, both scoped by `businessId`. And rate-limit invites: an invite endpoint is an "send any email you like from our domain" button for spammers.
+
+## Mistakes to avoid
+
+- Tokens from `Math.random()`, UUIDs or timestamps.
+- Storing raw tokens, or putting them in the query string.
+- Consuming a token on `GET` (link scanners use it up).
+- Building links from the `Host` header.
+- "No account with that email" on forgot-password.
+- Not revoking sessions after a password reset.
+- Not limiting which roles an admin can invite.
+- Accepting an invite without checking the email, or accepting it twice in a race.
+- User input (names, business names) in HTML emails without escaping.
+
+## Exercises
+
+- **4.1** 🟢 For each of these, say which rule it breaks and what an attacker could do: (a) reset token = `base64(userId + ':' + Date.now())`; (b) `https://app.com/reset?token=...` with Google Analytics on the reset page; (c) reset links that work for 7 days; (d) `` const link = `https://${req.headers.host}/reset#token=${t}` ``.
+- **4.2** 🟡 Build `OneTimeTokenService`, email verification (with resend) and forgot/reset password, sending to Mailpit. Check every email at http://localhost:8025. Then try: using a reset link twice, using a verify-email token on the reset endpoint, and using an old reset link after requesting a new one. All must fail with the same message.
+- **4.3** 🟡 Build invitations: create (with the role rules), list, revoke, accept. Test the race: send `accept` twice in parallel with `Promise.all`. Exactly one must succeed, and there must be exactly one membership.
+- **4.4** 🔴 **Attack it.** Write a script that measures the response time of `forgot-password` for 20 existing and 20 unknown emails, first with `await this.emails.send...` and then with the email sent in the background. Write down both results. Then explain in two sentences what an attacker could learn from the first version.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How would you build a password reset flow securely?"**
+
+> "The forgot-password endpoint always returns the same response, so it doesn't reveal which emails have accounts, and it sends the email in the background so the timing doesn't reveal it either. If the user exists, I generate 32 random bytes, store only the SHA-256 hash with a purpose, a 30-minute expiry and a used-at column, and email a link built from a configured base URL, never the Host header. I put the token in the URL fragment, so it doesn't end up in logs, and the page submits it with a POST, so email scanners can't use it up. The reset endpoint claims the token in a single update statement so it works only once, sets the new password hash, revokes all of the user's sessions and sends a 'your password was changed' email."
+
+**"How do team invitations work in your app?"**
+
+> "An owner or admin invites an email address with a role. Admins can only invite staff, so nobody can grant a role higher than their own. The invitation is a one-time token, hashed in the database, valid for seven days, and re-inviting replaces the old link. When someone accepts, I check the invitation is still valid and that the logged-in user's email matches the invited email, then in one transaction I claim the invitation atomically and create the membership. Accepting also verifies their email, because the link proved they can read that inbox."

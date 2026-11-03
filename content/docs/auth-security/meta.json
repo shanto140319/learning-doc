@@ -1,0 +1,18 @@
+{
+  "title": "Auth and security",
+  "pages": [
+    "index",
+    "lesson-1-passwords",
+    "lesson-2-sessions-and-jwt",
+    "lesson-3-refresh-tokens",
+    "lesson-4-email-flows",
+    "lesson-5-google-login",
+    "lesson-6-authorisation",
+    "lesson-7-browser-security",
+    "lesson-8-abuse-and-secrets",
+    "lesson-9-audit-and-2fa",
+    "practice-project",
+    "solutions",
+    "cheat-sheet"
+  ]
+}

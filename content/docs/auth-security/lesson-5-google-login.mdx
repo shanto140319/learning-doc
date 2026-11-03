@@ -1,0 +1,344 @@
+---
+title: "Lesson 5: Google login with OAuth and OpenID Connect"
+description: "OAuth 2.0 vs OpenID Connect, the authorization code flow with PKCE, state and nonce, implementing Sign in with Google in NestJS with openid-client, linking accounts without account takeover, safe redirects after login, and the build-vs-buy decision."
+---
+
+"Sign in with Google" removes passwords for many users, and most B2B customers expect it. It's also where many apps have serious bugs: login CSRF, stolen authorization codes, open redirects and, the worst one, **linking a Google login to the wrong account**. This lesson builds it properly, with a library doing the crypto.
+
+## OAuth 2.0 vs OpenID Connect
+
+| | OAuth 2.0 | OpenID Connect (OIDC) |
+| --- | --- | --- |
+| Purpose | **Authorisation**: let an app act on your behalf ("read my Google Calendar") | **Authentication**: tell the app **who you are** |
+| What you get | An **access token** for the provider's API | An access token **plus an ID token**: a signed JWT with `sub`, `email`, `email_verified`, `name` |
+| Built on | | OAuth 2.0 |
+
+"Sign in with Google" is **OIDC**. People say "OAuth" because OIDC is a layer on top of it. In an interview, using the right word shows you know the difference.
+
+The important ID token claims:
+
+| Claim | Meaning | Use it as… |
+| --- | --- | --- |
+| `sub` | Google's permanent ID for this person | **The** identity key |
+| `email` | Their email **today** (it can change) | Contact info; matching with care |
+| `email_verified` | Google confirmed they own that address | Required before you trust `email` |
+| `iss`, `aud`, `exp`, `nonce` | Who issued it, for which app, until when, for which login attempt | Checked by the library |
+
+## The authorization code flow with PKCE
+
+```text
+1. Browser → GET /v1/auth/google
+   API creates: state, nonce, code_verifier (random), code_challenge = SHA-256(code_verifier)
+   API stores them in a short-lived, signed, httpOnly cookie
+   API → 302 to accounts.google.com/...?client_id&redirect_uri&scope=openid email profile
+                                         &state&nonce&code_challenge&code_challenge_method=S256
+
+2. The user logs in at Google and agrees
+
+3. Google → 302 to /v1/auth/google/callback?code=...&state=...
+
+4. API checks: state in the URL = state in the cookie
+   API → POST to Google's token endpoint: code + code_verifier + client_secret
+   Google checks SHA-256(code_verifier) = the code_challenge from step 1
+   Google → ID token (+ access token)
+   API checks the ID token: signature (Google's public keys), iss, aud, exp, nonce
+
+5. API finds or creates the user, starts a session (Lessons 2–3), sets cookies, 302 to the app
+```
+
+What each random value stops:
+
+| Value | Attack it stops |
+| --- | --- |
+| `state` | **Login CSRF:** an attacker sends you a callback link with **their** code, and you end up logged in to the attacker's account (then you save your card details into it) |
+| `code_verifier` / `code_challenge` (**PKCE**) | **Code interception:** someone who steals the `code` from the redirect (logs, a malicious browser extension) can't exchange it without the verifier |
+| `nonce` | **ID token replay:** an old ID token can't be used for a new login |
+
+Don't use the old **implicit flow** (tokens directly in the redirect URL). It's deprecated. Always use the code flow with PKCE, and do the token exchange on the **server**, where the client secret lives.
+
+## Setup in Google Cloud
+
+1. In the Google Cloud console, create a project, configure the OAuth consent screen (app name, support email; "External", testing mode is fine).
+2. Create an **OAuth client ID** of type "Web application".
+3. Add the **authorized redirect URI** exactly as the browser sees it. With the Next.js proxy from Lesson 2: `http://localhost:3001/v1/auth/google/callback` (your frontend port).
+4. Put the client ID, secret and redirect URI in `.env`.
+
+Google compares the redirect URI **exactly**. A trailing slash or `127.0.0.1` vs `localhost` is a different URI.
+
+## The identity table
+
+One user can have several ways to log in (a password, Google, later Microsoft). Keep them in a separate table:
+
+```prisma
+model UserIdentity {
+  provider       String                                    // 'google'
+  providerUserId String   @map("provider_user_id")         // the `sub` claim
+  userId         String   @map("user_id") @db.Uuid
+  email          String                                    // the email at the provider, for display
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, providerUserId])
+  @@index([userId])
+  @@map("user_identities")
+}
+```
+
+Add `identities UserIdentity[]` to `User`. The primary key `(provider, provider_user_id)` means one Google account can belong to only one user.
+
+## The Google service
+
+[`openid-client`](https://github.com/panva/openid-client) is a certified OIDC library. It handles discovery, PKCE, the token exchange and ID token checks.
+
+```typescript
+// src/auth/google/google-oidc.service.ts
+import * as oidc from 'openid-client';
+
+export type GoogleLoginState = { state: string; nonce: string; codeVerifier: string; returnTo: string };
+export type GoogleProfile = { sub: string; email: string; emailVerified: boolean; name: string };
+
+@Injectable()
+export class GoogleOidcService {
+  private configPromise?: Promise<oidc.Configuration>;
+
+  constructor(private readonly config: ConfigService<Env, true>) {}
+
+  // Discovery downloads Google's endpoints and keys. Do it lazily, so the app can start when Google is unreachable
+  private getConfig(): Promise<oidc.Configuration> {
+    this.configPromise ??= oidc.discovery(
+      new URL('https://accounts.google.com'),
+      this.config.get('GOOGLE_CLIENT_ID', { infer: true }),
+      this.config.get('GOOGLE_CLIENT_SECRET', { infer: true }),
+    );
+    return this.configPromise;
+  }
+
+  async start(returnTo: string): Promise<{ url: URL; saved: GoogleLoginState }> {
+    const config = await this.getConfig();
+    const codeVerifier = oidc.randomPKCECodeVerifier();
+    const saved: GoogleLoginState = { state: oidc.randomState(), nonce: oidc.randomNonce(), codeVerifier, returnTo };
+
+    const url = oidc.buildAuthorizationUrl(config, {
+      redirect_uri: this.config.get('GOOGLE_REDIRECT_URI', { infer: true }),
+      scope: 'openid email profile',
+      code_challenge: await oidc.calculatePKCECodeChallenge(codeVerifier),
+      code_challenge_method: 'S256',
+      state: saved.state,
+      nonce: saved.nonce,
+    });
+    return { url, saved };
+  }
+
+  async finish(callbackQuery: string, saved: GoogleLoginState): Promise<GoogleProfile> {
+    const config = await this.getConfig();
+    // Rebuild the callback URL from config, not from the Host header
+    const callbackUrl = new URL(this.config.get('GOOGLE_REDIRECT_URI', { infer: true }));
+    callbackUrl.search = callbackQuery;
+
+    const tokens = await oidc.authorizationCodeGrant(config, callbackUrl, {
+      pkceCodeVerifier: saved.codeVerifier,
+      expectedState: saved.state,
+      expectedNonce: saved.nonce,
+    });
+    const claims = tokens.claims();                 // the checked ID token
+    if (!claims || typeof claims.email !== 'string') throw new UnauthorizedException('Google did not return an email');
+
+    return {
+      sub: claims.sub,
+      email: claims.email.toLowerCase(),
+      emailVerified: claims.email_verified === true,
+      name: typeof claims.name === 'string' ? claims.name.slice(0, 100) : '',
+    };
+  }
+}
+```
+
+`openid-client` v6 is published as an ES module. Node 22.12 and later can load it from NestJS's CommonJS build. If you see `ERR_REQUIRE_ESM`, upgrade Node.
+
+## The controller
+
+```typescript
+// src/auth/google/google-auth.controller.ts
+const STATE_COOKIE = 'google_oidc';
+const STATE_PATH = '/v1/auth/google';
+
+@Controller('auth/google')
+export class GoogleAuthController {
+  constructor(
+    private readonly google: GoogleOidcService,
+    private readonly accounts: AccountsService,
+    private readonly sessions: SessionsService,
+    private readonly config: ConfigService<Env, true>,
+  ) {}
+
+  @Public()
+  @Get()
+  async start(@Query('returnTo') returnTo: unknown, @Res() res: Response): Promise<void> {
+    const { url, saved } = await this.google.start(safeReturnTo(returnTo));
+    res.cookie(STATE_COOKIE, JSON.stringify(saved), {
+      httpOnly: true, secure: true, signed: true,   // signed with COOKIE_SECRET: can't be changed by the client
+      sameSite: 'lax',                              // must be Lax: Google's redirect back is a cross-site navigation
+      path: STATE_PATH,
+      maxAge: 10 * 60_000,
+    });
+    res.redirect(url.href);
+  }
+
+  @Public()
+  @Get('callback')
+  async callback(@Req() req: Request, @Res() res: Response): Promise<void> {
+    const appUrl = this.config.get('APP_URL', { infer: true });
+    const saved = parseLoginState(req.signedCookies?.[STATE_COOKIE]);   // validate the shape (Zod); false/undefined if missing or tampered
+    res.clearCookie(STATE_COOKIE, { path: STATE_PATH });                // one attempt per cookie
+    if (!saved) return res.redirect(new URL('/login?error=google', appUrl).href);
+
+    try {
+      const query = new URL(req.originalUrl, 'http://placeholder').search;
+      const profile = await this.google.finish(query, saved);
+      const user = await this.accounts.findOrCreateFromGoogle(profile);
+      setAuthCookies(res, await this.sessions.start(user.id, { ip: req.ip, userAgent: req.get('user-agent') }));
+      res.redirect(new URL(saved.returnTo, appUrl).href);
+    } catch {
+      // includes the user pressing "Cancel" at Google (?error=access_denied)
+      res.redirect(new URL('/login?error=google', appUrl).href);
+    }
+  }
+}
+```
+
+Why `sameSite: 'lax'` and not `'strict'` here: the callback request comes from Google's page, which is a **different site**. `Strict` cookies aren't sent on that navigation, so the state cookie would be missing and every login would fail. `Lax` cookies **are** sent on top-level `GET` navigations. That's exactly the case `Lax` was designed for.
+
+### Safe redirects after login
+
+"Log in, then go back to the page you were on" needs a `returnTo` value. If you redirect to whatever it says, you have an **open redirect**: `https://app.com/v1/auth/google?returnTo=https://evil.com/fake-login` looks like your site in a phishing email, then lands on the attacker's page.
+
+```typescript
+export function safeReturnTo(value: unknown): string {
+  if (typeof value !== 'string') return '/dashboard';
+  // Only paths on our own site: "/bookings" yes; "//evil.com", "/\evil.com", "https://evil.com" no
+  if (!value.startsWith('/') || value.startsWith('//') || value.startsWith('/\\')) return '/dashboard';
+  return value;
+}
+```
+
+And `new URL(saved.returnTo, appUrl)` keeps it on your domain. Use the same function on the password login page.
+
+## Linking accounts safely
+
+This is the part most tutorials get wrong. When a Google login arrives, there are three cases:
+
+```text
+1. (google, sub) already in user_identities   → log in that user. Done.
+2. No identity, but a user with this email exists → link? DANGER ZONE
+3. No identity, no user                         → create a user (email verified), add the identity
+```
+
+**Never link or log in based on email alone when the email isn't verified.** Google's `email_verified` must be `true`.
+
+Case 2 has a subtle attack called **pre-account takeover**:
+
+1. The attacker knows `nadia@gmail.com` will use your app. They sign up with that email and **their own password**. They can't verify the email, but the account exists.
+2. Later, Nadia clicks "Sign in with Google". Your code finds a user with her email and links Google to it.
+3. Nadia uses the account and adds her business. The attacker still knows **the password** and logs in too.
+
+The rule: if the existing account's email was **never verified**, the person signing in with Google has just proved they own the email, so they are the real owner. **Remove the password and revoke all sessions** before linking.
+
+```typescript
+// in AccountsService
+async findOrCreateFromGoogle(profile: GoogleProfile): Promise<User> {
+  return this.prisma.$transaction(async (tx) => {
+    const identity = await tx.userIdentity.findUnique({
+      where: { provider_providerUserId: { provider: 'google', providerUserId: profile.sub } },
+      include: { user: true },
+    });
+    if (identity) return identity.user;                                  // case 1
+
+    if (!profile.emailVerified) throw new UnauthorizedException('Your Google email is not verified');
+
+    const existing = await tx.user.findUnique({ where: { email: profile.email } });
+    if (existing) {                                                      // case 2
+      if (!existing.emailVerifiedAt) {
+        // Someone created this account without proving they own the email. Google just proved it.
+        await tx.session.updateMany({
+          where: { userId: existing.id, revokedAt: null },
+          data: { revokedAt: new Date(), revokedReason: 'account_claimed_by_email_owner' },
+        });
+        await tx.user.update({
+          where: { id: existing.id },
+          data: { passwordHash: null, emailVerifiedAt: new Date() },
+        });
+      }
+      await tx.userIdentity.create({
+        data: { provider: 'google', providerUserId: profile.sub, userId: existing.id, email: profile.email },
+      });
+      return existing;
+    }
+
+    return tx.user.create({                                              // case 3
+      data: {
+        email: profile.email,
+        name: profile.name || profile.email.split('@')[0],
+        emailVerifiedAt: new Date(),
+        identities: { create: { provider: 'google', providerUserId: profile.sub, email: profile.email } },
+      },
+    });
+  });
+}
+```
+
+A stricter option for case 2, used by many banks and B2B tools: don't link automatically. Show "An account with this email exists. Log in with your password to connect Google." Then link from the settings page while logged in. Choose one and write the reason in your README.
+
+Other rules:
+
+- After linking, a Google login is **not** a way around 2FA. If the account has 2FA (Lesson 9), ask for the code after Google too.
+- Let users **unlink** Google only if they still have another way to log in (a password or another provider). Otherwise they lock themselves out.
+
+## Passport: what you'll see in existing codebases
+
+Many NestJS projects use `@nestjs/passport` with `passport-google-oauth20` (and `passport-jwt` for access tokens). Passport wraps the same flow in "strategies" and guards (`AuthGuard('google')`). You should be able to read it, and you should check that it has `state: true` and PKCE turned on, and that the `validate()` function follows the linking rules above. The flow and the risks are the same; only the wrapping is different.
+
+## Build or buy?
+
+You built auth yourself to **understand** it. In a job, the decision depends on the product:
+
+| Option | What it is | Good when | Watch out for |
+| --- | --- | --- | --- |
+| Your own code | What you built in Lessons 1–5 | You need full control, or it's a learning or portfolio project | You own every bug and every new feature (2FA, passkeys, SSO) |
+| **Better Auth** | Open-source TypeScript auth library; runs in your app, stores data in your Postgres | TypeScript teams that want control without writing it all | It runs inside your app, so you still operate it |
+| **Auth.js** (NextAuth) | Auth library for Next.js | Next.js-only apps | Less natural when a separate NestJS API owns the users |
+| **Clerk, Auth0, WorkOS, Cognito** | Hosted auth services | Fast start; enterprise needs like SAML SSO and SCIM (WorkOS, Auth0) | Monthly cost per active user, vendor lock-in, user data stored outside your database |
+
+For Project 1, building it yourself is right: it's a portfolio project and the point is to show you understand it. In an interview, say both: "I've built it from scratch so I know how it works, and in a real product I'd consider Better Auth or a hosted provider, depending on cost and enterprise requirements."
+
+## Mistakes to avoid
+
+- Linking or logging in by email without checking `email_verified`.
+- Linking to an unverified existing account without removing its password.
+- Using `email` instead of `sub` as the identity key.
+- Skipping `state` or PKCE, or comparing state yourself and getting it wrong (let the library do it).
+- `sameSite: 'strict'` on the state cookie (every login fails).
+- Redirecting to any `returnTo` value (open redirect).
+- Building the callback URL from the `Host` header.
+- Showing raw OAuth errors to the user instead of a friendly "Google sign-in failed, try again".
+
+## Exercises
+
+- **5.1** 🟢 For each value (`state`, `nonce`, `code_verifier`), describe in two sentences what an attacker could do if you left it out.
+- **5.2** 🟡 Build "Sign in with Google": the `UserIdentity` model, `GoogleOidcService`, the controller and `findOrCreateFromGoogle`. Test all three linking cases: new user, existing verified user, existing **unverified** user (sign up with password, don't verify, then use Google with the same email). In the third case, check in `psql` that `password_hash` is now null.
+- **5.3** 🟡 **Attack it.** Try `returnTo` values: `/bookings`, `//evil.com`, `/\evil.com`, `https://evil.com`, `javascript:alert(1)`, `/%2F%2Fevil.com`. Write down where each one ends up. Then change the `state` value in the callback URL by one character: what happens?
+- **5.4** 🔴 Add `GET /v1/me/identities` and `DELETE /v1/me/identities/google`. Unlinking must fail with 409 if it would leave the user with no way to log in. Then write a short "build vs buy" note for Project 1 (5–8 sentences) that you could say in an interview.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How does 'Sign in with Google' work?"**
+
+> "It's OpenID Connect, which is an identity layer on top of OAuth 2.0. My backend redirects the user to Google with a state value, a nonce and a PKCE code challenge, which I keep in a short-lived signed cookie. Google redirects back with a one-time code. The backend checks the state, then exchanges the code plus the PKCE verifier and the client secret for tokens, server to server. The ID token is a JWT signed by Google, and the library verifies its signature, issuer, audience, expiry and nonce. Then I find the user by Google's subject ID, not the email, create a session and set my own cookies. State stops login CSRF, PKCE stops stolen codes being used, and the nonce stops ID token replay."
+
+**"What can go wrong when you link a social login to an existing account?"**
+
+> "The classic bug is pre-account takeover. An attacker registers with the victim's email and a password before the victim does. When the victim later signs in with Google and the app links by email, the attacker's password still works. So I only match by email when the provider says the email is verified, I key identities by the provider's subject ID, and if the existing account's email was never verified, I remove its password and revoke its sessions before linking, because the Google login has just proved who owns that email."
