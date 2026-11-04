@@ -3,15 +3,12 @@
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
 
-// Where the last-read position lives:
-// - the server (/api/last-read, SQLite): survives clearing the browser, shared by every browser on this server
-// - localStorage: an instant local copy, so the card shows without waiting for the network
-// The newer of the two (by savedAt) wins.
+// The last-read position lives only on the server (/api/last-read, SQLite).
+// No localStorage: one source of truth, shared by every browser on this server.
 
-const STORAGE_KEY = 'learning-docs:last-read';
-// Set when "Continue reading" is clicked, so the next page knows where to scroll.
-const RESUME_KEY = 'learning-docs:resume';
 const API_URL = '/api/last-read';
+// Old versions kept a copy here. Removed once on load so stale data doesn't linger.
+const OLD_STORAGE_KEY = 'learning-docs:last-read';
 
 type LastRead = {
   url: string;
@@ -20,9 +17,7 @@ type LastRead = {
   savedAt: number;
 };
 
-type Resume = { url: string; scrollY: number };
-
-// localStorage and the API can hold anything (old formats, manual edits), so check the shape.
+// The API can return anything (old formats, manual DB edits), so check the shape.
 function isLastRead(value: unknown): value is LastRead {
   return (
     typeof value === 'object' && value !== null &&
@@ -33,34 +28,7 @@ function isLastRead(value: unknown): value is LastRead {
   );
 }
 
-function isResume(value: unknown): value is Resume {
-  return (
-    typeof value === 'object' && value !== null &&
-    'url' in value && typeof value.url === 'string' &&
-    'scrollY' in value && typeof value.scrollY === 'number'
-  );
-}
-
-function readLocal(): LastRead | null {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw === null) return null;
-    const parsed: unknown = JSON.parse(raw);
-    return isLastRead(parsed) ? parsed : null;
-  } catch {
-    return null; // storage blocked or invalid JSON
-  }
-}
-
-function writeLocal(value: LastRead) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
-  } catch {
-    // storage blocked or full: the server copy still works
-  }
-}
-
-async function fetchFromServer(): Promise<LastRead | null> {
+async function fetchLastRead(): Promise<LastRead | null> {
   try {
     const res = await fetch(API_URL, { cache: 'no-store' });
     if (!res.ok) return null;
@@ -68,75 +36,74 @@ async function fetchFromServer(): Promise<LastRead | null> {
     const data = typeof body === 'object' && body !== null && 'data' in body ? body.data : null;
     return isLastRead(data) ? data : null;
   } catch {
-    return null; // offline or server down: fall back to the local copy
+    return null; // offline or server down: show no card
   }
 }
 
-function saveToServer(value: Omit<LastRead, 'savedAt'>, keepalive = false) {
+function saveLastRead(value: { url: string; title: string; scrollY: number }, keepalive = false) {
   // keepalive lets the request finish even when the tab is closing
   void fetch(API_URL, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url: value.url, title: value.title, scrollY: value.scrollY }),
+    body: JSON.stringify(value),
     keepalive,
   }).catch(() => {
-    // offline: the local copy is still saved; the next scroll will try again
+    // offline: the next scroll will try again
   });
 }
 
-function takeResume(url: string): Resume | null {
+function removeOldLocalCopy() {
   try {
-    const raw = sessionStorage.getItem(RESUME_KEY);
-    if (raw === null) return null;
-    sessionStorage.removeItem(RESUME_KEY);
-    const parsed: unknown = JSON.parse(raw);
-    return isResume(parsed) && parsed.url === url ? parsed : null;
+    localStorage.removeItem(OLD_STORAGE_KEY);
   } catch {
-    return null; // sessionStorage blocked or old format: just don't restore
+    // storage blocked: nothing to remove
   }
 }
 
-/** Saves the current page and scroll position, locally and on the server. Renders nothing. */
+// Set when "Continue reading" is clicked, read once by the next page so it can scroll.
+// A module variable is enough: Link navigation keeps the same JavaScript in memory.
+let pendingResume: { url: string; scrollY: number } | null = null;
+
+function takeResume(url: string): number | null {
+  const resume = pendingResume;
+  pendingResume = null;
+  return resume !== null && resume.url === url ? resume.scrollY : null;
+}
+
+/** Saves the current page and scroll position to the server. Renders nothing. */
 export function LastReadTracker({ url, title }: { url: string; title: string }) {
   useEffect(() => {
     let lastSentScrollY: number | null = null;
 
-    const current = (): LastRead => ({ url, title, scrollY: Math.round(window.scrollY), savedAt: Date.now() });
-
-    const saveLocal = () => writeLocal(current());
-    const sendToServer = (keepalive = false) => {
-      const value = current();
-      if (value.scrollY === lastSentScrollY) return; // nothing changed since the last save
-      lastSentScrollY = value.scrollY;
-      saveToServer(value, keepalive);
+    const send = (keepalive = false) => {
+      const scrollY = Math.round(window.scrollY);
+      if (scrollY === lastSentScrollY) return; // nothing changed since the last save
+      lastSentScrollY = scrollY;
+      saveLastRead({ url, title, scrollY }, keepalive);
     };
 
     let restoreTimer: number | undefined;
-    const resume = takeResume(url);
-    if (resume) {
+    const resumeY = takeResume(url);
+    if (resumeY !== null) {
       // Wait a moment so Next.js finishes its own scroll-to-top first.
-      restoreTimer = window.setTimeout(() => window.scrollTo({ top: resume.scrollY }), 100);
+      restoreTimer = window.setTimeout(() => window.scrollTo({ top: resumeY }), 100);
     } else {
-      saveLocal();
-      sendToServer();
+      send();
     }
 
-    // Local saves are cheap: 200 ms after scrolling stops. Server saves: 1.5 s, to send fewer requests.
-    let localTimer: number | undefined;
-    let serverTimer: number | undefined;
+    // Save 1 s after scrolling stops, so we send few requests.
+    let saveTimer: number | undefined;
     const onScroll = () => {
-      window.clearTimeout(localTimer);
-      window.clearTimeout(serverTimer);
-      localTimer = window.setTimeout(saveLocal, 200);
-      serverTimer = window.setTimeout(() => sendToServer(), 1500);
+      window.clearTimeout(saveTimer);
+      saveTimer = window.setTimeout(() => {
+        saveTimer = undefined;
+        send();
+      }, 1000);
     };
 
     // Closing or hiding the tab: send the latest position right away.
     const onHide = () => {
-      if (document.visibilityState === 'hidden') {
-        saveLocal();
-        sendToServer(true);
-      }
+      if (document.visibilityState === 'hidden') send(true);
     };
 
     window.addEventListener('scroll', onScroll, { passive: true });
@@ -144,10 +111,9 @@ export function LastReadTracker({ url, title }: { url: string; title: string }) 
 
     return () => {
       // Leaving the page inside the app (client-side navigation): flush the pending save.
-      if (serverTimer !== undefined) sendToServer(true);
+      if (saveTimer !== undefined) send(true);
       window.clearTimeout(restoreTimer);
-      window.clearTimeout(localTimer);
-      window.clearTimeout(serverTimer);
+      window.clearTimeout(saveTimer);
       window.removeEventListener('scroll', onScroll);
       document.removeEventListener('visibilitychange', onHide);
     };
@@ -166,22 +132,16 @@ function timeAgo(savedAt: number): string {
   return rtf.format(-Math.round(hours / 24), 'day');
 }
 
-/** "Continue reading" card. Shows nothing until a page has been read. */
+/** "Continue reading" card. Shows nothing until the server has a saved page. */
 export function ContinueReading() {
   const [lastRead, setLastRead] = useState<LastRead | null>(null);
 
-  // Read after mount: localStorage doesn't exist during server rendering.
   useEffect(() => {
     let cancelled = false;
-    const local = readLocal();
-    setLastRead(local); // show the local copy immediately
+    removeOldLocalCopy();
 
-    void fetchFromServer().then((server) => {
-      if (cancelled || server === null) return;
-      if (local === null || server.savedAt > local.savedAt) {
-        setLastRead(server);
-        writeLocal(server); // keep the local copy up to date
-      }
+    void fetchLastRead().then((data) => {
+      if (!cancelled) setLastRead(data);
     });
 
     return () => {
@@ -195,12 +155,7 @@ export function ContinueReading() {
     <Link
       href={lastRead.url}
       onClick={() => {
-        try {
-          const resume: Resume = { url: lastRead.url, scrollY: lastRead.scrollY };
-          sessionStorage.setItem(RESUME_KEY, JSON.stringify(resume));
-        } catch {
-          // ignore: the link still works, just without scroll restore
-        }
+        pendingResume = { url: lastRead.url, scrollY: lastRead.scrollY };
       }}
       className="not-prose mb-6 flex items-center justify-between gap-4 rounded-xl border bg-fd-card p-4 text-start no-underline transition-colors hover:bg-fd-accent"
     >
