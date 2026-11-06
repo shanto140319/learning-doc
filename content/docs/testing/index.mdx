@@ -1,0 +1,126 @@
+---
+title: "Testing"
+description: "Automated tests for the booking platform: Jest unit tests with mocked providers, integration tests on a real Postgres with Testcontainers, API tests with Supertest, time and race tests, React component tests, Playwright for critical flows, and tests in CI. Phase 1, Month 2."
+---
+
+Until now, you checked your booking API by hand: run a `curl`, look at the response, run the race script. That works once. It doesn't work after the 50th change, when you can't remember everything that used to work.
+
+Automated tests let you **change code without fear**. They're also part of what makes a project look professional: a CI badge, a `test` folder and a race test you can show an interviewer say "this person ships production code".
+
+All examples test the **booking API** from the [Auth and security practice project](/docs/auth-security/practice-project) (NestJS + Prisma 7 + PostgreSQL 18), plus a small Next.js frontend for Lessons 6 and 7.
+
+<Callout title="My progress">
+- Lesson 1 (why test, what to test, Jest basics): not started
+- Lesson 2 (unit tests in NestJS): not started
+- Lesson 3 (integration tests with Testcontainers): not started
+- Lesson 4 (API tests with Supertest, auth and tenants): not started
+- Lesson 5 (time, outside services and race conditions): not started
+- Lesson 6 (React component tests): not started
+- Lesson 7 (Playwright for critical flows): not started
+- Lesson 8 (CI, coverage and flaky tests): not started
+- Practice project: not started
+</Callout>
+
+## Before you start
+
+Finish the [Auth and security practice project](/docs/auth-security/practice-project) first, or at least Lessons 1–6 of that section: the tests here log in with real sessions and check roles and tenants.
+
+You also need **Docker Desktop running**. Testcontainers (Lesson 3) starts a real PostgreSQL in Docker for your tests.
+
+## What you will learn
+
+| Lesson | Topic | You will be able to… |
+| --- | --- | --- |
+| 1 | Why test, what to test, Jest basics | Explain the test pyramid (and the testing trophy), choose what to test, write clear Jest tests with matchers and mocks |
+| 2 | Unit tests in NestJS | Test services, guards and pipes with `Test.createTestingModule`, typed mocks and pure functions |
+| 3 | Integration tests | Run tests on a real Postgres with Testcontainers, apply migrations, reset data, use factories |
+| 4 | API tests with Supertest | Start the whole Nest app in a test, log in, check status codes, problem+json, cookies, roles and other tenants |
+| 5 | Time, outside services, races | Control the clock, test time zones, fake HTTP services with MSW, prove "no double bookings" with a race test |
+| 6 | React component tests | Test components like a user with React Testing Library, `user-event` and MSW |
+| 7 | Playwright | Test critical flows (log in, book, cancel) in a real browser, with saved login state and accessibility checks |
+| 8 | CI, coverage, flaky tests | Run every test in GitHub Actions, set coverage limits, find and fix flaky tests |
+
+### Topics added beyond the roadmap
+
+The roadmap lists Jest unit tests with mocked providers, integration tests on a real Postgres in Docker (Testcontainers), e2e tests with Supertest, and Playwright for critical user flows. All of them are covered.
+
+These are added because **your projects need them** or **interviews ask about them**:
+
+| Added topic | Why | Lesson |
+| --- | --- | --- |
+| **What to test** and the test pyramid vs the testing trophy | "How do you decide what to test?" is a very common interview question | 1 |
+| Jest vs Vitest | You'll meet both: NestJS uses Jest by default, Next.js docs use Vitest | 1, 6 |
+| Typed mocks, testing guards and pipes, pure policy functions | Your security code (Auth section) needs tests most | 2 |
+| **Test data factories** and resetting the database | Without them, database tests get slow and flaky | 3 |
+| One database per Jest worker (Postgres templates) | Parallel database tests without tests breaking each other | 3 |
+| Testing **auth, roles and tenants** (401 / 403 / 404) | Catches IDOR, OWASP's number 1 risk, before production | 4 |
+| **Controlling time** (fake timers, a clock provider, time zones, DST) | Bookings, reminders and token expiry all depend on time | 5 |
+| Faking outside services with **MSW** (Google, Stripe, email) | Tests must never call real APIs | 5 |
+| **Race and concurrency tests** | Proves your strongest Phase 1 story: no double bookings | 5 |
+| React component tests (React Testing Library) | You're a frontend engineer; frontend interviews ask about it | 6 |
+| Playwright: saved login, network mocking, **accessibility checks** with axe, traces | Makes browser tests fast, stable and useful | 7 |
+| Tests in **CI**, coverage limits, **flaky tests** | Needed for the "CI badge and test suite" deliverable in Phase 1 | 8 |
+
+### Topics left for later (on purpose)
+
+| Topic | When |
+| --- | --- |
+| Testing BullMQ jobs and Redis caching | Month 2, caching and background work (you'll reuse Lessons 3 and 5) |
+| Testing Stripe webhooks end to end (Stripe CLI) | Month 3, payments |
+| Load testing (k6) | Month 3, with observability |
+| Deploy previews and smoke tests after deploy | Month 3, CI/CD |
+| Contract tests (Pact) and mutation testing (Stryker) | Only if a job needs them; a short note is in Lesson 8 |
+| Evaluating LLM output (evals) | Phase 2: a different kind of testing |
+
+## Setup
+
+In the **booking API** (NestJS already installed Jest, `ts-jest`, `@nestjs/testing` and Supertest when you created the project). Add the rest:
+
+```powershell
+npm i -D @testcontainers/postgresql msw @faker-js/faker
+```
+
+In the **Next.js frontend** (Lessons 6 and 7):
+
+```powershell
+npm i -D vitest @vitejs/plugin-react jsdom @testing-library/react @testing-library/dom @testing-library/user-event @testing-library/jest-dom vite-tsconfig-paths msw
+npm init playwright@latest
+npm i -D @axe-core/playwright
+```
+
+Scripts you'll have at the end of the section, in the API's `package.json`:
+
+```json
+{
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:int": "jest --config test/jest-int.json",
+    "test:cov": "jest --coverage",
+    "test:all": "npm test && npm run test:int"
+  }
+}
+```
+
+<Callout type="warn" title="Versions">
+Written for Jest 30, Testcontainers 11, MSW 2, Vitest 4 and Playwright 1.5x. Tests rarely break between minor versions, but if an import doesn't exist, check the tool's own docs before asking an AI: older answers often show older APIs (for example MSW 1's `rest.get` instead of MSW 2's `http.get`).
+</Callout>
+
+## How each lesson works
+
+Same as before: type the examples yourself, do the exercises without help, send them to Claude for a scored review, then check the [Solutions](/docs/testing/solutions). Write your mistakes in each page's notes box and practise the interview answers out loud.
+
+Testing has one extra rule: **see every test fail once**. After a test passes, break the code on purpose (change `>` to `>=`, remove a `where`, delete a guard) and check the test goes red. A test that has never failed might not be testing anything.
+
+## Schedule (about 2.5 weeks)
+
+| When | What |
+| --- | --- |
+| Week 1 | Lessons 1, 2, 3 (Lesson 3 is the setup-heavy one; take two sessions) |
+| Week 2 | Lessons 4, 5 (Lesson 4 is the most important for Project 1) |
+| Week 3 | Lessons 6, 7, 8 |
+| Week 3, Friday block | [Practice project](/docs/testing/practice-project) |
+
+Then: the next part of Month 2, caching and background work (Redis and BullMQ).
+
+**Done means:** `npm run test:all` runs unit, integration and API tests on a real Postgres in a few minutes; every security rule from the Auth section has a test; the race test proves no double bookings; Playwright covers log in, book and cancel; everything runs in GitHub Actions on every push; and you can answer "How do you decide what to test?" in English without notes.

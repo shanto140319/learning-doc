@@ -1,0 +1,305 @@
+---
+title: "Practice project: reminders, emails and webhook delivery"
+description: "Part 1: give the booking API a Redis cache with correct invalidation, shared rate limits, a separate worker, emails through a queue, outbox-driven confirmations, reminders that survive cancels, reschedules and a Redis wipe, a daily summary in each business's time zone, dead letters and tests. Part 2: Mini-build B, a webhook delivery service with HMAC signatures, SSRF protection, retries with backoff and jitter, a dead-letter list, replay, auto-disable and a test receiver."
+---
+
+Two parts. Part 1 finishes the booking platform's background work. Part 2 is **Mini-build B** from the roadmap: a webhook delivery service, built as a module of the booking API, so salons can connect their own systems ("send booking events to my CRM").
+
+When you're done, you can show an interviewer a system where you **stopped Redis, killed workers and broke the receiver on purpose**, and nothing was lost.
+
+Time: one Friday block (about 4 hours) for Part 1, and one more Friday block plus two weekday sessions for Part 2.
+
+## Part 1: The booking API
+
+### Requirements
+
+#### Infrastructure
+
+- [ ] `redis-queue` (AOF, `noeviction`) and `redis-cache` (`allkeys-lru`, no persistence) in `docker-compose.yml`, bound to `127.0.0.1`
+- [ ] `QUEUE_REDIS_URL` and `CACHE_REDIS_URL` in the env schema (validated at startup)
+- [ ] `RedisModule` (cache client, `error` listener, `quit` on shutdown) and a Redis health indicator
+- [ ] `QueuesModule` shared by the API and the worker; processors **only** in the worker
+- [ ] `src/worker.ts` with `createApplicationContext` and `enableShutdownHooks`; `start:worker` scripts; a `worker` service in compose with `stop_grace_period`
+
+#### Caching
+
+- [ ] `CacheService.getOrSet` (JSON, jitter, single-flight, Redis-down fallback, hit/miss logs)
+- [ ] Public profile cached 5 minutes; invalidated on every write path; negative cache 30 seconds
+- [ ] Availability cached 60 seconds with versioned keys, bumped after booking create, cancel and reschedule commit (and from the events processor)
+- [ ] `Cache-Control: public, max-age=60, stale-while-revalidate=300` on public routes; `private, no-store` everywhere else
+- [ ] Before/after `autocannon` numbers for availability in the README
+
+#### Rate limiting
+
+- [ ] Throttler storage in Redis (queue instance); two instances share the limits
+- [ ] Per-business limit on public booking creation; 429 problem+json with `Retry-After`
+- [ ] Written fail-open / fail-closed decision per route; login and forgot-password fail closed
+
+#### Jobs
+
+- [ ] `emails` queue: every email goes through it (auth emails directly; booking emails from events); token jobs removed on completion
+- [ ] Outbox relay every second (`skip locked`, `addBulk`, `evt-{id}` job IDs); daily outbox cleanup
+- [ ] `events` queue fanning out to confirmation, cancellation and reschedule emails, cache invalidation and webhooks (Part 2)
+- [ ] Confirmation email in the business's time zone; idempotent with `confirmation_sent_at`
+- [ ] Reminders with the sweeper (every 5 minutes, partial index, `reminder-{id}-{startsAtMs}` job IDs, worker re-check, `reminder_sent_at` reset on reschedule)
+- [ ] Daily owner summary at 07:00 local (15-minute scheduler, `last_summary_on`)
+- [ ] `failed_jobs` table with final failures, replay endpoint for platform admins
+- [ ] Bull Board at `/admin/queues` behind basic auth
+- [ ] A log line every minute with lag, waiting and failed counts per queue
+
+#### Tests
+
+- [ ] Redis container in the global setup; one Redis database per Jest worker; `resetAll`
+- [ ] Unit: `reminderDecision` table, templates (escaping), `webhookBackoff`, processors with fake jobs
+- [ ] Integration: cache hit/miss/invalidation, two businesses, Redis down; sweeper with a `TestClock`; daily summary for Dhaka, New York (DST day) and Kolkata; idempotency (each job run twice)
+- [ ] End to end: public booking → one confirmation email; cancel before the worker runs → no confirmation
+
+### Failure drills
+
+The most important part. Do each drill, write down what happened, and fix anything that was lost or duplicated. Put the table in `BACKGROUND-JOBS.md`:
+
+| # | Do this | Expected |
+| --- | --- | --- |
+| 1 | Stop `redis-cache`, use the booking page | Works (slower); warnings in the log; `/health` shows cache down |
+| 2 | Stop `redis-queue`, create 5 bookings, start it again | All 5 return 201; all 5 confirmations arrive after Redis is back |
+| 3 | Kill the worker (`docker compose kill worker`) while 100 emails are queued | After restart, every email arrives; count duplicates (expected: at most a few, explain them) |
+| 4 | `docker compose stop worker` during a 20-second job (60 s grace) | The job finishes; no duplicate |
+| 5 | Stop Mailpit for 2 minutes, then start it | Emails retry and arrive; nothing in `failed_jobs` |
+| 6 | Stop Mailpit for longer than all attempts | Jobs in `failed_jobs`; replay works after Mailpit is back |
+| 7 | `FLUSHALL` on `redis-queue` (local only!) with reminders due in the next hour | The next sweep re-creates them; every reminder is sent once |
+| 8 | Cancel a booking 1 minute before its reminder sweep | No reminder |
+| 9 | Reschedule a booking after its reminder was sent, to 2 days later | A new reminder 24 hours before the new time |
+| 10 | Run two workers | No email or reminder sent twice (check `failed_jobs`, Mailpit, logs) |
+
+### Scaffold: the reminders processor
+
+```typescript
+// src/reminders/reminders.processor.ts
+@Processor(REMINDERS, { concurrency: 10 })
+export class RemindersProcessor extends WorkerHost {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly clock: Clock,
+    private readonly bookingEmails: BookingEmails,
+    private readonly deadLetters: DeadLetters,
+  ) {
+    super();
+  }
+
+  async process(job: Job<{ businessId: string; bookingId: string; startsAt: string }>): Promise<'sent' | 'skipped'> {
+    // TODO 1: load the booking with its customer, service, staff and business, scoped by businessId
+    // TODO 2: not found → UnrecoverableError
+    // TODO 3: the booking's startsAt differs from job.data.startsAt → 'skipped' (a stale job)
+    // TODO 4: reminderDecision(booking, this.clock.now()) !== 'send' → 'skipped'
+    // TODO 5: send the reminder (time in the business's time zone), then set reminder_sent_at
+    //         Hint: make the update conditional (`where: { id, reminderSentAt: null }`) and think about
+    //         what it means if it updates 0 rows
+    // TODO 6: return 'sent'
+  }
+
+  @OnWorkerEvent('failed')
+  async onFailed(job: Job | undefined, err: Error) {
+    // TODO 7: record final failures (with data: reminders contain no secrets)
+  }
+}
+```
+
+## Part 2: Mini-build B, webhook delivery
+
+### What it does
+
+A business owner registers a URL and picks events (`booking.created`, `booking.cancelled`, `booking.rescheduled`). When one happens, the platform sends an HTTP `POST` to that URL with a signed JSON body. If the receiver is down, the platform retries for hours. If it never succeeds, the delivery goes to a dead-letter list the owner can see and replay.
+
+Stripe, GitHub and Shopify all work like this. Building one teaches you everything in this section in one feature, and it's an excellent portfolio piece: "I built a webhook delivery system with signatures, retries, a dead-letter queue and SSRF protection."
+
+### API
+
+| Method and path | Who | What |
+| --- | --- | --- |
+| `POST /v1/webhook-endpoints` | Owner, admin | `{ url, events }` → the endpoint, with its signing secret **shown once** |
+| `GET /v1/webhook-endpoints` | Owner, admin | List (never the secret) |
+| `PATCH /v1/webhook-endpoints/:id` | Owner, admin | Change `events`, enable or disable |
+| `POST /v1/webhook-endpoints/:id/rotate-secret` | Owner | New secret, shown once |
+| `DELETE /v1/webhook-endpoints/:id` | Owner | Delete |
+| `POST /v1/webhook-endpoints/:id/test` | Owner, admin | Send a `ping` event now |
+| `GET /v1/webhook-deliveries?endpointId=&status=` | Owner, admin | Deliveries with status, attempts, last status code, last error |
+| `POST /v1/webhook-deliveries/:id/replay` | Owner, admin | Send a failed (`dead`) delivery again |
+
+All tenant-scoped with `MembershipGuard`, tested with the permissions matrix from the [Testing practice project](/docs/testing/practice-project).
+
+### Data model
+
+```prisma
+model WebhookEndpoint {
+  id              String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  businessId      String    @map("business_id") @db.Uuid
+  url             String
+  secretEncrypted String    @map("secret_encrypted")      // AES-256-GCM; you need the plain secret to sign
+  events          String[]
+  enabled         Boolean   @default(true)
+  disabledReason  String?   @map("disabled_reason")
+  failingSince    DateTime? @map("failing_since") @db.Timestamptz(3)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  business   Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([businessId])
+  @@map("webhook_endpoints")
+}
+
+model WebhookDelivery {
+  id             String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  businessId     String    @map("business_id") @db.Uuid
+  endpointId     String    @map("endpoint_id") @db.Uuid
+  eventId        String    @map("event_id")               // the outbox event ID
+  topic          String
+  body           String                                    // the exact JSON sent, saved once: retries send the same bytes
+  status         String    @default("pending")            // pending | delivered | dead
+  attempts       Int       @default(0)
+  lastStatusCode Int?      @map("last_status_code")
+  lastError      String?   @map("last_error")
+  deliveredAt    DateTime? @map("delivered_at") @db.Timestamptz(3)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  @@unique([endpointId, eventId])                          // one delivery per event per endpoint, however often the event is processed
+  @@index([businessId, status, createdAt(sort: Desc)])
+  @@map("webhook_deliveries")
+}
+```
+
+### The flow
+
+```text
+booking transaction ──► outbox row ──► relay ──► events queue
+                                                    │
+                       EventsProcessor: for each enabled endpoint of this business subscribed to the topic,
+                       insert a webhook_delivery (skipDuplicates) and add job delivery-{id}
+                                                    │
+                                    WebhooksProcessor ──► POST to the endpoint
+                                          │ 2xx → delivered
+                                          │ other / timeout → retry with webhookBackoff (12 attempts)
+                                          │ 410 Gone → disable the endpoint, stop
+                                          └ last attempt failed → status dead (the dead-letter list)
+```
+
+### The request you send
+
+```text
+POST https://crm.example.com/hooks/booking
+Content-Type: application/json
+User-Agent: BookingPlatform-Webhooks/1.0
+Booking-Event-Id: 1842
+Booking-Event-Type: booking.created
+Booking-Signature: t=1799990000,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd
+
+{"id":"1842","type":"booking.created","createdAt":"2027-01-10T08:00:00.000Z","data":{"bookingId":"0194...","startsAt":"2027-01-15T04:00:00.000Z","serviceName":"Haircut","status":"confirmed"}}
+```
+
+- The signature is `signWebhook` from [Auth Lesson 8](/docs/auth-security/lesson-8-abuse-and-secrets), over the **saved body**, with a timestamp from **this attempt**.
+- The body is built **once**, when the delivery is created (a snapshot of the event), so every retry sends the same bytes. Only the timestamp in the signature header changes.
+- Receivers deduplicate with `Booking-Event-Id`. Say in your docs: delivery is at least once, and order is not guaranteed.
+- Only fields the business may see. No customer phone numbers unless the business has them anyway.
+
+### Scaffold: the delivery processor
+
+```typescript
+// src/webhooks/webhooks.processor.ts
+@Processor(WEBHOOKS, { concurrency: 20, settings: { backoffStrategy: webhookBackoff } })
+export class WebhooksProcessor extends WorkerHost {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly secrets: WebhookSecrets,           // encrypt / decrypt with WEBHOOK_SECRET_KEY
+    private readonly http: SafeHttp,                    // SSRF-safe fetch: checks and pins the IP, no redirects
+    private readonly deadLetters: DeadLetters,
+  ) {
+    super();
+  }
+
+  async process(job: Job<{ businessId: string; deliveryId: string }>): Promise<void> {
+    const { businessId, deliveryId } = job.data;
+    // TODO 1: load the delivery with its endpoint (scoped by businessId); missing or already delivered → return
+    // TODO 2: endpoint disabled → mark the delivery dead with lastError 'endpoint disabled', return
+    // TODO 3: sign the saved body with the decrypted secret (a new timestamp)
+    // TODO 4: POST with a 10-second timeout and redirect: 'manual' through SafeHttp
+    //         (a private or invalid URL → UnrecoverableError)
+    // TODO 5: increment attempts; save lastStatusCode / lastError
+    // TODO 6: 2xx → delivered (deliveredAt), clear the endpoint's failingSince; return
+    // TODO 7: 410 → disable the endpoint (disabledReason 'gone'), UnrecoverableError
+    // TODO 8: anything else (or a network error / timeout) → set failingSince if it's null, throw to retry
+  }
+
+  @OnWorkerEvent('failed')
+  async onFailed(job: Job | undefined, err: Error) {
+    // TODO 9: on the final failure, mark the delivery dead, and if the endpoint has been failing for
+    //         more than 3 days, disable it and email the owner (through the emails queue)
+  }
+}
+```
+
+### Rules and hints
+
+- **SSRF:** reuse `assertPublicHttpsUrl` from [Auth Lesson 8](/docs/auth-security/lesson-8-abuse-and-secrets) when the endpoint is saved **and** before every attempt (DNS can change), and connect to the IP you checked (an undici `Agent` with a custom `lookup`). For local development, `WEBHOOK_ALLOW_PRIVATE=true` (only allowed when `NODE_ENV=development`, checked in the env schema) lets you send to `http://localhost:4000`.
+- **The response body:** read at most a few KB (for `lastError`), never return it to the user unescaped, never follow redirects.
+- **Secrets:** `whsec_` + 32 random bytes (base64url). Stored encrypted with AES-256-GCM (`node:crypto`, a key from env, a new IV each time); decrypted only in the worker.
+- **Replay:** set status back to `pending`, add the job with `jobId: delivery-{id}-replay-{n}`.
+- **A slow receiver can't block others:** concurrency 20 and a 10-second timeout mean one dead endpoint uses at most a few slots. Optionally add a per-endpoint limit (a group rate limit is a BullMQ Pro feature; a simple Redis counter per endpoint works too).
+- **Testing retries quickly:** `QUEUE_BACKOFF_MS` (Lesson 8) also scales `webhookBackoff` in tests, so 12 attempts take milliseconds.
+
+### A test receiver
+
+Write `scripts/webhook-receiver.ts`, a plain `node:http` server on port 4000 (you know how from the [Node.js and HTTP section](/docs/node-http)) that:
+
+- verifies the signature with `verifyWebhook` (raw body, timestamp tolerance), and returns 400 if it's wrong;
+- fails on purpose: 30% of requests return 500, 10% wait 15 seconds (longer than your timeout);
+- logs each event ID and prints `DUPLICATE` when it sees one again;
+- with `--gone`, returns 410 to everything.
+
+Run it, create 100 bookings, and check: every event is eventually received, the duplicates are explained, and the deliveries list in the API matches.
+
+### README (design doc)
+
+Mini-build B gets its own section in the API's README, written like a short design document:
+
+1. What it does, and the request format (headers, body, signature).
+2. **How to verify** a webhook, with a 15-line TypeScript example for receivers.
+3. Guarantees: at least once, no ordering, retry schedule (a table of attempt → delay), when an endpoint is disabled.
+4. Security: signatures, SSRF protection, encrypted secrets.
+5. The failure drills you ran and their results.
+
+## Suggested order
+
+1. Compose (two Redis), env, `RedisModule`, health (Lesson 2).
+2. `CacheService`, the profile and availability caches, headers, measurements (Lessons 1, 3).
+3. Throttler in Redis, the per-business limit, fail-open/closed (Lesson 4).
+4. `QueuesModule`, the worker process, `emails` queue, `AuthEmails` on the queue (Lessons 5, 6).
+5. Outbox relay, events queue, confirmation emails (Lesson 6).
+6. Reminders (sweeper), the daily summary, cleanup (Lesson 7).
+7. Dead letters, Bull Board, backoff, shutdown, metrics log (Lesson 8).
+8. The test setup with Redis and the Part 1 tests. **Get everything green before Part 2.**
+9. The failure drills, and `BACKGROUND-JOBS.md`.
+10. Part 2: endpoints API, secrets, the fan-out, the delivery processor, the receiver, replay, auto-disable, tests, README.
+
+## Test checklist
+
+1. `npm run test:all` passes with only Docker running.
+2. All 10 failure drills behave as expected (or the table says why not).
+3. Two API instances share rate limits; two workers never send anything twice except in the documented crash window.
+4. Changing the computer's time zone doesn't change any result.
+5. A webhook delivery to a private IP (`https://127.0.0.1`, `https://169.254.169.254`, a domain that resolves to `10.0.0.1`) is refused when saved and when sent.
+6. A webhook receiver down for "hours" (fast backoff in a test) gets the event after it comes back; one down forever ends up `dead` and can be replayed.
+7. `410 Gone` disables the endpoint after one attempt.
+8. Business B can't see, change, replay or test business A's endpoints or deliveries (404).
+9. No job data or secrets in the logs (search the logs for `whsec_` and `token`).
+10. Bull Board asks for a password.
+
+## When you're done
+
+1. Push with green CI, `BACKGROUND-JOBS.md` and the Mini-build B README.
+2. Paste `CacheService`, the outbox relay, the reminder sweeper and the webhook processor into Claude for a **scored code review**.
+3. Ask Claude for a **10-question quiz** on this section: at least one cache invalidation scenario, one "design a rate limiter" question, one "this job ran twice, why?" diagnosis and one time zone question. **Score 8 or more** to move on.
+4. Practise the system design answer "Design a webhook delivery system" out loud for 5 minutes, using your own project as the example.
+5. Blog post idea: "How I built webhook delivery for my booking platform: signatures, retries and a dead-letter queue" (or "I deleted all my Redis data and no reminder was lost"). Specific failure drills make the post stand out.
+6. Update the progress box on the [section home page](/docs/caching-queues).

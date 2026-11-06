@@ -1,0 +1,17 @@
+{
+  "title": "Caching and background work",
+  "pages": [
+    "index",
+    "lesson-1-caching-basics",
+    "lesson-2-redis-basics",
+    "lesson-3-caching-in-nestjs",
+    "lesson-4-rate-limiting",
+    "lesson-5-bullmq-basics",
+    "lesson-6-emails-and-outbox",
+    "lesson-7-delayed-and-scheduled-jobs",
+    "lesson-8-reliability-and-testing",
+    "practice-project",
+    "solutions",
+    "cheat-sheet"
+  ]
+}

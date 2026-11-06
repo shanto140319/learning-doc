@@ -1,0 +1,452 @@
+---
+title: "Lesson 2: Unit tests in NestJS"
+description: "What's worth unit testing in a NestJS app, plain constructors vs Test.createTestingModule, typed mocks, testing a service's rules and errors, pure policy functions with test tables, guards with a fake ExecutionContext, validation DTOs, and when a unit test is the wrong tool."
+---
+
+A unit test checks **one piece of your logic** with everything around it faked. In a NestJS app, the best candidates are:
+
+| Worth unit testing | Usually not worth it |
+| --- | --- |
+| Pure functions: slots, prices, policy rules, mappers with logic | Controllers that only call a service (API tests cover them) |
+| Services with rules: "can't cancel a cancelled booking", "service must exist" | Repositories (they're mostly queries: test them on a real database, Lesson 3) |
+| Guards, pipes and interceptors: your security and request rules | Modules, DTOs without rules, Prisma calls |
+| Error mapping: which error becomes which status | Anything where the mock would be the whole test |
+
+The last row is important. If a "unit test" for `BookingsRepository` mocks `prisma.booking.findFirst` and then checks that `findFirst` was called, it tests nothing: it only repeats the code. Repositories get integration tests.
+
+## The service we'll test
+
+A slightly bigger version of the service from your projects. The repository and `ServicesService` are its dependencies:
+
+```typescript
+// src/bookings/bookings.service.ts
+@Injectable()
+export class BookingsService {
+  constructor(
+    private readonly bookings: BookingsRepository,
+    private readonly services: ServicesService,
+  ) {}
+
+  async create(actor: AuthUser, input: CreateBookingInput): Promise<Booking> {
+    const service = await this.services.findActive(actor.businessId, input.serviceId);
+    if (!service) throw new NotFoundError('Service', input.serviceId);
+
+    const startsAt = new Date(input.startsAt);
+    if (startsAt <= new Date()) throw new ValidationError('Invalid booking', { startsAt: 'Must be in the future' });
+
+    // The repository throws ConflictError('...', 'SLOT_TAKEN') when the exclusion constraint fires
+    return this.bookings.create({
+      businessId: actor.businessId,
+      serviceId: service.id,
+      staffId: input.staffId,
+      customerEmail: input.customerEmail,
+      startsAt,
+      endsAt: new Date(startsAt.getTime() + service.durationMinutes * 60_000),
+      priceCents: service.priceCents,
+    });
+  }
+
+  async cancel(actor: AuthUser, id: string): Promise<Booking> {
+    const booking = await this.bookings.findOne(actor, id);
+    if (!booking) throw new NotFoundError('Booking', id);
+    if (!canCancel(actor, booking, new Date())) throw new ForbiddenError('You cannot cancel this booking');
+    if (booking.status === 'cancelled') throw new ConflictError('Booking is already cancelled', 'ALREADY_CANCELLED');
+
+    return this.bookings.cancel(actor.businessId, id);
+  }
+}
+```
+
+(`ForbiddenError` is a small `AppError` subclass with status 403, like `NotFoundError` from [Node.js Lesson 3](/docs/node-http/lesson-3-error-handling). Notice `new Date()` appears twice: that makes some tests depend on today's date. Lesson 5 fixes it with a clock. For now, use dates far in the future or past.)
+
+## Two ways to build the class under test
+
+### 1. Plain `new`
+
+Nest uses constructor injection, so you can just call the constructor:
+
+```typescript
+const service = new BookingsService(repo as unknown as BookingsRepository, services as unknown as ServicesService);
+```
+
+Fast and simple. The `as unknown as` cast is needed because your fake has only some methods, and classes with `private` fields can't be matched by a plain object.
+
+### 2. `Test.createTestingModule`
+
+```typescript
+const moduleRef = await Test.createTestingModule({
+  providers: [
+    BookingsService,
+    { provide: BookingsRepository, useValue: repo },
+    { provide: ServicesService, useValue: services },
+  ],
+}).compile();
+const service = moduleRef.get(BookingsService);
+```
+
+No casts, and it also checks your **wiring**: if you add a dependency to the constructor and forget it in the test, you get Nest's "can't resolve dependencies" error, like in production. Use it when the class uses DI features (`@Inject(TOKEN)`, `ConfigService`, factories). Both styles are fine; pick one per project and stay consistent. This lesson uses the testing module.
+
+## Typed mocks
+
+A mock with `jest.fn()` and no type accepts anything and returns `any`. Then you can mock a method that doesn't exist, or return the wrong shape, and TypeScript says nothing. Type them:
+
+```typescript
+// src/bookings/bookings.service.spec.ts
+import { Test } from '@nestjs/testing';
+
+type Mocked<T, K extends keyof T> = jest.Mocked<Pick<T, K>>;
+
+let repo: Mocked<BookingsRepository, 'findOne' | 'create' | 'cancel'>;
+let services: Mocked<ServicesService, 'findActive'>;
+let service: BookingsService;
+
+beforeEach(async () => {
+  repo = { findOne: jest.fn(), create: jest.fn(), cancel: jest.fn() };
+  services = { findActive: jest.fn() };
+
+  const moduleRef = await Test.createTestingModule({
+    providers: [
+      BookingsService,
+      { provide: BookingsRepository, useValue: repo },
+      { provide: ServicesService, useValue: services },
+    ],
+  }).compile();
+  service = moduleRef.get(BookingsService);
+});
+```
+
+Now `repo.findOne.mockResolvedValue({ wrong: true })` is a type error, and renaming `findOne` in the repository breaks the test at compile time instead of silently.
+
+The package `@golevelup/ts-jest` has `createMock<BookingsRepository>()`, which mocks every method for you. It's handy in big services; with three methods, writing them out is clearer.
+
+## Test data builders
+
+Every test needs an actor and a booking. Don't copy the same 12-line object into every test. Write small **builders** with good defaults, and override only what the test is about:
+
+```typescript
+// test/builders.ts
+import type { AuthUser } from '../src/common/auth/membership.guard';
+
+export const BUSINESS_ID = '0193f2a1-0000-7000-8000-000000000001';
+
+export function anActor(overrides: Partial<AuthUser> = {}): AuthUser {
+  return { id: 'user-owner', sessionId: 'session-1', businessId: BUSINESS_ID, role: 'owner', ...overrides };
+}
+
+export function aBooking(overrides: Partial<BookingWithStaff> = {}): BookingWithStaff {
+  return {
+    id: 'booking-1',
+    businessId: BUSINESS_ID,
+    serviceId: 'service-1',
+    staffId: 'staff-1',
+    staff: { userId: 'user-staff' },
+    status: 'confirmed',
+    startsAt: new Date('2099-01-01T10:00:00Z'),      // far future: "cancellable" by default
+    endsAt: new Date('2099-01-01T10:30:00Z'),
+    priceCents: 2_000,
+    ...overrides,
+  };
+}
+```
+
+A test that says `aBooking({ status: 'cancelled' })` tells the reader exactly what matters. In Lesson 3, the same idea becomes **factories** that insert rows into a real database.
+
+## Testing the service
+
+```typescript
+describe('BookingsService.cancel', () => {
+  it('cancels a confirmed booking', async () => {
+    repo.findOne.mockResolvedValue(aBooking());
+    repo.cancel.mockResolvedValue(aBooking({ status: 'cancelled' }));
+
+    const result = await service.cancel(anActor(), 'booking-1');
+
+    expect(result.status).toBe('cancelled');
+    expect(repo.cancel).toHaveBeenCalledWith(BUSINESS_ID, 'booking-1');
+  });
+
+  it('throws NotFoundError when the booking is not visible to the actor', async () => {
+    repo.findOne.mockResolvedValue(null);
+
+    await expect(service.cancel(anActor(), 'booking-1')).rejects.toBeInstanceOf(NotFoundError);
+    expect(repo.cancel).not.toHaveBeenCalled();
+  });
+
+  it('does not let staff cancel a colleague’s booking', async () => {
+    repo.findOne.mockResolvedValue(aBooking({ staff: { userId: 'someone-else' } }));
+
+    await expect(service.cancel(anActor({ id: 'user-staff', role: 'staff' }), 'booking-1'))
+      .rejects.toBeInstanceOf(ForbiddenError);
+    expect(repo.cancel).not.toHaveBeenCalled();
+  });
+
+  it('refuses to cancel twice', async () => {
+    repo.findOne.mockResolvedValue(aBooking({ status: 'cancelled' }));
+
+    await expect(service.cancel(anActor(), 'booking-1')).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'ALREADY_CANCELLED',
+    });
+  });
+});
+```
+
+Look at the `expect(repo.cancel).not.toHaveBeenCalled()` lines. Checking a mock is right here: "nothing was changed when the check failed" **is** the behaviour.
+
+```typescript
+describe('BookingsService.create', () => {
+  const service30min = { id: 'service-1', durationMinutes: 30, priceCents: 2_000 };
+  const input = {
+    serviceId: 'service-1',
+    staffId: 'staff-1',
+    customerEmail: 'rahim@test.dev',
+    startsAt: '2099-01-01T10:00:00.000Z',
+  };
+
+  it('sets the end time and price from the service', async () => {
+    services.findActive.mockResolvedValue(service30min);
+    repo.create.mockImplementation(async (data) => aBooking(data));
+
+    const booking = await service.create(anActor(), input);
+
+    expect(booking).toMatchObject({
+      endsAt: new Date('2099-01-01T10:30:00.000Z'),
+      priceCents: 2_000,
+    });
+  });
+
+  it('passes the slot-taken error from the repository through unchanged', async () => {
+    services.findActive.mockResolvedValue(service30min);
+    repo.create.mockRejectedValue(new ConflictError('This time slot is already booked', 'SLOT_TAKEN'));
+
+    await expect(service.create(anActor(), input)).rejects.toMatchObject({ code: 'SLOT_TAKEN' });
+  });
+
+  it('rejects a start time in the past', async () => {
+    services.findActive.mockResolvedValue(service30min);
+
+    await expect(service.create(anActor(), { ...input, startsAt: '2001-01-01T10:00:00Z' }))
+      .rejects.toBeInstanceOf(ValidationError);
+  });
+});
+```
+
+Notice what the second test does **not** prove: that the database really rejects overlaps. It only proves the service doesn't swallow the error. The constraint itself is tested in Lesson 3. This is the limit of unit tests with mocks: **they can only be as right as your mocks**.
+
+## Pure policy functions: the easiest wins
+
+The `canCancel` rule from [Auth Lesson 6](/docs/auth-security/lesson-6-authorisation) used `new Date()` inside. Pass the time in instead, and the function becomes pure:
+
+```typescript
+// src/bookings/booking.policy.ts
+export function canCancel(actor: AuthUser, booking: BookingForPolicy, now: Date): boolean {
+  if (booking.businessId !== actor.businessId) return false;
+  if (actor.role === 'owner' || actor.role === 'admin') return true;
+  return booking.staff.userId === actor.id && booking.startsAt > now;
+}
+```
+
+A pure function with a few inputs is perfect for a **test table**. Every row is a rule you could explain to the business owner:
+
+```typescript
+// src/bookings/booking.policy.spec.ts
+const now = new Date('2026-12-01T09:00:00Z');
+const future = new Date('2026-12-01T10:00:00Z');
+const past = new Date('2026-12-01T08:00:00Z');
+
+describe('canCancel', () => {
+  it.each`
+    role       | ownBooking | startsAt  | otherBusiness | expected
+    ${'owner'} | ${false}   | ${future} | ${false}      | ${true}
+    ${'owner'} | ${false}   | ${past}   | ${false}      | ${true}
+    ${'admin'} | ${false}   | ${future} | ${false}      | ${true}
+    ${'staff'} | ${true}    | ${future} | ${false}      | ${true}
+    ${'staff'} | ${true}    | ${past}   | ${false}      | ${false}
+    ${'staff'} | ${false}   | ${future} | ${false}      | ${false}
+    ${'owner'} | ${false}   | ${future} | ${true}       | ${false}
+  `('$role, own=$ownBooking, otherBusiness=$otherBusiness → $expected', ({ role, ownBooking, startsAt, otherBusiness, expected }) => {
+    const actor = anActor({ id: 'user-1', role });
+    const booking = aBooking({
+      startsAt,
+      staff: { userId: ownBooking ? 'user-1' : 'user-2' },
+      businessId: otherBusiness ? 'another-business' : BUSINESS_ID,
+    });
+
+    expect(canCancel(actor, booking, now)).toBe(expected);
+  });
+});
+```
+
+The `` it.each`...` `` table form reads like a spreadsheet. Use the array form from Lesson 1 when the rows are simple.
+
+A rule worth remembering: **move logic out of classes with many dependencies into pure functions**, and the classes become thin and the tests become easy. Slot calculation, prices, policy rules and mappers can all be pure.
+
+## Testing a guard
+
+Guards are your security code, so they deserve tests. A guard only needs an `ExecutionContext`. Build a small fake:
+
+```typescript
+// src/common/auth/roles.guard.spec.ts
+import { ExecutionContext } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+
+class FakeController {
+  @Roles(['owner', 'admin'])
+  deleteService() {}
+
+  listServices() {}            // no @Roles: any member
+}
+
+function contextFor(handler: () => void, user: Partial<AuthUser>): ExecutionContext {
+  return {
+    getHandler: () => handler,
+    getClass: () => FakeController,
+    switchToHttp: () => ({ getRequest: () => ({ user }) }),
+  } as unknown as ExecutionContext;
+}
+
+describe('RolesGuard', () => {
+  const guard = new RolesGuard(new Reflector());           // the real Reflector reads the real decorator
+  const { deleteService, listServices } = FakeController.prototype;
+
+  it.each([
+    ['owner', true],
+    ['admin', true],
+    ['staff', false],
+  ] as const)('%s on an owner/admin route → %s', (role, allowed) => {
+    expect(guard.canActivate(contextFor(deleteService, { role }))).toBe(allowed);
+  });
+
+  it('allows any role when the route has no @Roles', () => {
+    expect(guard.canActivate(contextFor(listServices, { role: 'staff' }))).toBe(true);
+  });
+});
+```
+
+The fake context uses the **real** `Reflector` and the **real** `@Roles` decorator, so it tests that the guard and decorator work together. Only the request is fake.
+
+The `AuthGuard` from [Auth Lesson 2](/docs/auth-security/lesson-2-sessions-and-jwt) has a dependency (`TokenService`), so mock it:
+
+```typescript
+describe('AuthGuard', () => {
+  const tokens = { verifyAccessToken: jest.fn() };
+  const guard = new AuthGuard(new Reflector(), tokens as unknown as TokenService);
+
+  const contextWithCookies = (cookies: Record<string, string>) => {
+    const req: { cookies: Record<string, string>; user?: unknown } = { cookies };
+    const context = {
+      getHandler: () => FakeController.prototype.listServices,
+      getClass: () => FakeController,
+      switchToHttp: () => ({ getRequest: () => req }),
+    } as unknown as ExecutionContext;
+    return { context, req };
+  };
+
+  it('rejects a request without the access cookie', async () => {
+    const { context } = contextWithCookies({});
+    await expect(guard.canActivate(context)).rejects.toBeInstanceOf(UnauthorizedException);
+    expect(tokens.verifyAccessToken).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invalid token', async () => {
+    tokens.verifyAccessToken.mockRejectedValue(new Error('jwt expired'));
+    const { context } = contextWithCookies({ access_token: 'expired' });
+
+    await expect(guard.canActivate(context)).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it('puts the user and session on the request', async () => {
+    tokens.verifyAccessToken.mockResolvedValue({ sub: 'user-1', sid: 'session-1' });
+    const { context, req } = contextWithCookies({ access_token: 'valid' });
+
+    await expect(guard.canActivate(context)).resolves.toBe(true);
+    expect(req.user).toEqual({ id: 'user-1', sessionId: 'session-1' });
+  });
+});
+```
+
+Add a fourth test yourself: a `@Public()` route returns `true` without calling `verifyAccessToken` (exercise 2.2).
+
+## Testing validation rules
+
+Your DTOs carry rules too: "no unknown fields", "email max 254 characters", "limit between 1 and 100". You can test a DTO through the **same** `ValidationPipe` options the app uses. Export them from one place:
+
+```typescript
+// src/common/validation.ts
+export const validationPipeOptions: ValidationPipeOptions = {
+  whitelist: true,
+  forbidNonWhitelisted: true,
+  transform: true,
+};
+// app.module.ts: { provide: APP_PIPE, useValue: new ValidationPipe(validationPipeOptions) }
+```
+
+```typescript
+// src/bookings/dto/create-booking.dto.spec.ts
+const pipe = new ValidationPipe(validationPipeOptions);
+const validate = (body: unknown) =>
+  pipe.transform(body, { type: 'body', metatype: CreateBookingDto });
+
+const valid = {
+  serviceId: '0193f2a1-0000-7000-8000-000000000002',
+  staffId: '0193f2a1-0000-7000-8000-000000000003',
+  customerEmail: 'rahim@test.dev',
+  startsAt: '2099-01-01T10:00:00Z',
+};
+
+it('accepts a valid body', async () => {
+  await expect(validate(valid)).resolves.toBeInstanceOf(CreateBookingDto);
+});
+
+it.each([
+  ['an unknown field', { ...valid, status: 'cancelled' }],      // mass assignment (Auth Lesson 6)
+  ['a bad email', { ...valid, customerEmail: 'not-an-email' }],
+  ['a missing serviceId', { ...valid, serviceId: undefined }],
+])('rejects %s', async (_name, body) => {
+  await expect(validate(body)).rejects.toThrow();
+});
+```
+
+If you use Zod (`nestjs-zod`), it's even simpler: test the schema with `CreateBookingSchema.safeParse(body)` and check `success` and `error.issues`.
+
+The full error **format** (the problem+json `errors` array) is tested in Lesson 4, through HTTP, because it depends on the filter too.
+
+## When a unit test is the wrong tool
+
+Signs you should write an integration or API test instead:
+
+- The mock setup is longer than the test, and it mostly describes Prisma calls.
+- The thing you care about lives in the database: a constraint, a transaction, `for update`, a unique index.
+- You're testing that a guard is **applied** to a route (a unit test proves the guard works; only an API test proves the route uses it).
+- The bug you're afraid of is "two parts don't fit together": a DTO field name the service doesn't read, a filter that formats errors wrongly.
+
+## Mistakes to avoid
+
+- Mocking Prisma to "unit test" a repository: it proves nothing about the real query.
+- Untyped mocks (`useValue: { findOne: jest.fn() }` with no type): the test keeps passing after you rename or change the real method.
+- Copying big test objects into every test instead of builders with defaults.
+- `new Date()` inside business rules, then tests that pass today and fail next month.
+- Testing that the controller called the service with the same arguments it received.
+- Using a snapshot (`toMatchSnapshot`) for API responses or errors: people update snapshots without reading them. Write the expected fields.
+- Forgetting the negative check: "throws 403" **and** "didn't change anything".
+
+## Exercises
+
+- **2.1** 🟢 Write `test/builders.ts` with `anActor`, `aBooking` and `aService`. Then write the `BookingsService.cancel` tests above in your project and make each one fail once by breaking the service.
+- **2.2** 🟡 Write the full `AuthGuard` and `RolesGuard` tests, including: a `@Public()` route returns `true` without verifying anything, and a guard on the **class** (`@Roles(['owner'])` on `FakeController`) is overridden by a method decorator.
+- **2.3** 🟡 Write unit tests for the `OriginGuard` from [Auth Lesson 7](/docs/auth-security/lesson-7-browser-security): GET is always allowed; POST without cookies is allowed; POST with cookies and the right `Origin` is allowed; POST with cookies and `Sec-Fetch-Site: cross-site` is blocked; POST with cookies and no `Origin` is blocked. Use a test table.
+- **2.4** 🔴 Pick the most complex service in your auth code (for example `AuthService.login` with the dummy hash, or the refresh flow). Write unit tests for every branch. Then answer in your notes: which of these tests would you **delete** after writing integration tests in Lesson 3, and why?
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you unit test a NestJS service?"**
+
+> "Nest uses constructor injection, so I build the service with `Test.createTestingModule` and replace its dependencies, like the repository, with typed Jest mocks using `useValue`. Each test sets up the mock's answers, calls one method and checks the result or the error. I also check that nothing was written when a rule fails, for example that the repository's cancel method wasn't called when the user isn't allowed. I keep business rules like permissions and slot calculation in pure functions, which I test with tables of cases. I don't mock Prisma to test repositories, because that only repeats the code; those get integration tests on a real Postgres."
+
+**"What's the difference between a mock, a stub and a fake?"**
+
+> "They all replace a real dependency in a test. A stub just returns fixed answers. A mock is a stub you also check afterwards: was it called, and with what arguments. A fake is a small working implementation, like an in-memory repository or a local email server. A spy wraps a real function so you can watch its calls. I mock at the edges of the system, like email or payment providers, and avoid mocking my own small functions, because it ties the tests to the implementation."

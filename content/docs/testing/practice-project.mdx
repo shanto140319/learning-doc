@@ -1,0 +1,179 @@
+---
+title: "Practice project: a full test suite for the booking platform"
+description: "Write the test suite for the booking API and its Next.js frontend: unit, integration and API tests on a real Postgres, a permissions matrix, tenant tests, the race test, time zone and DST tests, MSW fakes, component tests, Playwright for critical flows, CI with branch protection, a TESTING.md, and a bug hunt that proves the suite works."
+---
+
+Give the booking platform a test suite that you'd be happy to show in an interview. When you're done, anyone can clone the repo, run `npm run test:all` with only Docker running, and see every rule of the platform checked in a few minutes. And a green CI badge on GitHub proves it runs on every change.
+
+This is the project where "I write tests" becomes "here are my tests, and here's a bug they caught".
+
+Time: one Friday block (about 4 hours) plus three or four weekday sessions.
+
+## Requirements
+
+### Test infrastructure
+
+- [ ] `npm test`: unit tests only, no Docker, under 10 seconds
+- [ ] `npm run test:int`: integration and API tests with Testcontainers (`postgres:18-alpine`), migrations applied once, one database per Jest worker
+- [ ] `test/setup/env.ts` sets every env var with fake values and `TZ=UTC`; no `.env` file needed to run tests
+- [ ] `configureApp()` shared by `main.ts` and `createTestApp()`
+- [ ] Builders (`anActor`, `aBooking`) for unit tests and factories (`f.salon()`, `f.member()`, `f.userWithPassword()`) for database tests
+- [ ] `Clock` provider used by every rule that depends on time
+- [ ] MSW for outside HTTP calls, with only localhost allowed through
+- [ ] `clearMocks` and `restoreMocks` on in both Jest configs
+- [ ] ESLint's Jest plugin with `no-focused-tests` and `no-disabled-tests` (warn)
+
+### What must be tested
+
+| Area | Tests | Lesson |
+| --- | --- | --- |
+| Slots and prices | `overlaps`, `freeSlots`, `bookingPrice` with test tables | 1 |
+| Policies and guards | `canCancel` table; `AuthGuard`, `RolesGuard`, `OriginGuard` | 2 |
+| DTOs | One valid body; unknown fields and bad values rejected | 2 |
+| Repositories | Exclusion constraint (overlap, touching, other staff, cancelled frees the slot), outbox event, tenant scoping in `findOne` / `list` / `cancel` | 3 |
+| Every endpoint | Main path (exact response body), 401, the main error (404 / 409 / 412 / 422) as problem+json | 4 |
+| Permissions | A matrix: every route × owner / admin / staff | 4 |
+| Tenants | Business B gets 404 or an empty list for every resource of business A, and nothing changes | 4 |
+| Auth flows | Login cookies, no enumeration, refresh rotation and reuse detection, logout, logout-all, sign-up → verify, password reset (link expiry with the `Clock`), CSRF blocked | 4, 5 |
+| Time | Exact cancel boundary; DST spring-forward and fall-back availability; "today" for Dhaka at 23:30 UTC | 5 |
+| Outside services | Breached-password check (breached, clean, down, only 5 characters sent); Google login linking rules with a fake `GoogleOidcService` | 5 |
+| Races | 20 parallel bookings → one 201, nineteen 409; same idempotency key twice → one booking; deterministic two-connection test for the last-owner rule | 3, 5 |
+| Frontend components | `BookingForm` (success, sending, 409, 422, network error), `SlotPicker` (loading, empty, error, slots in the business's time zone) | 6 |
+| Browser flows | Log in and reload; sign-up with Mailpit; public booking and the slot disappears; owner cancels; staff don't see owner actions; axe on 4 pages | 7 |
+| CI | `api.yml` (two jobs) and `e2e.yml`; branch protection on `main`; badge in the README | 8 |
+
+## Scaffold: the permissions matrix
+
+The most valuable single test file in the project. Fill in the `TODO`s:
+
+```typescript
+// test/permissions.e2e-spec.ts
+import { createTestApp } from './setup/test-app';
+import { resetDb } from './setup/db';
+import { factories } from './factories';
+import { client } from './setup/client';
+import { loginAs } from './setup/auth';
+
+type Role = 'owner' | 'admin' | 'staff';
+type Method = 'get' | 'post' | 'patch' | 'delete';
+type Salon = Awaited<ReturnType<ReturnType<typeof factories>['salon']>>;
+
+type Row = {
+  name: string;
+  method: Method;
+  path: (s: Salon) => string;
+  body?: (s: Salon) => object;
+  allowed: Role[];
+};
+
+const matrix: Row[] = [
+  { name: 'list bookings', method: 'get', path: () => '/v1/bookings', allowed: ['owner', 'admin', 'staff'] },
+  {
+    name: 'create service',
+    method: 'post',
+    path: () => '/v1/services',
+    body: () => ({ name: 'Beard trim', durationMinutes: 15, priceCents: 800 }),
+    allowed: ['owner', 'admin'],
+  },
+  // TODO 1: one row for EVERY route in your API that needs a business (look at your controllers, or Swagger)
+  // TODO 2: routes with an :id need a real resource: create it in the salon factory, or in `path`
+];
+
+let t: Awaited<ReturnType<typeof createTestApp>>;
+let f: ReturnType<typeof factories>;
+
+beforeAll(async () => {
+  t = await createTestApp();
+  f = factories(t.prisma);
+});
+beforeEach(() => resetDb(t.prisma));
+afterAll(() => t.close());
+
+describe.each(matrix)('$method $name', (row) => {
+  it.each<Role>(['owner', 'admin', 'staff'])('as %s', async (role) => {
+    const salon = await f.salon();
+    // TODO 3: create a user with this role in the salon and log in as them
+    // TODO 4: send the request with the body (if any) and the right headers
+    // TODO 5: allowed → status is not 403; not allowed → exactly 403, and problem+json
+  });
+});
+
+// TODO 6: one more test: every route without a login returns 401 (reuse the matrix)
+```
+
+Then answer in `TESTING.md`: why does the test check `not 403` for allowed roles instead of `200`?
+
+## Scaffold: the bug hunt
+
+A suite is only good if it **catches bugs**. Prove it. On a new branch `bug-hunt`, make each change below **one at a time**, run the tests, write down which test failed, and undo the change:
+
+| # | Break this | Which test should catch it? |
+| --- | --- | --- |
+| 1 | `overlaps`: `<` becomes `<=` | |
+| 2 | Drop the `bookings_no_overlap` constraint in a new migration | |
+| 3 | `BookingsRepository.findOne`: remove `businessId` from the `where` | |
+| 4 | Remove `@Roles(['owner', 'admin'])` from `DELETE /v1/services/:id` | |
+| 5 | `MembershipGuard`: skip the membership lookup and trust `X-Business-Id` | |
+| 6 | Refresh: remove the reuse check (always rotate) | |
+| 7 | Login: return "User not found" for unknown emails | |
+| 8 | Password reset links: 30 minutes becomes 30 hours | |
+| 9 | The booking response includes `customer.phone` | |
+| 10 | Map the exclusion constraint error to 500 instead of 409 | |
+| 11 | `OriginGuard`: allow any `Origin` | |
+| 12 | `BookingForm`: remove `if (sending) return` and the `disabled` attribute | |
+
+Your suite must catch **at least 11 of 12**. For each one it misses, write the missing test, then run the hunt again. Put the final table in `TESTING.md`: it's excellent interview material ("I broke my own code twelve ways to check my tests").
+
+## TESTING.md
+
+A short document in the API repo (1–2 pages):
+
+1. **How to run:** the commands, what each needs (Docker? Mailpit?), how long each takes on your machine.
+2. **Strategy:** which kinds of tests you write for what, and why most tests use a real Postgres. A small diagram or table of the layers.
+3. **Conventions:** file names (`.spec.ts`, `.int-spec.ts`, `.e2e-spec.ts`), builders vs factories, the `Clock`, MSW, two businesses in every tenant test.
+4. **What isn't tested, and why** (honest gaps: real Google login, real Stripe, load).
+5. **The bug hunt table.**
+
+## Suggested order
+
+1. Unit test config fixes (`clearMocks`, `restoreMocks`), `slots.ts` tests, builders (Lessons 1–2).
+2. Policy, guard and DTO unit tests (Lesson 2).
+3. Testcontainers global setup, `env.ts`, `resetDb`, factories, repository tests (Lesson 3). **Get `npm run test:int` green before going further.**
+4. `configureApp`, `createTestApp`, `loginAs`, `client`, the first endpoint tests (Lesson 4).
+5. Tenant tests and the permissions matrix.
+6. Auth flow tests.
+7. `Clock`, DST tests, MSW, race tests (Lesson 5).
+8. `api.yml` and branch protection (Lesson 8). From here on, every change goes through a PR.
+9. Frontend component tests (Lesson 6).
+10. Playwright: e2e database, seed, setup project, the flows, axe (Lesson 7), then `e2e.yml`.
+11. The bug hunt and `TESTING.md`.
+
+## Test checklist
+
+1. Fresh clone, Docker running, nothing else: `npm ci && npm run test:all` passes.
+2. `npm test` passes **with Docker stopped**.
+3. `npm run test:int -- --randomize` passes three times in a row.
+4. Running one integration file alone (`npm run test:int -- bookings.repository`) passes.
+5. The race test passes 10 times in a row (`-t "simultaneous"` in a loop).
+6. Changing your computer's time zone (or `TZ=Asia/Dhaka`) doesn't change any result.
+7. Turning off Wi-Fi doesn't change any result (MSW catches every outside call).
+8. `npx playwright test --repeat-each=5 --workers=4` passes.
+9. A PR that breaks a test can't be merged.
+10. The bug hunt catches at least 11 of 12.
+
+## Part 2: test plan for Mini-build A
+
+Before you build the URL shortener (Month 2), write its test plan in its README, using what you learned:
+
+- Which rules get **unit** tests (short code generation, URL validation, the "no private IPs" rule from SSRF in [Auth Lesson 8](/docs/auth-security/lesson-8-abuse-and-secrets))?
+- Which get **integration** tests (unique short codes under a race, click counting)?
+- How will you test **rate limiting** (Lesson 4: switch it on in one file) and the **Redis cache** (Month 2: a Redis container with Testcontainers, cache hit vs miss, invalidation on update)?
+- Which **one** browser test is worth writing, if any?
+
+## When you're done
+
+1. Push both repos with green badges, `TESTING.md` and the bug hunt table.
+2. Paste `createTestApp`, the factories, the permissions matrix and the race test into Claude for a **scored code review**.
+3. Ask Claude for a **10-question testing quiz**: at least two "which kind of test would you write?" questions, one flaky-test diagnosis, one question about mocks vs fakes and one about testing time. **Score 8 or more** to move on.
+4. Blog post idea: "I broke my own booking API 12 ways to check my tests" (the bug hunt, which tests caught what, the two it missed at first and why). It's honest, specific and practical, which is exactly what makes a dev.to or LinkedIn post stand out.
+5. Update the progress box on the [section home page](/docs/testing).

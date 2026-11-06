@@ -1,0 +1,425 @@
+---
+title: "Lesson 6: Emails through a queue and the outbox relay"
+description: "Moving AuthEmails onto the queue without changing its callers, the Mailer and email templates with HTML escaping, tokens in job data, why 'save, then add a job' can lose work, the outbox relay (skip locked, addBulk, job IDs), an events queue that fans out to handlers, the booking confirmation email in the business's time zone, out-of-order events, tenants in workers, the duplicate-email window, and sending email in production."
+---
+
+Two kinds of email in the booking platform:
+
+1. **Auth emails** (verify email, password reset, invites, "your password was changed"): the user just did something and is waiting for the email.
+2. **Booking emails** (confirmation, cancellation, reminder): they must be sent **if and only if** the booking change was really saved.
+
+Both go through the `emails` queue from Lesson 5. They get there in different ways.
+
+## Part 1: Auth emails through the queue
+
+### Keep the callers unchanged
+
+`AuthService` calls `this.emails.sendVerifyEmail(to, name, token)` ([Auth Lesson 4](/docs/auth-security/lesson-4-email-flows)), and the tests replace `AuthEmails` with a fake ([Testing Lesson 4](/docs/testing/lesson-4-api-e2e-tests)). Keep that class and its method names; only change what's inside:
+
+```typescript
+// src/auth/auth-emails.ts
+import { Injectable } from '@nestjs/common';
+import type { JobsOptions } from 'bullmq';
+import { EmailQueue } from '../emails/email-queue';
+
+/** Jobs that contain one-time tokens: delete them from Redis as soon as they're done. */
+const HAS_SECRET: JobsOptions = { removeOnComplete: true, removeOnFail: { age: 24 * 3600 } };
+
+@Injectable()
+export class AuthEmails {
+  constructor(private readonly queue: EmailQueue) {}
+
+  async sendVerifyEmail(to: string, name: string, token: string): Promise<void> {
+    await this.queue.add('verify-email', { to, name, token }, HAS_SECRET);
+  }
+
+  async sendPasswordReset(to: string, token: string): Promise<void> {
+    await this.queue.add('password-reset', { to, token }, { ...HAS_SECRET, priority: 1 });
+  }
+
+  // sendAlreadyRegistered, sendPasswordChanged, sendInvite: same pattern
+}
+```
+
+Sign-up now takes a few milliseconds instead of a few seconds, and works even when the SMTP server is down: the job waits and retries.
+
+### Tokens in job data
+
+The verify token **has** to be in the job: the database only stores its hash, so the worker can't look it up. That makes Redis a place where secrets live for a short time. So:
+
+- `removeOnComplete: true` for these jobs: the token is gone from Redis seconds after the email is sent.
+- Never log `job.data` (the `failed` logger in Lesson 5 logs only the ID and name for this reason).
+- The dashboard (Lesson 8) shows job data: protect it like an admin page.
+- Redis itself: password, private network, TLS in the cloud (Lesson 2).
+
+### If Redis is down
+
+`queue.add` throws. Decide per flow:
+
+- **Forgot password:** let it fail with 503 "try again in a moment". The user hasn't lost anything.
+- **Sign-up:** the user row is already created. Log the error and return success; the "resend verification email" button (rate-limited) covers it.
+
+If even that isn't acceptable, the email request can go through the outbox (Part 2), but then the token would sit in a Postgres table in plain text. For auth emails, the direct add is the usual trade-off.
+
+## The worker side: `Mailer` and templates
+
+The Nodemailer code moves from `AuthEmails` into the worker:
+
+```typescript
+// src/emails/mailer.ts
+import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import nodemailer, { type Transporter } from 'nodemailer';
+
+export type EmailContent = { subject: string; text: string; html: string };
+
+@Injectable()
+export class Mailer {
+  private readonly transport: Transporter;
+  readonly appUrl: string;
+
+  constructor(config: ConfigService<Env, true>) {
+    this.transport = nodemailer.createTransport(config.get('SMTP_URL', { infer: true }));
+    this.appUrl = config.get('APP_URL', { infer: true });
+  }
+
+  /** Link with the token in the URL fragment (Auth Lesson 4: scanners and logs). */
+  link(path: string, token: string): string {
+    const url = new URL(path, this.appUrl);
+    url.hash = `token=${token}`;
+    return url.href;
+  }
+
+  async send(to: string, content: EmailContent): Promise<void> {
+    await this.transport.sendMail({ from: 'Booking <no-reply@booking.test>', to, ...content });
+  }
+}
+```
+
+Templates are plain functions: easy to unit test, no state.
+
+```typescript
+// src/emails/templates.ts
+import type { EmailContent } from './mailer';
+
+const ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+export const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => ESCAPES[c]);
+
+function layout(body: string): string {
+  return `<!doctype html><html><body style="font-family: sans-serif; line-height: 1.5">${body}</body></html>`;
+}
+
+export function verifyEmail(p: { name: string; link: string }): EmailContent {
+  return {
+    subject: 'Verify your email',
+    text: `Hi ${p.name},\n\nConfirm your email address: ${p.link}\n\nThis link expires in 24 hours.`,
+    html: layout(
+      `<p>Hi ${escapeHtml(p.name)},</p>` +
+      `<p><a href="${escapeHtml(p.link)}">Confirm my email address</a></p>` +
+      `<p>This link expires in 24 hours.</p>`,
+    ),
+  };
+}
+
+export function bookingConfirmation(p: {
+  customerName: string; businessName: string; serviceName: string; staffName: string; when: string;
+}): EmailContent {
+  const line = `${p.serviceName} with ${p.staffName} at ${p.businessName}, ${p.when}`;
+  return {
+    subject: `Booking confirmed: ${p.businessName}`.replace(/[\r\n]/g, ' '),   // no new lines in a subject
+    text: `Hi ${p.customerName},\n\nYour booking is confirmed:\n${line}\n`,
+    html: layout(`<p>Hi ${escapeHtml(p.customerName)},</p><p>Your booking is confirmed:<br>${escapeHtml(line)}</p>`),
+  };
+}
+```
+
+**Every** value from users is escaped in HTML: customer names, business names, service names. A business could name a service `<a href="https://evil.example">Pay here</a>`, and your server would send that link to its customers ([Auth Lesson 4](/docs/auth-security/lesson-4-email-flows) warned about this).
+
+For nicer emails, React Email lets you write templates as React components and render them to HTML. As a frontend engineer you'll like it, but plain functions are enough for now.
+
+## Part 2: Booking emails and the outbox
+
+### Why "save, then add a job" isn't enough
+
+```typescript
+const booking = await this.bookings.create(businessId, input);        // committed
+await this.emailQueue.add('booking-confirmation', { businessId, bookingId: booking.id });
+```
+
+Two problems:
+
+- If the process crashes (or Redis is down) **between** the two lines, the booking exists and the email is never sent. Nobody notices.
+- If you add the job **before** or **inside** the transaction, and the transaction then rolls back, the customer gets a confirmation for a booking that doesn't exist.
+
+This is the **dual write** problem: two systems (Postgres and Redis) can't be updated atomically. You already have the fix from [PostgreSQL Lesson 6](/docs/postgresql/lesson-6-transactions-and-locking): the **transactional outbox**. The booking transaction inserts an `outbox` row (`booking.created`). Now you build the other half: a **relay** that moves outbox rows into BullMQ.
+
+```text
+API: transaction { insert booking; insert outbox row }        ← both or neither
+          │
+Relay (worker): outbox rows ──► events queue ──► handlers ──► emails queue, cache, webhooks
+```
+
+### The relay
+
+```typescript
+// src/outbox/outbox-relay.processor.ts
+import { InjectQueue, Processor, WorkerHost } from '@nestjs/bullmq';
+import type { Queue } from 'bullmq';
+import { PrismaService } from '../prisma/prisma.service';
+import { EVENTS, OUTBOX } from '../queues/names';
+
+type OutboxRow = { id: bigint; topic: string; payload: Record<string, unknown> };
+const BATCH = 100;
+
+@Processor(OUTBOX, { concurrency: 1 })
+export class OutboxRelayProcessor extends WorkerHost {
+  constructor(
+    private readonly prisma: PrismaService,
+    @InjectQueue(EVENTS) private readonly events: Queue,
+  ) {
+    super();
+  }
+
+  async process(): Promise<{ published: number }> {
+    let published = 0;
+    for (;;) {
+      const count = await this.publishBatch();
+      published += count;
+      if (count < BATCH) return { published };          // caught up
+    }
+  }
+
+  private publishBatch(): Promise<number> {
+    return this.prisma.$transaction(async (tx) => {
+      const rows = await tx.$queryRaw<OutboxRow[]>`
+        select id, topic, payload
+        from outbox
+        where published_at is null
+        order by id
+        limit ${BATCH}
+        for update skip locked`;
+      if (rows.length === 0) return 0;
+
+      await this.events.addBulk(
+        rows.map((r) => ({
+          name: r.topic,
+          data: { ...r.payload, eventId: r.id.toString() },
+          opts: { jobId: `evt-${r.id}` },                // a second publish of the same row is ignored
+        })),
+      );
+
+      const ids = rows.map((r) => r.id.toString());
+      await tx.$executeRaw`update outbox set published_at = now() where id = any(${ids}::bigint[])`;
+      return rows.length;
+    });
+  }
+}
+```
+
+Run it every second with a **job scheduler** (Lesson 7 explains schedulers in detail):
+
+```typescript
+// src/outbox/outbox-scheduler.ts (provided only in the worker)
+@Injectable()
+export class OutboxScheduler implements OnModuleInit {
+  constructor(@InjectQueue(OUTBOX) private readonly queue: Queue) {}
+
+  async onModuleInit() {
+    await this.queue.upsertJobScheduler(
+      'outbox-relay',
+      { every: 1_000 },
+      { name: 'relay', opts: { removeOnComplete: true, removeOnFail: 100 } },
+    );
+  }
+}
+```
+
+Why it's safe:
+
+| Failure | What happens |
+| --- | --- |
+| Redis is down | `addBulk` throws, the transaction rolls back, the rows stay unpublished; the next run tries again. **Bookings keep working**: the API only writes to Postgres |
+| The relay crashes after `addBulk`, before the commit | Rows stay unpublished and are published again, but the job IDs (`evt-42`) make BullMQ ignore the duplicates |
+| Two workers run the relay | `skip locked`: each takes different rows |
+
+<Callout title="A Redis call inside a transaction?">
+[PostgreSQL Lesson 6](/docs/postgresql/lesson-6-transactions-and-locking) said: never call outside services inside a transaction. The relay is the deliberate exception: the transaction only locks a few outbox rows (which nobody else needs), and `addBulk` to Redis takes about a millisecond. If Redis is slow, only the relay waits. If you prefer, publish first and mark rows in a second short transaction: the job IDs make the extra publish harmless.
+</Callout>
+
+Latency is up to a second. That's fine for emails. If you want it instant, the API can `NOTIFY outbox` after the commit and the relay `LISTEN`s, with the 1-second schedule as the safety net.
+
+Clean up the outbox: a daily scheduled job deletes rows published more than 7 days ago (Lesson 7).
+
+### The events queue: one event, many handlers
+
+One `booking.created` event causes several things: a confirmation email, an availability cache bump (Lesson 3), a reminder (Lesson 7), webhooks to the business's systems (the practice project). Put each in its own job, so one failing (a customer's webhook server is down) doesn't retry the others (the email is sent again):
+
+```typescript
+// src/events/domain-events.ts
+type BookingEvent = { eventId: string; businessId: string; bookingId: string };
+
+export type DomainEvent =
+  | ({ topic: 'booking.created' } & BookingEvent)
+  | ({ topic: 'booking.cancelled' } & BookingEvent)
+  | ({ topic: 'booking.rescheduled' } & BookingEvent);
+```
+
+```typescript
+// src/events/events.processor.ts
+@Processor(EVENTS, { concurrency: 10 })
+export class EventsProcessor extends WorkerHost {
+  constructor(
+    private readonly emails: EmailQueue,
+    private readonly availability: AvailabilityService,
+  ) {
+    super();
+  }
+
+  async process(job: Job): Promise<void> {
+    const event = { ...job.data, topic: job.name } as DomainEvent;
+    const { businessId, bookingId } = event;
+
+    switch (event.topic) {
+      case 'booking.created':
+        await this.emails.add('booking-confirmation', { businessId, bookingId }, { jobId: `confirm-${bookingId}` });
+        break;
+      case 'booking.cancelled':
+        await this.emails.add('booking-cancelled', { businessId, bookingId }, { jobId: `cancelled-${bookingId}` });
+        break;
+      case 'booking.rescheduled':
+        await this.emails.add('booking-rescheduled', { businessId, bookingId }, { jobId: `rescheduled-${event.eventId}` });
+        break;
+      default: {
+        const unknown: never = event;
+        throw new UnrecoverableError(`Unknown event ${(unknown as DomainEvent).topic}`);
+      }
+    }
+    await this.availability.invalidate(businessId);     // also done after commit in the API; this is the safety net
+  }
+}
+```
+
+(Add `booking-cancelled` and `booking-rescheduled` to the `EmailJob` union.)
+
+Notice the job IDs. A booking gets **one** confirmation and one cancellation, ever, so the booking ID is the key. It can be rescheduled several times, so each reschedule uses the **event** ID.
+
+### The confirmation email
+
+```typescript
+// src/emails/booking-emails.ts
+@Injectable()
+export class BookingEmails {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly mailer: Mailer,
+  ) {}
+
+  async sendConfirmation({ businessId, bookingId }: { businessId: string; bookingId: string }) {
+    const booking = await this.prisma.booking.findFirst({
+      where: { id: bookingId, businessId },                         // tenant-scoped, even in a worker
+      include: { customer: true, service: true, staff: true, business: true },
+    });
+    if (!booking) throw new UnrecoverableError(`booking ${bookingId} not found`);
+
+    // Idempotent: nothing to do if it's no longer confirmed, or already sent
+    if (booking.status !== 'confirmed' || booking.confirmationSentAt) return;
+
+    const when = new Intl.DateTimeFormat('en-GB', {
+      timeZone: booking.business.timeZone,                          // the BUSINESS's time zone, not the server's
+      dateStyle: 'full',
+      timeStyle: 'short',
+    }).format(booking.startsAt);
+
+    await this.mailer.send(
+      booking.customer.email,
+      bookingConfirmation({
+        customerName: booking.customer.name,
+        businessName: booking.business.name,
+        serviceName: booking.service.name,
+        staffName: booking.staff.name,
+        when,                                                       // about "Friday 15 January 2027 at 10:00"
+      }),
+    );
+
+    await this.prisma.booking.update({ where: { id: booking.id }, data: { confirmationSentAt: new Date() } });
+  }
+}
+```
+
+Add the columns to the schema:
+
+```prisma
+model Booking {
+  // ...
+  confirmationSentAt DateTime? @map("confirmation_sent_at") @db.Timestamptz(3)
+  reminderSentAt     DateTime? @map("reminder_sent_at") @db.Timestamptz(3)     // Lesson 7
+}
+```
+
+The processor's `booking-confirmation` case calls `bookingEmails.sendConfirmation(email.data)`.
+
+### Events can arrive out of order
+
+With concurrency and retries, `booking.cancelled` can be processed **before** the `booking-confirmation` email job for the same booking runs. If the confirmation job only trusted its event, the customer would get "Confirmed!" after cancelling. That's why the job **reads the current state** (`status !== 'confirmed'` → do nothing). Don't design handlers that depend on order; design them to look at the truth (Postgres) when they run.
+
+### The duplicate-email window
+
+There's still one gap: the email is sent, then the worker crashes **before** saving `confirmationSentAt`. The retry sends it again. You can make this window smaller, but not zero, because the email server and Postgres can't commit together (the same dual-write problem).
+
+Options:
+
+- **Accept it.** A rare duplicate confirmation is harmless. Most companies accept it, and say so.
+- Use the email provider's **idempotency key** if it has one (some APIs, like Resend's, accept an idempotency key header; SMTP doesn't): send `confirm-{bookingId}` and the provider drops the duplicate.
+- For things where a duplicate **is** harmful (charging a card), the outside service must support idempotency keys. Stripe does (Month 3).
+
+## Tenants in workers
+
+A worker has no request, no JWT and no `MembershipGuard`. All tenant safety comes from the **data** in the job:
+
+- Every job carries `businessId`, and every query uses it (`findFirst({ where: { id, businessId } })`, not `findUnique({ where: { id } })`).
+- If you turned on Row-Level Security ([PostgreSQL Lesson 10](/docs/postgresql/lesson-10-multi-tenancy-and-scaling)), the worker must set `app.business_id` in each transaction, exactly like the API.
+- Never trust IDs from **outside** without checking them. Your own outbox events are trusted; a webhook payload from somewhere else isn't.
+
+## Sending email in production
+
+Mailpit is for development. In production, use an email service: Amazon SES (cheap, on AWS), Postmark or Resend (simple, good deliverability). Three DNS records decide whether your emails reach the inbox or the spam folder:
+
+- **SPF**: which servers may send email for your domain.
+- **DKIM**: a signature that proves the email wasn't changed.
+- **DMARC**: what receivers should do when SPF or DKIM fails.
+
+The provider's setup guide gives you the exact records. Also handle **bounces and complaints** (the provider sends a webhook): stop emailing addresses that bounce, or your sending reputation drops. That's a good small feature for Month 3.
+
+## Mistakes to avoid
+
+- Changing the callers of `AuthEmails` (and breaking the tests' fake) instead of only its insides.
+- Keeping token jobs in Redis for a week, or logging their data.
+- Adding a job inside or before the transaction (confirmation for a booking that rolled back).
+- Adding a job after the commit with nothing to catch a crash in between (a booking without an email).
+- An outbox relay without job IDs (a crash publishes events twice).
+- One big job that sends the email **and** calls webhooks **and** bumps the cache: one failure retries everything.
+- Formatting times in the server's time zone (UTC) instead of the business's.
+- Trusting the order of events.
+- Worker queries without `businessId`.
+- User input in HTML emails without escaping, or new lines in subjects.
+
+## Exercises
+
+- **6.1** 🟢 Move `AuthEmails` onto the queue, and the Nodemailer code into `Mailer` and templates in the worker. Check sign-up and password reset end to end with Mailpit. Run the API tests from the Testing section: do they still pass without changes? Why?
+- **6.2** 🟡 Build the outbox relay and its scheduler. Create 50 bookings with a script, with **two** worker processes running. Prove that every event was published exactly once to the `events` queue (count `evt-*` jobs, or log each publish with the worker's PID and check for duplicates). Then kill one worker in the middle and check again.
+- **6.3** 🟡 Build the events processor and the confirmation email. Create a booking for a business in `Asia/Dhaka` at `2027-01-15T04:00:00Z`: what time must the email show? Check in Mailpit. Then cancel a booking **before** the worker runs (stop the worker, create and cancel, start the worker): what emails arrive, and why?
+- **6.4** 🔴 Failure drill. Stop Redis. Create 5 bookings: does the API still return 201? Start Redis: do all 5 confirmations arrive? Now write down what would have happened with "save, then add a job" instead of the outbox. Then stop Mailpit during a confirmation, kill the worker right after `mailer.send` returns (add a temporary 10-second wait before the `update`), restart, and explain the result.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you make sure an email is sent only if the database change was saved?"**
+
+> "I use the transactional outbox pattern. In the same transaction that creates the booking, I insert an event row into an outbox table, so either both are saved or neither is. A relay in the worker reads unpublished outbox rows with `FOR UPDATE SKIP LOCKED`, adds them to a BullMQ queue with the outbox ID as the job ID, and marks them published. If Redis is down, nothing is lost: the rows wait in Postgres and the API keeps working. Delivery is at least once, so the email job is idempotent: it loads the booking, checks that it's still confirmed and that the confirmation hasn't been sent, sends it and records the time. There's still a tiny window where a crash after sending causes a duplicate, which I accept for emails; for payments I'd use the provider's idempotency keys."
+
+**"Why not just add the job after the transaction commits?"**
+
+> "Because Postgres and Redis can't be updated atomically. If the process crashes or Redis is unavailable between the commit and the add, the booking exists but the email is never sent, and nothing will retry it. Adding the job inside the transaction is worse: if the transaction rolls back, the customer gets a confirmation for a booking that doesn't exist. The outbox turns two writes into one database write plus a retryable copy step."

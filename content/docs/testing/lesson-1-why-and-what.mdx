@@ -1,0 +1,283 @@
+---
+title: "Lesson 1: Why test, what to test, and Jest basics"
+description: "Why automated tests matter, the kinds of tests (unit, integration, API, browser), the test pyramid vs the testing trophy, how to decide what to test, testing behaviour instead of implementation, Jest basics (describe, it, matchers, it.each, mocks), and Jest vs Vitest."
+---
+
+A test is a small program that runs your code and checks the result. You write it once, and it checks the same thing again on every change, forever, in seconds.
+
+Tests give you three things:
+
+1. **Confidence to change code.** You can refactor `BookingsService` and know in 30 seconds if anything broke.
+2. **Documentation that can't go out of date.** A test named `rejects a booking that overlaps an existing one` explains a rule better than a comment.
+3. **Better design.** Code that's hard to test is usually too tangled. If you need 15 mocks to test one function, the function does too much.
+
+## Kinds of tests
+
+| Kind | What runs | Speed | Example in the booking API |
+| --- | --- | --- | --- |
+| **Unit** | One function or class; everything else is faked | Milliseconds | `freeSlots()` returns the right times; `BookingsService.cancel` refuses a cancelled booking |
+| **Integration** | Your code plus a real dependency, usually the database | ~10–100 ms each (plus a few seconds to start Postgres once) | `BookingsRepository.create` really hits the exclusion constraint |
+| **API (e2e for the backend)** | The whole Nest app over HTTP, with a real database | ~20–200 ms each | `POST /v1/bookings` with a staff cookie returns 201 with the right JSON |
+| **Browser e2e** | Frontend + API + database, in a real browser | Seconds each | A user logs in, picks a slot and sees "Booking confirmed" |
+
+Names aren't used the same way everywhere. Many NestJS teams call the API tests "e2e" (the Nest CLI creates `test/app.e2e-spec.ts`), while frontend teams mean browser tests. In an interview, say what **runs** in your test, not just its name.
+
+## The pyramid and the trophy
+
+The classic **test pyramid**: many unit tests at the bottom, fewer integration tests, very few browser tests at the top. Lower tests are faster and more precise; higher tests give more confidence but are slower and break more often.
+
+The **testing trophy** (Kent C. Dodds) says: for most web apps, put **most** of your effort in integration tests, because they test how pieces work together, and that's where real bugs are. Add static checks (TypeScript, ESLint) at the bottom.
+
+For your booking API, a practical mix:
+
+| Layer | Share | What goes here |
+| --- | --- | --- |
+| TypeScript strict + ESLint | Always on | Typos, wrong types, unused code |
+| Unit | ~40% | Pure rules: slots, prices, time zones, policy functions, guards |
+| Integration + API (real Postgres) | ~50% | Repositories, constraints, every endpoint's main and error paths, auth, tenants |
+| Browser (Playwright) | ~10%, a handful of tests | Log in, book, cancel, invite: the flows that lose money if broken |
+
+Why so many database tests? Because your most important rules **live in Postgres**: the no-overlap constraint, unique emails, foreign keys, `for update`. A unit test with a mocked repository can't prove any of them.
+
+## What to test
+
+Test where a bug would **hurt** and where bugs are **likely**:
+
+- **Business rules:** no double bookings, cancellation rules, slot calculation, prices.
+- **Security:** 401, 403, 404 for other tenants, refresh token reuse, one-time links. A missing check is invisible until someone exploits it.
+- **Time:** time zones, DST, "tomorrow", expiry. Easy to get wrong, hard to notice.
+- **Money:** amounts in cents, refunds, Stripe webhook handling.
+- **Edges:** empty lists, the last page, the exact boundary (a booking ending at 10:30 and one starting at 10:30).
+- **Every bug you fix:** first write a test that fails because of the bug, then fix it. This is a **regression test**, and the bug never comes back.
+
+Don't test:
+
+- **Framework or library code.** Don't test that NestJS calls your controller or that Prisma saves a row; test **your** logic.
+- **Private methods directly.** Test them through the public method that uses them.
+- **Trivial code:** a getter, a DTO with no logic, a controller method that only calls a service (the API tests cover it).
+- **Exact implementation details:** "it called `findFirst` and then `update`". When you refactor to one `updateMany`, the behaviour is the same, but the test breaks.
+
+### Behaviour, not implementation
+
+```typescript
+// ❌ Tests HOW it works: breaks when you refactor, even if nothing is wrong
+expect(repo.findById).toHaveBeenCalledTimes(1);
+expect(repo.update).toHaveBeenCalledWith('b1', { status: 'cancelled', cancelledAt: expect.any(Date) });
+
+// ✅ Tests WHAT it does: the result the caller sees
+const booking = await service.cancel(actor, 'b1');
+expect(booking.status).toBe('cancelled');
+```
+
+Sometimes the call **is** the behaviour: "the email service was called with the reset link", "no booking was inserted when validation failed". Checking a mock is fine then. The question is: "would a user or another part of the system notice if this changed?"
+
+## Jest basics
+
+NestJS projects come with Jest configured in `package.json`:
+
+```json
+"jest": {
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": "src",
+  "testRegex": ".*\\.spec\\.ts$",
+  "transform": { "^.+\\.(t|j)s$": "ts-jest" },
+  "collectCoverageFrom": ["**/*.(t|j)s"],
+  "coverageDirectory": "../coverage",
+  "testEnvironment": "node"
+}
+```
+
+Add two lines to it now:
+
+```jsonc
+"clearMocks": true,       // reset every jest.fn() call history before each test
+"restoreMocks": true      // undo every jest.spyOn() after each test
+```
+
+Without them, a mock's calls from test 1 are still there in test 2, and tests start depending on their order.
+
+### A pure function to test
+
+```typescript
+// src/bookings/slots.ts
+export type Range = { start: Date; end: Date };
+
+/** Two ranges overlap if each starts before the other ends. Touching ends don't overlap. */
+export function overlaps(a: Range, b: Range): boolean {
+  return a.start < b.end && b.start < a.end;
+}
+
+/** Start times of free slots of `durationMin` minutes inside `day`, skipping `taken` ranges. */
+export function freeSlots(day: Range, durationMin: number, taken: Range[]): Date[] {
+  if (durationMin <= 0) throw new RangeError('durationMin must be positive');
+
+  const step = durationMin * 60_000;
+  const slots: Date[] = [];
+  for (let t = day.start.getTime(); t + step <= day.end.getTime(); t += step) {
+    const slot = { start: new Date(t), end: new Date(t + step) };
+    if (!taken.some((b) => overlaps(slot, b))) slots.push(slot.start);
+  }
+  return slots;
+}
+```
+
+This is the same `[start, end)` rule as the `tstzrange` exclusion constraint from [PostgreSQL Lesson 3](/docs/postgresql/lesson-3-time-and-ranges): a booking that ends at 10:30 doesn't clash with one that starts at 10:30.
+
+```typescript
+// src/bookings/slots.spec.ts
+import { freeSlots, overlaps, type Range } from './slots';
+
+// Small helper: makes test data short and readable
+const at = (time: string) => new Date(`2026-12-01T${time}:00Z`);
+const range = (from: string, to: string): Range => ({ start: at(from), end: at(to) });
+
+describe('overlaps', () => {
+  it.each([
+    ['same range',            range('10:00', '10:30'), range('10:00', '10:30'), true],
+    ['partly overlapping',    range('10:00', '10:30'), range('10:15', '10:45'), true],
+    ['one inside the other',  range('10:00', '11:00'), range('10:15', '10:30'), true],
+    ['touching ends',         range('10:00', '10:30'), range('10:30', '11:00'), false],
+    ['far apart',             range('10:00', '10:30'), range('12:00', '12:30'), false],
+  ])('%s → %s', (_name, a, b, expected) => {
+    expect(overlaps(a, b)).toBe(expected);
+    expect(overlaps(b, a)).toBe(expected);       // the order of arguments mustn't matter
+  });
+});
+
+describe('freeSlots', () => {
+  const day = range('09:00', '11:00');
+
+  it('returns every slot when nothing is booked', () => {
+    expect(freeSlots(day, 30, [])).toEqual([at('09:00'), at('09:30'), at('10:00'), at('10:30')]);
+  });
+
+  it('skips slots that overlap a booking', () => {
+    const slots = freeSlots(day, 30, [range('09:15', '09:45')]);
+
+    expect(slots).toEqual([at('10:00'), at('10:30')]);
+  });
+
+  it('does not return a slot that would end after closing time', () => {
+    expect(freeSlots(range('09:00', '10:00'), 45, [])).toEqual([at('09:00')]);
+  });
+
+  it('throws for a zero-length service', () => {
+    expect(() => freeSlots(day, 0, [])).toThrow(RangeError);
+  });
+});
+```
+
+Run it:
+
+```powershell
+npm test -- slots          # only files whose path matches "slots"
+npm run test:watch         # re-runs related tests on every save; press "p" to filter
+```
+
+### The shape of a good test
+
+Every test has three parts, often called **Arrange, Act, Assert**:
+
+```typescript
+it('skips slots that overlap a booking', () => {
+  const taken = [range('09:15', '09:45')];        // Arrange: the situation
+  const slots = freeSlots(day, 30, taken);        // Act: one call
+  expect(slots).toEqual([at('10:00'), at('10:30')]);   // Assert: the result
+});
+```
+
+Rules that keep tests readable:
+
+- **The name is a sentence** about behaviour: `it('rejects a booking in the past')`, not `it('test create 3')`. When it fails, the name alone should tell you what's broken.
+- **No logic in tests.** No `if`, no loops that compute the expected value. If the test calculates the answer the same way as the code, both can be wrong together. Write the expected value by hand.
+- **One behaviour per test.** Several `expect`s are fine if they check one behaviour.
+- **Tests don't depend on each other.** Each test sets up what it needs. Running one test alone (`it.only`) must work.
+
+### Matchers you'll use every day
+
+| Matcher | Use for |
+| --- | --- |
+| `toBe(x)` | Primitives and "the same object" (`===`) |
+| `toEqual(x)` | Objects and arrays by value; ignores `undefined` properties |
+| `toStrictEqual(x)` | Like `toEqual`, but `undefined` properties and class types count |
+| `toMatchObject({ ... })` | The object has **at least** these properties (good for API responses) |
+| `toHaveLength(n)`, `toContain(x)` | Arrays and strings |
+| `toThrow(ErrorClass)` / `toThrow('message')` | A sync function throws |
+| `await expect(promise).rejects.toThrow(...)` | An async function throws. Don't forget `await`! |
+| `toHaveBeenCalledWith(...)`, `toHaveBeenCalledTimes(n)`, `not.toHaveBeenCalled()` | Mocks |
+| `expect.any(Date)`, `expect.stringMatching(/^bk_/)`, `expect.objectContaining({...})` | Parts you can't predict, like IDs and dates |
+
+```typescript
+expect(response.body).toMatchObject({
+  id: expect.any(String),
+  status: 'confirmed',
+  startsAt: '2026-12-01T10:00:00.000Z',
+});
+```
+
+### Mocks, stubs, fakes and spies
+
+Interviewers like these words. They all mean "something that stands in for a real dependency":
+
+| Word | Meaning | In Jest |
+| --- | --- | --- |
+| **Stub** | Returns fixed answers | `jest.fn().mockResolvedValue(booking)` |
+| **Mock** | A stub you also **check**: was it called, with what? | `expect(email.send).toHaveBeenCalledWith(...)` |
+| **Spy** | Wraps a **real** function to watch it (it can still run) | `jest.spyOn(service, 'notify')` |
+| **Fake** | A small working version | An in-memory repository; Mailpit; MSW handlers (Lesson 5) |
+
+```typescript
+const send = jest.fn();                                  // returns undefined
+send.mockResolvedValue({ id: 'msg_1' });                 // every call resolves to this
+send.mockRejectedValueOnce(new Error('SMTP down'));      // only the next call fails
+send.mockImplementation(async (to: string) => ({ id: `msg_${to}` }));
+```
+
+Mock **at the edges** of your system: email, payment providers, other HTTP APIs, the clock. Don't mock your own small helpers; it makes tests know too much about the code's insides.
+
+## Jest vs Vitest
+
+| | Jest | Vitest |
+| --- | --- | --- |
+| Where you'll see it | NestJS default, most existing Node projects | Vite projects, Next.js docs, most new frontend projects |
+| TypeScript | Through `ts-jest` or SWC | Built in (uses Vite) |
+| ESM | Still awkward | Works out of the box |
+| Speed | Good | Usually faster, very fast watch mode |
+| API | `describe`, `it`, `expect`, `jest.fn()` | Almost the same; `vi.fn()` instead of `jest.fn()` |
+
+In this section: **Jest for the NestJS API** (it's the default, and every NestJS guide uses it) and **Vitest for the Next.js frontend** (Lesson 6). Because the APIs are almost the same, you learn both at once. In an interview: "I use Jest in NestJS because it's the default and works well with its testing module; for Vite or Next.js frontends I use Vitest because it handles ESM and TypeScript without extra config and is faster in watch mode."
+
+<Callout title="Prisma 7 and Jest">
+Your Prisma 7 client is generated with `moduleFormat = "cjs"` ([PostgreSQL Lesson 8](/docs/postgresql/lesson-8-prisma)), so `ts-jest` can load it. If you ever see `Cannot use import statement outside a module` or an error about `import.meta` from `src/generated/prisma`, check that setting first.
+</Callout>
+
+## Mistakes to avoid
+
+- Writing tests only for the happy path. Most bugs are in the error paths and edges.
+- Forgetting `await` before `expect(...).rejects`: the test passes before the promise rejects, so it checks nothing.
+- Computing the expected value with the same logic as the code under test.
+- Tests that depend on order or on data left by the previous test.
+- Leaving `it.only` or `describe.only` in a commit: every other test silently stops running. (ESLint's `jest/no-focused-tests` rule catches it.)
+- Mocking everything, including your own small functions, so tests break on every refactor.
+- Chasing 100% coverage instead of testing the risky parts well (Lesson 8).
+
+## Exercises
+
+- **1.1** 🟢 For each feature, say which kind of test you'd write first (unit, integration, API or browser) and why: (a) `freeSlots`, (b) the no-overlap exclusion constraint, (c) `GET /v1/bookings` returns 404 for another business's booking, (d) the "Book" button is disabled while the request is sending, (e) the full sign-up → verify email → log in flow, (f) the refresh token reuse detection.
+- **1.2** 🟢 Add `slots.ts` and its tests. Then **make each test fail once**: change `<` to `<=` in `overlaps`, change `t + step <= ...` to `<`, remove the `durationMin` check. Write down which tests caught each change. Did any change go unnoticed?
+- **1.3** 🟡 Write `bookingPrice(service, startsAt, timeZone)` as a pure function: the base price in cents, plus 20% on Fridays and Saturdays **in the business's time zone**, rounded to whole cents. Test it with `it.each`, including a booking at 23:30 UTC on a Thursday that is already Friday in `Asia/Dhaka`.
+- **1.4** 🟡 Look at the `bookings.service.spec.ts` you wrote in [NestJS Lesson 2](/docs/nestjs/lesson-2-modules-and-di). Mark every `expect` as "behaviour" or "implementation". Rewrite the implementation ones, or explain why they're the behaviour.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you decide what to test?"**
+
+> "I start from risk: where would a bug hurt most, and where are bugs likely? In my booking platform, that's double bookings, permissions between tenants, time zones and money. Pure business rules, like slot calculation, get fast unit tests. Anything that depends on the database, like the no-overlap constraint or tenant filtering, gets integration tests against a real Postgres, because a mock can't prove a constraint works. Every endpoint gets API tests for its main path and its error paths, including 401, 403 and 404 for another tenant. And a few browser tests cover the critical flows, like logging in and booking. I don't test framework code or trivial getters, and every bug I fix gets a regression test first."
+
+**"What's the difference between unit, integration and end-to-end tests?"**
+
+> "A unit test checks one piece of logic with its dependencies faked, so it's fast and precise. An integration test checks my code with a real dependency, usually the database, so it proves the pieces work together. An end-to-end test goes through the whole system like a user would, over HTTP or in a real browser. Higher tests give more confidence but are slower and more fragile, so I keep many fast tests, a lot of integration tests for a backend like mine, and only a few browser tests for the most important flows."

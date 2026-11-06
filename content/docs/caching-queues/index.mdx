@@ -1,0 +1,142 @@
+---
+title: "Caching and background work"
+description: "Redis and BullMQ for the booking platform: what and where to cache, cache-aside with invalidation and versioned keys, cache stampedes, rate limiting shared across instances, queues and workers, emails through a queue, the outbox relay, delayed and scheduled jobs (reminders), retries, dead letters, monitoring and tests. Phase 1, Month 2."
+---
+
+So far, every request to the booking API does all its work **while the user waits**, and every request goes to Postgres. That's fine for one user. It stops being fine when:
+
+- the public booking page gets 500 visitors a minute, and each one runs the availability query;
+- sign-up takes 3 seconds because the email server is slow, or **fails** because it's down;
+- a reminder must be sent 24 hours before each booking, and nobody is making a request at that moment;
+- the API runs on 3 servers, and the rate limiter on each one counts separately.
+
+This section adds the two tools almost every production backend has: a **cache** (Redis) and a **job queue** (BullMQ, which also runs on Redis). All examples extend the **booking API** from the [Testing practice project](/docs/testing/practice-project) (NestJS + Prisma 7 + PostgreSQL 18).
+
+<Callout title="My progress">
+- Lesson 1 (caching basics: what, where, how long): not started
+- Lesson 2 (Redis basics): not started
+- Lesson 3 (caching in NestJS: invalidation and stampedes): not started
+- Lesson 4 (rate limiting with Redis): not started
+- Lesson 5 (BullMQ basics: queues, workers, retries): not started
+- Lesson 6 (emails through a queue and the outbox relay): not started
+- Lesson 7 (delayed and scheduled jobs: reminders): not started
+- Lesson 8 (reliability, monitoring and testing): not started
+- Practice project (reminders + Mini-build B, webhook delivery): not started
+</Callout>
+
+## Before you start
+
+You need:
+
+- The booking API with Postgres and Prisma ([PostgreSQL section](/docs/postgresql)), including the **outbox** table from [Lesson 6](/docs/postgresql/lesson-6-transactions-and-locking) and the throttler from [Auth Lesson 8](/docs/auth-security/lesson-8-abuse-and-secrets).
+- The test setup from the [Testing section](/docs/testing) (Testcontainers, factories, `eventually`), because Lesson 8 adds Redis to it.
+- Docker Desktop running, and Mailpit in your `docker-compose.yml` (from [Auth Lesson 4](/docs/auth-security/lesson-4-email-flows)).
+
+## What you will learn
+
+| Lesson | Topic | You will be able to… |
+| --- | --- | --- |
+| 1 | Caching basics | Decide what to cache, where (browser, CDN, app, Redis) and for how long; use HTTP cache headers; explain cache-aside and invalidation |
+| 2 | Redis basics | Run Redis, use its data types and expiry, name keys, use atomic commands and Lua, connect from NestJS |
+| 3 | Caching in NestJS | Cache the public profile and availability, invalidate correctly with versioned keys, stop cache stampedes |
+| 4 | Rate limiting with Redis | Share limits across servers, explain fixed vs sliding windows and token buckets, choose fail-open or fail-closed |
+| 5 | BullMQ basics | Add jobs, process them in a separate worker process, retry with backoff, write jobs that are safe to run twice |
+| 6 | Emails and the outbox | Send emails from a worker, connect the Postgres outbox to the queue, send booking confirmations exactly when the booking is saved |
+| 7 | Delayed and scheduled jobs | Send reminders 24 hours before a booking, handle cancel and reschedule, run recurring jobs in the right time zone |
+| 8 | Reliability and testing | Handle failed jobs and dead letters, shut workers down safely, configure Redis, monitor queues, test caches and workers |
+
+### Topics added beyond the roadmap
+
+The roadmap lists Redis caching, rate limiting, BullMQ job queues with retries and backoff, and sending emails through a queue. All of them are covered.
+
+These are added because **your projects need them** or **interviews ask about them**:
+
+| Added topic | Why | Lesson |
+| --- | --- | --- |
+| **HTTP caching** (`Cache-Control`, `ETag`, CDN) | The cheapest cache is one your server never sees; also a frontend interview topic | 1 |
+| Cache keys that include the **tenant** | A cache key without `businessId` leaks one business's data to another | 2, 3 |
+| **Versioned keys** and the "stale write" race | Deleting a key on update isn't always enough | 3 |
+| **Cache stampede** (and single-flight, jitter, stale-while-revalidate) | A classic system design question | 3 |
+| Rate limiting **algorithms** and fail-open vs fail-closed | Asked in system design ("design a rate limiter") | 4 |
+| Distributed locks and why they're risky | Interviewers like to ask; usually a Postgres constraint is better | 2 |
+| A **separate worker process** | Slow jobs must not slow down the API, and they scale separately | 5 |
+| **At-least-once delivery** and idempotent jobs | Every queue re-runs jobs sometimes; you must be ready | 5, 6 |
+| **Outbox → queue** relay | Sends the email only if the booking was really saved, and never loses it | 6 |
+| The **sweeper** pattern (Postgres as the source of truth for reminders) | More robust than week-long delayed jobs | 7 |
+| Recurring jobs in each business's **local time zone** | "07:00 in Dhaka" and "07:00 in New York" are different UTC hours, and DST moves them | 7 |
+| **Dead letters**, replay, and two Redis instances (cache vs queue) | What makes background work production-ready | 8 |
+| Testing caches and workers with a Redis container | Extends the Testing section | 8 |
+
+### Topics left for later (on purpose)
+
+| Topic | When |
+| --- | --- |
+| Redis pub/sub for live updates across servers (Socket.IO adapter) | Month 3, WebSockets |
+| Stripe webhooks (receiving) | Month 3, payments |
+| Metrics dashboards and alerts (OpenTelemetry, Grafana) | Month 3, observability |
+| Managed Redis on AWS (ElastiCache / Valkey) and SQS | Month 3, AWS |
+| Redis as a vector store | Not planned: pgvector in Phase 2 |
+| Kafka and event streaming | Only if a job needs it; a short note is in Lesson 5 |
+
+## Setup
+
+In the **booking API**:
+
+```powershell
+npm i ioredis bullmq @nestjs/bullmq @nest-lab/throttler-storage-redis
+npm i @bull-board/api @bull-board/express @bull-board/nestjs
+npm i -D @testcontainers/redis
+```
+
+Add Redis to `docker-compose.yml` (Lesson 2 explains each setting; Lesson 8 splits it into two instances):
+
+```yaml
+services:
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:
+```
+
+And to `.env`: `REDIS_URL=redis://localhost:6379`.
+
+Scripts you'll have at the end of the section:
+
+```json
+{
+  "scripts": {
+    "start:dev": "nest start --watch",
+    "start:worker:dev": "nest start --watch --entryFile worker",
+    "start:worker": "node dist/worker"
+  }
+}
+```
+
+<Callout type="warn" title="Versions">
+Written for Redis 8, ioredis 5, BullMQ 5, `@nestjs/bullmq` 11 and Bull Board 6. BullMQ changes faster than most libraries: for example, `upsertJobScheduler` replaced the older `repeat` option for recurring jobs, and many blog posts still show the old way or the even older `bull` package (without "mq"). When an example doesn't match, check the BullMQ docs at docs.bullmq.io first.
+</Callout>
+
+## How each lesson works
+
+Same as before: type the examples yourself, do the exercises without help, send them to Claude for a scored review, then check the [Solutions](/docs/caching-queues/solutions). Write your mistakes in each page's notes box and practise the interview answers out loud.
+
+Background work has one extra rule: **break it on purpose**. Stop Redis, kill the worker in the middle of a job, stop Mailpit. Watch what happens. The goal of this section is that nothing is lost and nothing is sent twice (or, where "twice" can't be fully prevented, that you know exactly when and why).
+
+## Schedule (about 2.5 weeks)
+
+| When | What |
+| --- | --- |
+| Week 1 | Lessons 1, 2, 3 (Lesson 3 is the important one for caching) |
+| Week 2 | Lessons 4, 5, 6 (Lesson 6 connects everything from the PostgreSQL section) |
+| Week 3 | Lessons 7, 8 |
+| Week 3, Friday block | [Practice project](/docs/caching-queues/practice-project) (reminders + Mini-build B) |
+
+Then: Month 3, starting with Docker and deployment.
+
+**Done means:** the public pages are cached with correct invalidation; rate limits work across two API instances; all emails go through a queue processed by a separate worker; booking confirmations come from the outbox; reminders go out 24 hours before each booking and survive cancels, reschedules and a Redis restart; failed jobs are visible and can be replayed; Mini-build B delivers signed webhooks with retries and a dead-letter list; and you can answer "How would you send a reminder 24 hours before an appointment?" in English without notes.

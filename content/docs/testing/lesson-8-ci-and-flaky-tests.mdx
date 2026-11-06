@@ -1,0 +1,252 @@
+---
+title: "Lesson 8: Tests in CI, coverage and flaky tests"
+description: "A GitHub Actions workflow that runs type checks, unit, integration and Playwright tests on every push, required checks and a CI badge, what coverage does and doesn't tell you, coverage thresholds, the causes of flaky tests and how to find and fix them, keeping the suite fast, and a short note on contract and mutation testing."
+---
+
+Tests only protect you if they **run**. On your laptop, you forget. In CI (continuous integration), every push and every pull request runs every test, and a red ❌ blocks the merge. That's also what interviewers and reviewers look at first in your GitHub repo: is there a workflow, is it green, and what does it run?
+
+## The workflow for the API
+
+```yaml
+# .github/workflows/api.yml
+name: API
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:                                   # a new push cancels the old run of the same branch
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Lint, types, unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm test -- --coverage
+
+  integration:
+    name: Integration and API tests (Postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npm run test:int          # Testcontainers starts Postgres: Docker is already on GitHub's Ubuntu runners
+```
+
+- **Two jobs run in parallel.** The fast one (lint, types, unit) fails in a minute if you made a typo; the slow one needs Docker.
+- `npm ci`, not `npm install`: it installs exactly what's in `package-lock.json` and fails if the lock file is out of date ([Auth Lesson 8](/docs/auth-security/lesson-8-abuse-and-secrets): supply chain).
+- `prisma generate` is needed because the generated client in `src/generated/prisma` isn't in git.
+- No secrets are needed: `test/setup/env.ts` sets fake values. If a test needs a real secret, it's not a test, it's a call to the outside world (Lesson 5).
+- `timeout-minutes` stops a hanging test from using your free minutes for 6 hours.
+
+### Playwright in CI
+
+If the API and the web app are in **two repositories** (as in Lesson 7, side by side), the web repo's workflow checks out both:
+
+```yaml
+# booking-web/.github/workflows/e2e.yml
+name: E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:                                  # the same containers as docker-compose, managed by GitHub
+      db-e2e:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: booking
+          POSTGRES_PASSWORD: booking
+          POSTGRES_DB: booking_e2e
+        ports: ['5434:5432']
+        options: >-
+          --health-cmd "pg_isready -U booking" --health-interval 2s --health-timeout 5s --health-retries 20
+      mail:
+        image: axllent/mailpit
+        ports: ['1025:1025', '8025:8025']
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: booking-web
+      - uses: actions/checkout@v5
+        with:
+          repository: your-github-name/booking-api   # a private repo also needs a token with read access
+          path: booking-api
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: npm ci && npx prisma generate
+        working-directory: booking-api
+      - run: npm ci
+        working-directory: booking-web
+      - run: npx playwright install --with-deps chromium
+        working-directory: booking-web
+      - run: npx playwright test
+        working-directory: booking-web
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}                  # upload the report even when tests fail
+        with:
+          name: playwright-report
+          path: booking-web/playwright-report/
+          retention-days: 14
+```
+
+When a test fails, open the run on GitHub, download `playwright-report`, and run `npx playwright show-report` on it: you get the trace of the failed try (Lesson 7).
+
+(Many teams put both apps in **one** repository, a monorepo, to avoid exactly this extra checkout. That's a good choice for Project 1 too. Either works.)
+
+### Make it count
+
+1. **Branch protection:** on GitHub, Settings → Branches → add a rule for `main`: "Require status checks to pass" and pick the jobs. Now nothing reaches `main` without green tests, even from you.
+2. **A badge** at the top of your README:
+
+```markdown
+![API](https://github.com/your-github-name/booking-api/actions/workflows/api.yml/badge.svg)
+```
+
+3. **Work in pull requests**, even alone. A PR with a green check, a short description and a screenshot is exactly what a remote team expects to see from you.
+
+## Coverage
+
+Coverage measures which lines and branches of your code ran during the tests:
+
+```powershell
+npm test -- --coverage                       # unit tests
+npm run test:int -- --coverage               # integration and API tests
+```
+
+Open `coverage/lcov-report/index.html` to see each file with untested lines in red.
+
+| Coverage tells you | Coverage doesn't tell you |
+| --- | --- |
+| Which code **never ran** in any test: definitely untested | Whether the tests **check** anything. A test with no `expect` still "covers" lines |
+| Which `if` branches never ran (**branch** coverage is more useful than line coverage) | Whether the important cases are tested (the boundary, the other tenant) |
+| Where to look first when adding tests | Whether the code is correct |
+
+So use coverage to **find gaps**, not as a target. Read the red lines in `src/auth/` and `src/bookings/`; that's where a missing test hurts. Chasing 100% leads to tests for getters and module files that protect nothing.
+
+A threshold stops coverage from quietly dropping over time:
+
+```json
+"jest": {
+  "coverageThreshold": {
+    "global": { "branches": 70, "lines": 80 }
+  }
+}
+```
+
+Set it a little **below** your current numbers, and raise it now and then. If you combine unit and integration coverage (both measure different code), tools like `nyc merge` or Codecov can merge the reports. For a portfolio project, separate reports are fine.
+
+## Flaky tests
+
+A **flaky** test sometimes passes and sometimes fails with the same code. One flaky test makes people stop trusting the whole suite: "it's red again, just re-run it". Then a real failure gets re-run too.
+
+### Common causes in your stack
+
+| Cause | Example | Fix |
+| --- | --- | --- |
+| **Shared state between tests** | Test B passes only after test A created a business | Each test creates its own data; reset before each test (Lesson 3) |
+| **Parallel tests on one database** | Two Jest workers truncate each other's tables | One database per worker (Lesson 3) |
+| **Time** | "Tomorrow" is a different weekday in CI; a test fails at midnight UTC | A `Clock`; fixed dates; `TZ=UTC` (Lesson 5) |
+| **Fixed waits** | `sleep(500)` for an email that sometimes takes 600 ms | Wait for the result: `eventually`, `findBy`, `toPass` (Lessons 4, 6, 7) |
+| **Order of results** | `expect(list).toEqual([a, b])` with no `order by` in the query | Order in SQL, or sort in the test, or `expect.arrayContaining` |
+| **Random data** | `faker` sometimes makes an email longer than your 254-character limit | Explicit values for what the test checks; `faker.seed()` to reproduce |
+| **Real network** | A test calls a real API that's slow today | MSW with unhandled-request errors (Lesson 5) |
+| **Unique values that aren't** | Two Playwright workers use `Date.now()` in the same millisecond | `crypto.randomUUID()` or `testInfo.workerIndex` in the value |
+| **Slower CI machines** | Passes in 4 s locally, times out at 5 s in CI | Find the slow part; raise a timeout only on purpose |
+
+### How to find them
+
+```powershell
+npx jest --config test/jest-int.json --randomize      # run tests in a random order (prints the seed)
+npx jest --config test/jest-int.json --randomize --seed=1234   # repeat the order that failed
+npx jest -t "slot-taken" --runInBand                  # one test, no parallel workers
+npx playwright test public-booking --repeat-each=20   # the same test 20 times
+```
+
+If a test fails only with `--randomize`, it depends on another test. If it fails only in parallel, it shares data. If it fails only with `--repeat-each`, it depends on timing.
+
+### What to do with one
+
+1. **Don't add a retry and move on.** Playwright's `retries: 2` in CI is there to **collect a trace**, and the report marks those tests as "flaky". Treat every "flaky" label as a bug.
+2. If you can't fix it today, **quarantine** it: `test.fixme('...')` or `it.skip` with a link to a GitHub issue, so the rest of the suite stays trusted. Then fix it this week.
+3. Sometimes the test is right and the **app** is flaky: a real race, a missing `order by`, a double submit. Those are the best finds.
+
+## Keep it fast
+
+Slow tests get run less. Targets for Project 1:
+
+| Suite | Target | If it's slower |
+| --- | --- | --- |
+| Unit (`npm test`) | Under 10 seconds | Something is touching the network, disk or a real timer |
+| Integration + API (`npm run test:int`) | Under 2 minutes | One container per run? One Nest app per file? Truncate, not re-migrate? |
+| Playwright | Under 10 minutes in CI | Too many tests in the browser? Login once with `storageState`; API setup |
+
+Locally, run only what you're working on: `npm run test:watch` (Jest watches related files), `-t "name"`, `npx playwright test --ui`.
+
+Some teams also add a **pre-commit hook** (Husky + lint-staged) that runs ESLint and Prettier on changed files. Keep tests out of it: a commit that takes a minute makes people skip the hook. Tests belong in CI.
+
+## Two names to know
+
+- **Contract tests** (Pact): the frontend writes down the requests and responses it expects, and the API's CI checks it still matches. Useful when separate teams own each side. You own both, and your shared Zod types ([TypeScript Lesson 5](/docs/typescript/lesson-5-real-world)) and the Swagger document already cover most of it.
+- **Mutation testing** (Stryker): the tool changes your code on purpose (`<` to `<=`, `true` to `false`) and checks that some test fails. It measures whether tests **check** things, which coverage can't. It's the automated version of the "see every test fail once" rule from this section. Slow; try it once on `slots.ts` for fun.
+
+## Mistakes to avoid
+
+- A workflow that only runs `npm test` (unit tests), so the database tests never run in CI.
+- No branch protection: a red ❌ that nothing respects.
+- `npm install` in CI.
+- Real secrets in CI for tests that shouldn't need them.
+- Coverage as a goal instead of a map.
+- Retries as a fix for flakiness; skipping a flaky test without an issue.
+- No `timeout-minutes`, and a hanging job.
+- Forgetting to upload the Playwright report, so a CI failure can't be investigated.
+
+## Exercises
+
+- **8.1** 🟢 Add `api.yml`. Push a commit that breaks a unit test on purpose, open a PR, and check the job turns red. Fix it, add branch protection and the badge.
+- **8.2** 🟡 Run your integration suite with `--randomize` five times. Fix every test that fails. Then add `--randomize` to the CI command permanently. (Is that a good idea? Write your answer in your notes.)
+- **8.3** 🟡 Look at the coverage report for `src/auth/` and `src/bookings/`. List three red lines or branches that **matter** and three that don't. Write tests for the three that matter. Set a coverage threshold just below your new numbers.
+- **8.4** 🔴 Add the Playwright workflow. Make one test flaky on purpose (for example, a `page.waitForTimeout(300)` before reading a slot that appears after an API call with a random 0–600 ms delay you add in development). Watch CI mark it "flaky", download the trace, and explain from the trace what happened. Then fix it the right way.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What does your CI pipeline do?"**
+
+> "On every push and pull request, GitHub Actions runs two jobs in parallel. The first installs with `npm ci`, then runs ESLint, the TypeScript compiler and the unit tests with coverage, and it fails within a minute or two if something basic is wrong. The second runs the integration and API tests against a real Postgres that Testcontainers starts in Docker. The frontend has a third workflow that starts the API and a production build of the Next.js app and runs the Playwright tests, and it uploads the HTML report with traces when something fails. The main branch is protected, so nothing merges without green checks."
+
+**"How do you deal with flaky tests?"**
+
+> "I treat a flaky test as a bug, either in the test or in the app. The usual causes are shared state between tests, fixed waits, time, unordered results or parallel tests sharing data. To find it, I run the tests in random order, repeat the one test many times, or run it alone, and in Playwright I read the trace. If I can't fix it the same day, I quarantine it with a linked issue so the rest of the suite stays trusted. I don't use retries as a fix; in CI, a retry is there to collect a trace and to flag the test as flaky."
+
+**"What coverage do you aim for?"**
+
+> "I don't aim for a number. I use the coverage report as a map to find code that no test runs, especially branches in security and booking logic, and I set a threshold just below the current level so it doesn't quietly drop. High coverage doesn't mean the tests check the right things, so I care more about testing the risky cases: boundaries, other tenants, races and error paths."

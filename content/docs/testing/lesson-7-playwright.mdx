@@ -1,0 +1,389 @@
+---
+title: "Lesson 7: Playwright for critical flows"
+description: "Which flows deserve browser tests, Playwright setup with two web servers (API and Next.js), a separate e2e database and seed, logging in once with a setup project and storageState, locators and web-first assertions, reading emails from Mailpit, mocking one API response with page.route, accessibility checks with axe, and debugging with UI mode and traces."
+---
+
+Browser tests are the slowest and most fragile tests you have, and the only ones that check what a real user sees: the Next.js page, the API, the database, cookies, redirects and JavaScript, all together. So you write **few** of them, for the flows that would cost money or trust if they broke.
+
+## Which flows?
+
+For Project 1, about 6–10 tests:
+
+| Flow | Why it's critical |
+| --- | --- |
+| Log in (and stay logged in after a page reload) | Nobody can do anything without it; cookies, `proxy.ts` and refresh all take part |
+| Sign up → verify email → first business | New customers; one broken link and you get no sign-ups |
+| A customer books a slot on the public page | The product's main job; money |
+| The slot just booked is gone for the next customer | The no-double-booking promise, seen from the browser |
+| The owner cancels a booking from the dashboard | Common action; the customer gets an email |
+| Staff don't see owner-only actions | Roles in the UI (the API is already tested in Lesson 4) |
+| Invite a teammate → they accept | Multi-user businesses depend on it |
+
+Everything else (every validation message, every error code, every role on every route) is already covered faster by Lessons 4 and 6.
+
+## Setup
+
+```powershell
+npm init playwright@latest       # in the Next.js project: choose TypeScript, folder "e2e", add a GitHub Actions workflow: no (Lesson 8)
+npm i -D @axe-core/playwright
+```
+
+### A separate database for browser tests
+
+Browser tests run the **real** API, which needs a database. Don't use your development database: the tests would delete your data, and your data would break the tests. Add one to the API's `docker-compose.yml`:
+
+```yaml
+  db-e2e:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: booking
+      POSTGRES_PASSWORD: booking
+      POSTGRES_DB: booking_e2e
+    ports:
+      - "5434:5432"
+    tmpfs:
+      - /var/lib/postgresql      # data in memory: fast, and empty after every restart
+```
+
+(Testcontainers would also work here. A compose service is simpler because two processes, the API and Playwright's setup, both need to know the URL.)
+
+In the API, a script that resets, migrates and seeds this database with **known** data:
+
+```json
+"db:e2e": "dotenv -e .env.e2e -- prisma migrate reset --force && dotenv -e .env.e2e -- tsx prisma/seed-e2e.ts",
+"start:e2e": "dotenv -e .env.e2e -- node dist/main.js"
+```
+
+(`npm i -D dotenv-cli`. If `migrate reset` also runs your normal seed in your Prisma version, write the e2e seed so it works on top of it, with `upsert`. Start the containers first with `docker compose up -d db-e2e mail`; the Playwright config below runs `db:e2e` for you.)
+
+```typescript
+// prisma/seed-e2e.ts: the same people and business every run
+export const E2E = {
+  owner: { email: 'owner@e2e.test', password: 'e2e owner password 123' },
+  staff: { email: 'staff@e2e.test', password: 'e2e staff password 123' },
+  business: { slug: 'e2e-salon', name: 'E2E Salon', timeZone: 'Asia/Dhaka' },
+};
+// create the users with your real PasswordService hash, memberships, one staff member,
+// one 30-minute service and working hours 09:00–17:00 every day
+```
+
+`.env.e2e` points `DATABASE_URL` at port 5434, `SMTP_URL` at Mailpit, and sets `THROTTLE_DISABLED=true` (many logins from one IP in a short time).
+
+### `playwright.config.ts`
+
+```typescript
+import { defineConfig, devices } from '@playwright/test';
+
+const WEB = 'http://localhost:3001';
+
+export default defineConfig({
+  testDir: './e2e',
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,                  // fail CI if someone left test.only
+  retries: process.env.CI ? 2 : 0,
+  workers: process.env.CI ? 2 : undefined,
+  reporter: process.env.CI ? [['html', { open: 'never' }], ['github']] : 'list',
+  use: {
+    baseURL: WEB,
+    trace: 'on-first-retry',                     // a full recording when a test fails and is retried
+    screenshot: 'only-on-failure',
+  },
+  projects: [
+    { name: 'setup', testMatch: /.*\.setup\.ts/ },
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+      dependencies: ['setup'],                   // log in first (below)
+    },
+    {
+      name: 'mobile',
+      use: { ...devices['Pixel 7'] },            // your customers book on phones
+      dependencies: ['setup'],
+      testMatch: /public-booking\.spec\.ts/,
+    },
+  ],
+  webServer: [
+    {
+      command: 'npm run db:e2e && npm run build && npm run start:e2e',
+      cwd: '../booking-api',
+      url: 'http://localhost:3000/health/ready',
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    {
+      command: 'npm run build && npm run start -- -p 3001',
+      url: WEB,
+      reuseExistingServer: !process.env.CI,
+      timeout: 180_000,
+    },
+  ],
+});
+```
+
+- **Two web servers**: Playwright starts the API and the Next.js app and waits for both URLs before running tests. Locally, `reuseExistingServer` uses servers you already started, which is faster while writing tests.
+- Test a **production build** (`next build && next start`), not `next dev`. Dev mode is slower, compiles pages on first visit (timeouts), and behaves differently.
+- `trace: 'on-first-retry'`: when a test fails in CI, you get a trace file with every step, screenshot, network request and console message.
+
+Your Next.js app rewrites `/v1/*` to the API ([Auth Lesson 2](/docs/auth-security/lesson-2-sessions-and-jwt)), so the browser talks only to `localhost:3001`, exactly like production.
+
+## Log in once, reuse the cookies
+
+Logging in through the UI in every test is slow. Playwright's **setup project** logs in once and saves the browser state (cookies) to a file:
+
+```typescript
+// e2e/auth.setup.ts
+import { test as setup, expect } from '@playwright/test';
+
+const users = {
+  owner: { email: 'owner@e2e.test', password: 'e2e owner password 123' },
+  staff: { email: 'staff@e2e.test', password: 'e2e staff password 123' },
+};
+
+for (const [role, user] of Object.entries(users)) {
+  setup(`log in as ${role}`, async ({ page }) => {
+    await page.goto('/login');
+    await page.getByLabel('Email').fill(user.email);
+    await page.getByLabel('Password').fill(user.password);
+    await page.getByRole('button', { name: 'Log in' }).click();
+
+    await expect(page.getByRole('heading', { name: 'Bookings' })).toBeVisible();   // landed on the dashboard
+    await page.context().storageState({ path: `playwright/.auth/${role}.json` });
+  });
+}
+```
+
+Add `playwright/.auth/` to `.gitignore`: those files contain real session cookies.
+
+Then a test file says which user it is:
+
+```typescript
+test.use({ storageState: 'playwright/.auth/owner.json' });
+```
+
+<Callout title="Secure cookies on localhost">
+Your cookies are `Secure`, and the tests run on `http://localhost`. Chromium and Firefox treat `localhost` as a secure origin and accept them. WebKit (Safari) has had problems with this. If you add a WebKit project and its tests don't stay logged in, this is the first thing to check.
+</Callout>
+
+## Writing tests
+
+```typescript
+// e2e/public-booking.spec.ts
+import { test, expect } from '@playwright/test';
+
+test('a customer books a slot, and the slot disappears for the next customer', async ({ page, browser }) => {
+  await page.goto('/b/e2e-salon');
+  await page.getByRole('button', { name: /Haircut/ }).click();
+
+  const day = page.getByRole('group', { name: 'Free times' });
+  const firstSlot = day.getByRole('button').first();
+  const time = await firstSlot.textContent();
+  await firstSlot.click();
+
+  await page.getByLabel('Name').fill('Rahim');
+  await page.getByLabel('Email').fill(`rahim+${Date.now()}@test.dev`);
+  await page.getByRole('button', { name: 'Book' }).click();
+
+  await expect(page.getByRole('status')).toHaveText(/Booking confirmed/);
+
+  // A second customer, in a fresh browser with no cookies
+  const other = await browser.newPage();
+  await other.goto('/b/e2e-salon');
+  await other.getByRole('button', { name: /Haircut/ }).click();
+  await expect(other.getByRole('group', { name: 'Free times' }).getByRole('button', { name: time! })).toHaveCount(0);
+  await other.close();
+});
+```
+
+Things to notice:
+
+- **Locators** like `getByRole` and `getByLabel` are the same idea as Testing Library (Lesson 6). Prefer them to CSS selectors (`.btn-primary`) and `data-testid`.
+- **Web-first assertions** (`await expect(locator).toBeVisible()`, `toHaveText`, `toHaveCount`) **retry** until they pass or time out (5 seconds by default). Never write `await page.waitForTimeout(2000)`.
+- **Unique data per test** (`rahim+${Date.now()}@test.dev`). Tests run in parallel against one database, and all of them use the same salon. Don't assume "the first slot" is the same in every test; read it, like `time` above.
+
+### Owner and staff tests
+
+```typescript
+// e2e/dashboard.spec.ts
+import { test, expect } from '@playwright/test';
+
+test.describe('as the owner', () => {
+  test.use({ storageState: 'playwright/.auth/owner.json' });
+
+  test('cancels a booking', async ({ page, request }) => {
+    const booking = await createBookingThroughApi(request);       // fast setup through the API, not the UI
+
+    await page.goto('/dashboard/bookings');
+    const row = page.getByRole('row', { name: new RegExp(booking.customerEmail) });
+    await row.getByRole('button', { name: 'Cancel' }).click();
+    await page.getByRole('dialog').getByRole('button', { name: 'Yes, cancel it' }).click();
+
+    await expect(row.getByText('Cancelled')).toBeVisible();
+  });
+
+  test('stays logged in after a reload', async ({ page }) => {
+    await page.goto('/dashboard/bookings');
+    await page.reload();
+    await expect(page.getByRole('heading', { name: 'Bookings' })).toBeVisible();
+  });
+});
+
+test.describe('as staff', () => {
+  test.use({ storageState: 'playwright/.auth/staff.json' });
+
+  test('does not see owner-only actions', async ({ page }) => {
+    await page.goto('/dashboard/services');
+    await expect(page.getByRole('heading', { name: 'Services' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'New service' })).toHaveCount(0);
+  });
+});
+```
+
+**Set up data through the API, check through the UI.** `createBookingThroughApi(request)` posts to the public booking endpoint with Playwright's `request` fixture (an HTTP client). It takes 50 ms instead of 5 seconds of clicking, and the test is still about cancelling.
+
+### Emails: read them from Mailpit
+
+The sign-up flow needs the verification link from the email. Mailpit has an HTTP API:
+
+```typescript
+// e2e/helpers/mailpit.ts
+import { expect, type APIRequestContext } from '@playwright/test';
+
+const MAILPIT = 'http://localhost:8025/api/v1';
+
+export async function latestEmailTo(request: APIRequestContext, to: string): Promise<{ Subject: string; Text: string }> {
+  let message: { ID: string } | undefined;
+  await expect(async () => {
+    const res = await request.get(`${MAILPIT}/search?query=${encodeURIComponent(`to:"${to}"`)}`);
+    message = (await res.json()).messages[0];
+    expect(message).toBeDefined();
+  }).toPass({ timeout: 10_000 });               // the API sends emails in the background: retry until it's there
+
+  const full = await request.get(`${MAILPIT}/message/${message!.ID}`);
+  return full.json();
+}
+
+export function linkFrom(text: string): string {
+  const match = text.match(/https?:\/\/\S+/);
+  if (!match) throw new Error(`No link in email:\n${text}`);
+  return match[0];
+}
+```
+
+```typescript
+test('sign up, verify the email, create a business', async ({ page, request }) => {
+  const email = `new+${Date.now()}@test.dev`;
+  await page.goto('/signup');
+  await page.getByLabel('Name').fill('New Owner');
+  await page.getByLabel('Email').fill(email);
+  await page.getByLabel('Password').fill('a long enough password 123');
+  await page.getByRole('button', { name: 'Create account' }).click();
+  await expect(page.getByText('Check your email')).toBeVisible();
+
+  const mail = await latestEmailTo(request, email);
+  await page.goto(linkFrom(mail.Text));                    // the token is in the #fragment (Auth Lesson 4)
+  await expect(page.getByText('Email verified')).toBeVisible();
+  // ...log in and create the first business
+});
+```
+
+`expect(async () => { ... }).toPass()` is Playwright's version of the `eventually` helper from Lesson 4.
+
+### Mocking one response
+
+Some states are hard to create for real: the API is down, or a slot is taken between loading the page and clicking "Book". `page.route` answers a request from the browser instead of the server:
+
+```typescript
+test('shows a friendly message when the slot was taken in the meantime', async ({ page }) => {
+  await page.route('**/v1/bookings', (route) =>
+    route.fulfill({
+      status: 409,
+      contentType: 'application/problem+json',
+      json: { type: 'slot-taken', title: 'This time slot is already booked', status: 409 },
+    }),
+  );
+  // ...pick a slot, fill the form, click Book
+  await expect(page.getByRole('alert')).toContainText('just taken');
+});
+```
+
+Use it **rarely** in browser tests: a mocked response means you're no longer testing the real API. The component tests in Lesson 6 already cover these states. Keep `page.route` for things you can't create any other way.
+
+## Accessibility checks with axe
+
+`@axe-core/playwright` runs the axe engine on the real page and reports problems like missing labels, low contrast and buttons without names:
+
+```typescript
+// e2e/accessibility.spec.ts
+import { test, expect } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
+
+for (const path of ['/', '/login', '/signup', '/b/e2e-salon']) {
+  test(`${path} has no detectable accessibility problems`, async ({ page }) => {
+    await page.goto(path);
+    const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa']).analyze();
+    expect(results.violations).toEqual([]);
+  });
+}
+```
+
+Automated checks find only part of the problems (about a third to a half, depending on who you ask). Still, they're free to run, and "my CI checks accessibility on every page" is a strong line for a frontend interview. When a violation appears, the test output names the rule (`label`, `color-contrast`) and the element.
+
+## Debugging
+
+| Tool | Command | Use for |
+| --- | --- | --- |
+| UI mode | `npx playwright test --ui` | Writing tests: watch mode, time travel through every step, pick locators |
+| Debug mode | `npx playwright test --debug` | Step through a test line by line in a real browser |
+| Trace viewer | `npx playwright show-trace trace.zip` | A failure in CI: download the trace from the report, see every step, network call and console line |
+| Codegen | `npx playwright codegen localhost:3001` | Click around, get code. A starting point only: clean up the locators |
+| HTML report | `npx playwright show-report` | All results, with screenshots and traces |
+
+## Page objects (only a little)
+
+When the same steps appear in many tests, put them in a function or a small class:
+
+```typescript
+// e2e/pages/booking-page.ts
+export class BookingPage {
+  constructor(private readonly page: Page) {}
+
+  async open(slug: string) { await this.page.goto(`/b/${slug}`); }
+  async chooseService(name: RegExp) { await this.page.getByRole('button', { name }).click(); }
+  freeTimes() { return this.page.getByRole('group', { name: 'Free times' }).getByRole('button'); }
+}
+```
+
+Keep the **assertions in the test**, not in the page object, so each test still reads like a story. With 6–10 tests, plain helper functions are often enough.
+
+## Mistakes to avoid
+
+- Testing everything in the browser. Use it for critical flows; the rest belongs in Lessons 4 and 6.
+- `waitForTimeout` (fixed waits). Use web-first assertions or `toPass`.
+- CSS selectors and `nth-child`. Use roles and labels.
+- Logging in through the UI in every test. Use a setup project and `storageState`.
+- Running against `next dev` or your development database.
+- Tests that depend on each other or on a fixed "first free slot", then fail in parallel.
+- Committing `playwright/.auth/*.json`.
+- Mocking most API calls with `page.route`: then it isn't an end-to-end test any more.
+- Turning on `retries` locally to hide a flaky test (Lesson 8).
+
+## Exercises
+
+- **7.1** 🟢 Install Playwright, add the e2e database, the seed and the two web servers. Write the login setup project and the "stays logged in after a reload" test. Look at the trace of one run in UI mode.
+- **7.2** 🟡 Write the public booking test (book, then check the slot is gone in a new browser). Run it 10 times in parallel: `npx playwright test public-booking --repeat-each=10`. If any run fails, find out why before going on.
+- **7.3** 🟡 Write the sign-up flow with Mailpit, and the "owner cancels a booking" test with API setup. Add the axe checks for four pages and fix every violation they find.
+- **7.4** 🔴 Write the invite flow with **two** users in one test: the owner invites `new+…@test.dev` (one browser context), the invitee opens the link from Mailpit, signs up and accepts (a second context with `browser.newContext()`), and the owner then sees them in the team list. Then run the whole suite with `--workers=4` and fix anything that clashes.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you approach end-to-end testing for a web app?"**
+
+> "I keep browser tests for the critical flows only: logging in, signing up, booking a slot, cancelling and inviting a teammate. Everything else is covered faster by API and component tests. I use Playwright against a production build of the Next.js app and the real API, with a separate database that's reset and seeded with known data before each run. A setup project logs in once per role and saves the cookies, so tests start already logged in. I find elements by role and label, use Playwright's auto-retrying assertions instead of fixed waits, create test data through the API, and give every test its own data so they run in parallel. In CI, failed tests are retried once with a trace, so I can see exactly what happened. I also run axe on the main pages to catch accessibility problems."
+
+**"How do you keep browser tests from being flaky?"**
+
+> "No fixed waits, only assertions that wait for a condition. Stable locators based on roles and labels, not CSS classes. Each test creates its own data, so order and parallelism don't matter. A production build instead of the dev server. And when a test is flaky, I treat it as a bug: I look at the trace, find the race, and fix the test or the app, instead of adding more retries."

@@ -1,0 +1,131 @@
+---
+title: "Cheat sheet"
+description: "One page to revise the whole Testing section before an interview."
+---
+
+## Kinds of tests
+
+| Kind | What runs | Booking API example |
+| --- | --- | --- |
+| Unit | One function or class, dependencies faked | `freeSlots`, `canCancel`, guards |
+| Integration | Code + real Postgres | Exclusion constraint, tenant `where` |
+| API (backend e2e) | Whole Nest app over HTTP + real Postgres | 201 / 401 / 403 / 404 / 409 / 422 |
+| Browser e2e | Next.js + API + DB in a real browser | Log in, book, cancel |
+
+- Pyramid: many unit, fewer integration, few browser. **Trophy**: most effort in integration (+ static checks)
+- Backend with rules in Postgres → lots of database tests
+- Say what **runs** in the test, not just its name
+
+## What to test
+
+- Rules, security, time, money, edges (exact boundaries), **every fixed bug** (regression test)
+- Not: framework code, private methods, trivial getters, implementation details
+- Behaviour, not implementation. Checking a mock is OK when the call **is** the behaviour ("nothing was saved")
+- **See every test fail once**
+
+## Jest
+
+- `clearMocks: true`, `restoreMocks: true`
+- AAA: arrange, act, assert; names are sentences; no logic in tests
+- `toBe` / `toEqual` / `toStrictEqual` / `toMatchObject`; `await expect(p).rejects.toThrow()`; `expect.any(String)`
+- `it.each([...])` or `` it.each`table` ``
+- Stub (answers) · mock (answers + checked) · spy (watches real) · fake (small working version)
+- Jest: NestJS default. Vitest: Vite/Next.js, ESM, faster; `vi.fn()` ≈ `jest.fn()`
+
+## NestJS unit tests
+
+- `Test.createTestingModule({ providers: [Svc, { provide: Repo, useValue: repo }] })` or plain `new`
+- Typed mocks: `jest.Mocked<Pick<Repo, 'findOne'>>`
+- Builders: `aBooking({ status: 'cancelled' })`
+- Pure policy functions + test tables; pass `now` in
+- Guards: fake `ExecutionContext` + **real** `Reflector` and decorators
+- DTOs: `new ValidationPipe(sameOptions).transform(body, { type: 'body', metatype: Dto })`
+- Don't mock Prisma to test repositories
+
+## Integration (Testcontainers)
+
+- Real `postgres:18-alpine`; not SQLite, not pg-mem
+- `globalSetup`: start container → `prisma migrate deploy` (not `db push`) → `create database booking_test_N template booking_template`
+- `setupFiles`: `DATABASE_URL` per `JEST_WORKER_ID`, fake env vars, `TZ=UTC`
+- `truncate ... restart identity cascade` before each test
+- Factories with faker; scenario `f.salon()`; **two businesses** per tenant test
+- Explicit values for what you check; `faker.seed()` to reproduce
+- `afterAll(prisma.$disconnect)`; superuser skips RLS
+
+## API tests (Supertest)
+
+- One `configureApp()` for `main.ts` and tests (cookies, helmet, versioning, trust proxy)
+- `createTestingModule({ imports: [AppModule] }).overrideProvider(AuthEmails).useValue(fake)`; app once per file
+- Throttler `skipIf` env flag; on in its own test file
+- `Secure` cookies + agent over HTTP = not sent → parse `Set-Cookie`, send `Cookie` yourself
+- Fast `loginAs` (real session + JWT); real login only in login tests
+- Send `Origin` on unsafe methods; keep `OriginGuard` on
+- `toEqual` on main responses (catches leaked fields); problem+json `type` and content type
+- Tenant: B gets **404**, list empty, row unchanged; wrong `X-Business-Id` → **403**
+- **Permissions matrix**: route × role; `not 403` for allowed
+- Background work: `eventually()`, never `sleep()`
+
+## Time
+
+- `Clock` provider (abstract class token) + `TestClock` (`set`, `advance`)
+- Rules that use time: compute in the app, pass to SQL; records: DB `now()` is fine; shift data in tests
+- Fake timers for waiting code: `advanceTimersByTimeAsync`, `runAllTimersAsync`; attach `rejects` first; not in API tests
+- `TZ=UTC`; test `Asia/Dhaka` + `America/New_York`; DST days (2027-03-14, 2027-11-07); expected values by hand
+
+## Outside services
+
+- **MSW** (`http.get`, `HttpResponse`, `server.use`, `resetHandlers`)
+- Node + Supertest: `onUnhandledRequest` lets only localhost through; browser tests: `'error'`
+- Test success, error, timeout (`delay('infinite')`), and what was **sent**
+- Complex protocols (OIDC): fake **your wrapper class**, test your linking rules
+
+## Races
+
+- 20 parallel requests: **1 × 201, 19 × 409 (not 500)**, 1 row
+- Same idempotency key twice → 1 booking
+- Race tests are smoke alarms; the guarantee is the constraint
+- Deterministic: two `pg` clients, `begin`, check `pg_stat_activity.wait_event_type = 'Lock'`, commit, check the other
+
+## React components
+
+- Vitest + jsdom + Testing Library + `user-event` + jest-dom + MSW
+- Test like a user; queries: **role** > label > text > test ID
+- `getBy` (now) · `findBy` (appears) · `queryBy` (absent)
+- `const user = userEvent.setup()`; `await user.type/click`
+- `toHaveAccessibleDescription` for field errors
+- `fetch(new URL(path, window.location.origin))` so relative URLs work in Node
+- Async Server Components → Playwright; Server Actions → extract logic
+
+## Playwright
+
+- 6–10 critical flows; production build; separate e2e database + known seed
+- `webServer: [api, web]`; `reuseExistingServer` locally
+- Setup project + `storageState` per role; `.auth/` in `.gitignore`
+- `getByRole` / `getByLabel`; web-first assertions; **no `waitForTimeout`**; `toPass()` to retry
+- Set up through the API, check through the UI; unique data per test
+- Mailpit API for email links; `page.route` rarely
+- `@axe-core/playwright` on main pages
+- `--ui`, `--debug`, traces (`on-first-retry`), `--repeat-each`
+
+## CI
+
+- Jobs: lint + types + unit (fast) ∥ integration (Docker) ∥ e2e (services: Postgres, Mailpit)
+- `npm ci`, `prisma generate`, `timeout-minutes`, upload Playwright report `if: !cancelled()`
+- Branch protection + required checks + badge; work in PRs
+- Coverage = a map of untested code, not a goal; branch > line; threshold a little below current
+- Flaky causes: shared state, parallel DB, time, fixed waits, order, random data, network, CI speed
+- Find: `--randomize --seed`, `--runInBand`, `-t`, `--repeat-each`; fix the cause; quarantine with an issue; retries only to collect traces
+- Contract tests (Pact), mutation testing (Stryker): know the names
+
+## Top interview questions
+
+1. How do you decide what to test? → risk; unit for rules, real-DB integration for constraints and tenants, API tests per endpoint, few browser tests; regression test per bug.
+2. Unit vs integration vs e2e? → what runs; speed vs confidence.
+3. How do you unit test a NestJS service? → testing module, typed mocks via `useValue`, pure policy functions.
+4. Mock the database or use a real one? → real Postgres via Testcontainers for repositories; mock repositories for service logic.
+5. How do you test authorisation / multi-tenancy? → permissions matrix; other tenant gets 404 and nothing changes.
+6. How do you test time? → inject a clock; fake timers for waits; UTC; DST days.
+7. How do you test race conditions? → parallel requests + deterministic two-connection test; the constraint is the guarantee.
+8. How do you test React components? → Testing Library like a user, role queries, MSW.
+9. How do you avoid flaky e2e tests? → no fixed waits, stable locators, own data, prod build, treat flakiness as a bug.
+10. What does your CI do? → lint/types/unit, integration on Postgres, Playwright with reports, protected main.

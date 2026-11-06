@@ -1,0 +1,328 @@
+---
+title: "Lesson 5: BullMQ basics"
+description: "Why background work, the options (fire-and-forget, a Postgres queue, BullMQ, cloud queues, Kafka), queues, jobs and job states, @nestjs/bullmq setup with its own Redis connection, producers and typed jobs, processors, a separate worker process, retries and backoff, UnrecoverableError, at-least-once delivery and idempotent jobs, job IDs for deduplication, what to put in job data, concurrency, limits and cleaning up finished jobs."
+---
+
+Some work shouldn't happen while the user waits:
+
+| Work | Why not in the request |
+| --- | --- |
+| Sending an email | Slow (1–3 s), and the SMTP server may be down |
+| A reminder 24 hours before a booking | Nobody is making a request at that moment |
+| Calling a customer's webhook URL (Mini-build B) | Their server may be slow or down for hours; you must retry |
+| Building a CSV export of 10,000 bookings | Takes seconds; the HTTP request might time out |
+| Processing a document for RAG (Phase 2) | Takes minutes |
+
+The pattern: the API **records** that the work must be done and answers right away. A separate **worker** does the work, retries if it fails, and nobody waits.
+
+## The options
+
+| Option | How | Good | Bad |
+| --- | --- | --- | --- |
+| Fire and forget | `void sendEmail()` without `await` | No setup | **Lost** on crash or deploy; no retries; errors disappear |
+| Postgres queue | A `jobs` table with `skip locked` ([PostgreSQL Lesson 6](/docs/postgresql/lesson-6-transactions-and-locking)), or pg-boss / Graphile Worker | No new infrastructure; jobs can be added in the same transaction as the data | You build (or learn) delays, retries, schedules; heavy load stresses the database |
+| **BullMQ** (Redis) | A library on top of Redis data types | Delays, retries with backoff, schedules, priorities, rate limits, a dashboard, a Nest module | Another service to run; Redis is in memory (Lesson 8 covers durability) |
+| Cloud queues (AWS SQS) | A managed service | No servers; very durable | Fewer features (delays up to 15 minutes); AWS only |
+| Kafka / streams | An ordered log that many consumers read | Huge volume, replay, event-driven systems | Big and complex; not a job queue |
+
+BullMQ is the most common choice in Node.js backends, and it appears in many job descriptions. A Postgres queue is a perfectly good choice too, especially at small scale; knowing why you'd pick each is the interview answer.
+
+## The concepts
+
+- A **queue** has a name (`emails`). Jobs are added to it.
+- A **job** has a **name** (`verify-email`), **data** (JSON), **options** (attempts, delay, ID...) and an ID.
+- A **producer** adds jobs (the API).
+- A **worker** takes jobs from the queue and runs your **processor** function (the worker process).
+
+A job moves through these states:
+
+```text
+add() ──► waiting ──► active ──► completed
+  │           ▲           │
+  │ delay     │ retry     └──► failed (attempts used up, or UnrecoverableError)
+  ▼           │ (backoff)
+delayed ──────┘
+```
+
+There are also `prioritized` (waiting, with a priority) and `waiting-children` (flows, below). Each state is a Redis data structure; that's why Redis must never evict BullMQ's keys (`noeviction`, Lesson 2).
+
+## Setup in NestJS
+
+### A Redis connection for BullMQ
+
+BullMQ creates its **own** Redis connections (several per worker). Give it connection options, not the cache client from Lesson 2:
+
+```typescript
+// src/redis/redis-options.ts
+import type { RedisOptions } from 'ioredis';
+
+/** Turns redis://user:pass@host:port/db into ioredis options. rediss:// means TLS. */
+export function redisOptions(url: string): RedisOptions {
+  const u = new URL(url);
+  return {
+    host: u.hostname,
+    port: Number(u.port || 6379),
+    username: u.username || undefined,
+    password: u.password ? decodeURIComponent(u.password) : undefined,
+    db: u.pathname.length > 1 ? Number(u.pathname.slice(1)) : 0,
+    tls: u.protocol === 'rediss:' ? {} : undefined,
+  };
+}
+```
+
+Workers wait on Redis with blocking commands and must keep retrying while Redis restarts, so BullMQ uses `maxRetriesPerRequest: null` for them. When you pass options (not a ready client), BullMQ sets this for you.
+
+### Register the queues (shared by the API and the worker)
+
+```typescript
+// src/queues/queues.module.ts
+import { BullModule } from '@nestjs/bullmq';
+import { Module } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { redisOptions } from '../redis/redis-options';
+import { EMAILS } from './names';
+
+@Module({
+  imports: [
+    BullModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService<Env, true>) => ({
+        connection: redisOptions(config.get('REDIS_URL', { infer: true })),
+      }),
+    }),
+    BullModule.registerQueue({
+      name: EMAILS,
+      defaultJobOptions: {
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 5_000 },        // 5 s, 10 s, 20 s, 40 s
+        removeOnComplete: { age: 24 * 3600, count: 1_000 },    // keep the last day / last 1,000
+        removeOnFail: { age: 7 * 24 * 3600 },                  // keep failures for a week
+      },
+    }),
+  ],
+  exports: [BullModule],
+})
+export class QueuesModule {}
+```
+
+```typescript
+// src/queues/names.ts
+export const EMAILS = 'emails';
+```
+
+### Typed jobs
+
+Job data is just JSON, so TypeScript can't check it for you unless you define the shapes. Use a discriminated union ([TypeScript Lesson 2](/docs/typescript/lesson-2-narrowing)):
+
+```typescript
+// src/emails/email-jobs.ts
+export type EmailJob =
+  | { name: 'verify-email'; data: { to: string; name: string; token: string } }
+  | { name: 'password-reset'; data: { to: string; token: string } }
+  | { name: 'booking-confirmation'; data: { businessId: string; bookingId: string } }
+  | { name: 'test'; data: { to: string } };
+
+export type EmailJobName = EmailJob['name'];
+export type EmailJobData<N extends EmailJobName> = Extract<EmailJob, { name: N }>['data'];
+```
+
+### The producer
+
+```typescript
+// src/emails/email-queue.ts
+import { InjectQueue } from '@nestjs/bullmq';
+import { Injectable } from '@nestjs/common';
+import type { JobsOptions, Queue } from 'bullmq';
+import { EMAILS } from '../queues/names';
+import type { EmailJobData, EmailJobName } from './email-jobs';
+
+@Injectable()
+export class EmailQueue {
+  constructor(@InjectQueue(EMAILS) private readonly queue: Queue) {}
+
+  add<N extends EmailJobName>(name: N, data: EmailJobData<N>, opts?: JobsOptions) {
+    return this.queue.add(name, data, opts);
+  }
+}
+```
+
+`emailQueue.add('verify-email', { to, name, token })` is checked; `emailQueue.add('verify-email', { bookingId })` doesn't compile.
+
+### The processor
+
+```typescript
+// src/emails/emails.processor.ts
+import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
+import { Logger } from '@nestjs/common';
+import { type Job, UnrecoverableError } from 'bullmq';
+import { EMAILS } from '../queues/names';
+import type { EmailJob } from './email-jobs';
+import { Mailer } from './mailer';
+
+@Processor(EMAILS, { concurrency: 5 })
+export class EmailsProcessor extends WorkerHost {
+  private readonly logger = new Logger(EmailsProcessor.name);
+
+  constructor(private readonly mailer: Mailer) {
+    super();
+  }
+
+  async process(job: Job): Promise<void> {
+    const email = { name: job.name, data: job.data } as EmailJob;   // the one place we trust the shape
+    switch (email.name) {
+      case 'test':
+        return this.mailer.send({ to: email.data.to, subject: 'Test', text: 'It works.' });
+      case 'verify-email':
+        return this.mailer.sendVerifyEmail(email.data);
+      case 'password-reset':
+        return this.mailer.sendPasswordReset(email.data);
+      case 'booking-confirmation':
+        return this.mailer.sendBookingConfirmation(email.data);      // Lesson 6
+      default: {
+        const unknown: never = email;                                // compile error if a case is missing
+        throw new UnrecoverableError(`Unknown email job ${(unknown as Job).name}`);
+      }
+    }
+  }
+
+  @OnWorkerEvent('failed')
+  onFailed(job: Job | undefined, err: Error) {
+    this.logger.warn(`job ${job?.id} (${job?.name}) failed, attempt ${job?.attemptsMade}: ${err.message}`);
+  }
+}
+```
+
+`Mailer` is the Nodemailer code from `AuthEmails` in [Auth Lesson 4](/docs/auth-security/lesson-4-email-flows), moved into a class the **worker** uses. Lesson 6 finishes the move.
+
+How `process` reports results:
+
+- **Returns** (the promise resolves) → the job is `completed`.
+- **Throws** → this attempt failed. If attempts are left, the job waits for the backoff and runs again; otherwise it's `failed`.
+- **Throws `UnrecoverableError`** → `failed` right away, no more attempts. Use it when retrying can't help: an invalid email address, an unknown job name, a booking that no longer exists.
+
+## A separate worker process
+
+If the processor runs inside the API process, a slow or CPU-heavy job slows down HTTP requests, and you can't scale them separately (2 API instances, 4 workers). So the worker is **its own process**, built from the same code:
+
+```typescript
+// src/worker.module.ts
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true, validate: validateEnv }),
+    PrismaModule,
+    RedisModule,
+    QueuesModule,
+    EmailsWorkerModule,           // providers: [EmailsProcessor, Mailer]
+  ],
+})
+export class WorkerModule {}
+```
+
+```typescript
+// src/worker.ts
+import { NestFactory } from '@nestjs/core';
+import { WorkerModule } from './worker.module';
+
+async function bootstrap() {
+  const app = await NestFactory.createApplicationContext(WorkerModule);   // no HTTP server
+  app.enableShutdownHooks();                                              // close workers cleanly on SIGTERM
+}
+void bootstrap();
+```
+
+```json
+{
+  "scripts": {
+    "start:worker:dev": "nest start --watch --entryFile worker",
+    "start:worker": "node dist/worker"
+  }
+}
+```
+
+The important rule: **`EmailsProcessor` must not be in a module the API imports.** `@nestjs/bullmq` starts a worker for every `@Processor` it finds. The API imports `QueuesModule` (to add jobs); only the worker imports `EmailsWorkerModule` (to process them).
+
+Run both in two terminals:
+
+```powershell
+npm run start:dev
+npm run start:worker:dev
+```
+
+Stop the worker and add jobs: they wait in Redis. Start the worker: they're processed. That's the whole point of a queue (exercise 5.1).
+
+## At-least-once: jobs run more than once
+
+BullMQ (like every queue) gives **at-least-once** delivery. A job can run twice:
+
+- **Retries after partial work.** The job sent the email, then failed while saving `sentAt`. The retry sends it again.
+- **Stalled jobs.** A worker holds a **lock** on each active job and renews it while it runs (default `lockDuration` 30 s). If the worker crashes, or its event loop is blocked so it can't renew the lock, another worker sees the job as **stalled** and runs it again.
+- **Duplicate adds.** The producer adds the same job twice (a retry of the HTTP request, the outbox relay running twice).
+
+"Exactly once" isn't possible in general. What you can build is **effectively once**: the job may run twice, but the **effect** happens once. That's **idempotency**, and there are three tools:
+
+| Tool | How | Example |
+| --- | --- | --- |
+| **A job ID** | `add(name, data, { jobId })`: BullMQ ignores an add if a job with that ID already exists | `jobId: 'confirm-' + bookingId`: one confirmation job per booking, however many times it's added |
+| **Check the state first** | The job reads the current data and does nothing if the work is done | `if (booking.confirmationSentAt) return;` |
+| **A unique constraint** | Record the effect with a unique key; a duplicate insert fails | `processed_events (event_id primary key)` |
+
+Two notes on job IDs:
+
+- Don't use `:` in custom IDs (BullMQ uses colons in its Redis keys) and don't use plain integers. `confirm-0193...` is fine.
+- A job ID only deduplicates while the job **still exists** in Redis. After `removeOnComplete` deletes it, the same ID can be added again. That's why the job ID is the first line of defence, and the state check is the real one.
+
+## What goes in job data
+
+- **IDs, not objects.** `{ bookingId }`, not the whole booking. The worker loads fresh data when it runs, which might be minutes or hours later: the booking might be cancelled or moved by then.
+- **Small.** Every job is stored in Redis memory, and appears in the dashboard.
+- **JSON only.** `Date` becomes a string; `Map`, `BigInt` and class instances don't survive.
+- **Secrets only when there's no other way.** The verify-email token must be in the job (the database only has its hash), so treat job data as sensitive: protect Redis, delete those jobs soon after completion, never log `job.data` (Lesson 6).
+- **The tenant.** A job has no request and no `MembershipGuard`. Put `businessId` in the data and scope every query with it.
+- **Versioned when it changes.** Jobs added by yesterday's code may run on today's code. If you change the data shape, handle both, or use a new job name.
+
+## Concurrency and limits
+
+- `concurrency: 5` → one worker process runs up to 5 jobs at the same time. Good for I/O-bound jobs (emails, HTTP calls). For CPU-heavy work, use more processes instead.
+- `limiter: { max: 10, duration: 1_000 }` → at most 10 jobs per second **across all workers** of this queue. Use it to respect an email provider's rate limit.
+- Priorities: `add(name, data, { priority: 1 })` (lower number = higher priority). For example, password resets before marketing emails. Priorities cost some speed; use them only when you need them.
+
+## Other features (know they exist)
+
+- **Flows** (`FlowProducer`): a parent job that runs after all its children finish. For example, "send 300 emails, then mark the campaign as sent".
+- **Progress**: `await job.updateProgress(40)`, shown in the dashboard. Good for exports.
+- **`QueueEvents`**: listen to job events from another process (for example, the API waits for an export to finish).
+- **Sandboxed processors**: run a processor in a separate child process, for CPU-heavy code that would otherwise block the lock renewal.
+
+## Mistakes to avoid
+
+- Fire-and-forget promises for important work.
+- The processor in a module the API imports (the API becomes a worker too).
+- Reusing the cache's Redis client (with `maxRetriesPerRequest: 2`) for BullMQ.
+- Assuming a job runs exactly once.
+- Whole objects in job data instead of IDs; loading nothing fresh in the worker.
+- Throwing a normal error for a problem retrying can't fix (5 useless attempts).
+- No `removeOnComplete`: Redis memory grows forever.
+- Logging `job.data` (tokens, emails).
+- Jobs that don't carry `businessId`, or queries in workers without it.
+- A `:` in a custom job ID.
+
+## Exercises
+
+- **5.1** 🟢 Set up `QueuesModule`, the `emails` queue, `EmailsProcessor` with the `test` job, `Mailer` and the worker process. Add `POST /v1/dev/test-email` (only when `NODE_ENV=development`) that adds a `test` job. Check the email in Mailpit. Then stop the worker, call the endpoint 5 times, look at the keys in `redis-cli` (`SCAN 0 MATCH bull:emails:*`), start the worker and watch all 5 arrive.
+- **5.2** 🟡 Add a new job type `password-changed` to `EmailJob` without adding it to the `switch`. What does TypeScript say, and where? Add the case. Then try `emailQueue.add('password-changed', { bookingId: 'x' })` and read the error.
+- **5.3** 🟡 Stop Mailpit and add a `test` job. Log each attempt with a timestamp: do the gaps match the exponential backoff? Start Mailpit before the last attempt and watch it succeed. Then make an invalid address (no `@`) fail with `UnrecoverableError` and check that it's attempted only once.
+- **5.4** 🔴 Prove at-least-once. Make the `test` job send the email, then wait 20 seconds, then finish. Start it, and **kill** the worker during the wait (`Stop-Process -Name node` for the worker, or close its terminal). Start the worker again and wait about 30 seconds. How many emails are in Mailpit? Explain why. Then make the job idempotent with an `email_log` table that has a unique `dedupe_key`, and explain the one case where a duplicate is still possible.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"Why use a job queue, and how do you make jobs reliable?"**
+
+> "I use a queue for work the user shouldn't wait for, or that must survive failures: emails, webhooks, reminders, exports. The API adds a job and returns right away, and a separate worker process runs it, so slow jobs don't affect API latency and I can scale workers separately. I use BullMQ on Redis, with retries and exponential backoff for temporary errors, and an unrecoverable error when retrying can't help. Queues deliver at least once, so every job must be idempotent: I use a job ID based on the business key, like the booking ID, so duplicates are ignored, and the job checks the current state in the database before acting. Job data holds IDs, not objects, so the worker always works with fresh data."
+
+**"BullMQ or a Postgres-based queue?"**
+
+> "Both are valid. A Postgres queue with `FOR UPDATE SKIP LOCKED` needs no extra infrastructure, and I can add a job in the same transaction as the data change, which is a big advantage. BullMQ gives me delays, retries, schedules, rate limits, priorities and a dashboard out of the box, and handles high volume well, but it's another service, and Redis is in memory, so I keep the source of truth in Postgres. In my booking platform I use both: the outbox table in Postgres records events in the same transaction, and a relay moves them into BullMQ."

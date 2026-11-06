@@ -1,0 +1,532 @@
+---
+title: "Solutions"
+description: "Model answers for every exercise in the Testing section. Try the exercises first."
+---
+
+<Callout type="warn" title="Try first">
+Do each exercise yourself and get it reviewed before reading the answer. Tests can be written in many good ways: if yours is different, ask "Does my test fail when the code is wrong? Is it easy to read?" Those two questions matter more than matching this page.
+</Callout>
+
+## Lesson 1: Why test, what to test, Jest basics
+
+**1.1**
+
+| Feature | First test | Why |
+| --- | --- | --- |
+| (a) `freeSlots` | Unit | A pure function: fast, many cases, no dependencies |
+| (b) The exclusion constraint | Integration (real Postgres) | The rule lives in the database; only a real database can prove it |
+| (c) 404 for another business's booking | API test | It depends on the guard, the query and the filter together, through HTTP |
+| (d) "Book" disabled while sending | Component test | A UI state; Testing Library + MSW with a small delay |
+| (e) Sign-up → verify → log in | Browser (Playwright), plus an API test of the same flow | Crosses pages, email and cookies; the API test is faster and catches most bugs, the browser test proves the pages work |
+| (f) Refresh token reuse detection | API test (plus integration tests for the repository) | It's about cookies, the database and timing together |
+
+**1.2** Typical results:
+
+- `<` → `<=` in `overlaps`: the "touching ends" row fails, in both directions. The `freeSlots` tests still pass, because none of their bookings touch a slot edge. That shows a gap: add a `freeSlots` test where a booking ends exactly when a slot starts.
+- `t + step <= end` → `<`: "returns every slot when nothing is booked" fails (the 10:30 slot, which ends exactly at closing time, disappears). "Does not return a slot that would end after closing" still passes, which shows why you need **both** edge tests.
+- Removing the `durationMin` check: "throws for a zero-length service" doesn't fail, it **hangs forever**, because `t += 0` loops and Jest's timeout can't stop a synchronous loop. So the check protects against a frozen server, not just a wrong answer.
+
+If a change went unnoticed, you've found a missing test. That's the point of the exercise.
+
+**1.3**
+
+```typescript
+// src/bookings/price.ts
+export function bookingPrice(service: { priceCents: number }, startsAt: Date, timeZone: string): number {
+  const weekday = new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone }).format(startsAt);
+  const weekend = weekday === 'Fri' || weekday === 'Sat';
+  return weekend ? Math.round(service.priceCents * 1.2) : service.priceCents;
+}
+```
+
+```typescript
+// src/bookings/price.spec.ts
+describe('bookingPrice', () => {
+  it.each([
+    // [what,                                   price, startsAt,                 timeZone,           expected]
+    ['Thursday in Dhaka',                       2_000, '2026-12-03T06:00:00Z',   'Asia/Dhaka',       2_000],
+    ['Friday in Dhaka',                         2_000, '2026-12-04T06:00:00Z',   'Asia/Dhaka',       2_400],
+    ['Saturday in Dhaka',                       2_000, '2026-12-05T06:00:00Z',   'Asia/Dhaka',       2_400],
+    ['Sunday in Dhaka',                         2_000, '2026-12-06T06:00:00Z',   'Asia/Dhaka',       2_000],
+    ['Thursday 23:30 UTC = Friday in Dhaka',    2_000, '2026-12-03T23:30:00Z',   'Asia/Dhaka',       2_400],
+    ['Friday 02:00 UTC = Thursday in New York', 2_000, '2026-12-04T02:00:00Z',   'America/New_York', 2_000],
+    ['rounds to whole cents',                   1_999, '2026-12-04T06:00:00Z',   'Asia/Dhaka',       2_399],
+  ])('%s', (_what, priceCents, startsAt, timeZone, expected) => {
+    expect(bookingPrice({ priceCents }, new Date(startsAt), timeZone)).toBe(expected);
+  });
+});
+```
+
+(2026-12-03 is a Thursday. 1,999 × 1.2 = 2,398.8, so the answer is 2,399.) The New York row checks the other direction: a moment that's Friday in UTC is still Thursday evening there.
+
+**1.4** In the NestJS Lesson 2 tests:
+
+- `expect(booking.status).toBe('confirmed')`: **behaviour**.
+- `rejects.toThrow(ConflictException)`: **behaviour**.
+- `expect(repo.insert).not.toHaveBeenCalled()` after the conflict: **behaviour** (nothing was saved when the rule failed).
+- `expect(repo.insert).toHaveBeenCalledTimes(1)` in the success test: borderline. It's "the booking was saved", which is behaviour. A better version checks **what** was saved: `expect(repo.insert).toHaveBeenCalledWith(expect.objectContaining({ status: 'confirmed', startsAt: ... }))`.
+- Anything like `expect(repo.findAt).toHaveBeenCalledWith(...)`: **implementation**. Delete it; if the lookup were wrong, the result tests would fail.
+
+## Lesson 2: Unit tests in NestJS
+
+**2.1** The builders and tests are in the lesson. The four breakages to try: remove the `!booking` check (the "not visible" test fails with a TypeError instead of `NotFoundError`), invert `canCancel` (two tests fail), swap the order of the status and permission checks (still passes: think about whether the order matters to a user), and remove the `ALREADY_CANCELLED` check (the "refuses to cancel twice" test fails).
+
+**2.2**
+
+```typescript
+class FakeController {
+  @Public()
+  health() {}
+
+  @Roles(['owner', 'admin'])
+  deleteService() {}
+
+  listServices() {}
+}
+
+@Roles(['owner'])
+class OwnerOnlyController {
+  everything() {}
+
+  @Roles(['owner', 'admin', 'staff'])
+  overridden() {}
+}
+
+function contextFor(cls: Function, handler: Function, req: object): ExecutionContext {
+  return {
+    getHandler: () => handler,
+    getClass: () => cls,
+    switchToHttp: () => ({ getRequest: () => req }),
+  } as unknown as ExecutionContext;
+}
+
+it('AuthGuard lets a @Public() route through without checking a token', async () => {
+  const tokens = { verifyAccessToken: jest.fn() };
+  const guard = new AuthGuard(new Reflector(), tokens as unknown as TokenService);
+
+  await expect(guard.canActivate(contextFor(FakeController, FakeController.prototype.health, { cookies: {} })))
+    .resolves.toBe(true);
+  expect(tokens.verifyAccessToken).not.toHaveBeenCalled();
+});
+
+it('RolesGuard: a class decorator applies to every method, and a method decorator overrides it', () => {
+  const guard = new RolesGuard(new Reflector());
+  const staff = { user: { role: 'staff' } };
+
+  expect(guard.canActivate(contextFor(OwnerOnlyController, OwnerOnlyController.prototype.everything, staff))).toBe(false);
+  expect(guard.canActivate(contextFor(OwnerOnlyController, OwnerOnlyController.prototype.overridden, staff))).toBe(true);
+});
+```
+
+**2.3**
+
+```typescript
+describe('OriginGuard', () => {
+  const config = { get: () => 'http://localhost:3001' } as unknown as ConfigService<Env, true>;
+  const guard = new OriginGuard(config);
+
+  const ctx = (req: { method: string; cookies?: Record<string, string>; headers?: Record<string, string> }) =>
+    ({
+      switchToHttp: () => ({
+        getRequest: () => ({ ...req, header: (name: string) => req.headers?.[name.toLowerCase()] }),
+      }),
+    }) as unknown as ExecutionContext;
+
+  const withCookie = { access_token: 'x' };
+
+  it.each([
+    ['GET with cookies, any origin',                 { method: 'GET', cookies: withCookie, headers: { origin: 'https://evil.example' } }, true],
+    ['POST without cookies (API key or anonymous)',  { method: 'POST', headers: { origin: 'https://evil.example' } }, true],
+    ['POST with cookies and our origin',             { method: 'POST', cookies: withCookie, headers: { origin: 'http://localhost:3001' } }, true],
+    ['POST with cookies, Sec-Fetch-Site cross-site', { method: 'POST', cookies: withCookie, headers: { 'sec-fetch-site': 'cross-site', origin: 'http://localhost:3001' } }, false],
+    ['POST with cookies and another origin',         { method: 'POST', cookies: withCookie, headers: { origin: 'https://evil.example' } }, false],
+    ['POST with cookies and no Origin',              { method: 'POST', cookies: withCookie, headers: {} }, false],
+    ['DELETE with the refresh cookie only',          { method: 'DELETE', cookies: { refresh_token: 'x' }, headers: { origin: 'https://evil.example' } }, false],
+  ])('%s → %s', (_name, req, allowed) => {
+    if (allowed) expect(guard.canActivate(ctx(req))).toBe(true);
+    else expect(() => guard.canActivate(ctx(req))).toThrow(ForbiddenException);
+  });
+});
+```
+
+The `cross-site` row with the **right** Origin is a good one: it shows `Sec-Fetch-Site` is checked first.
+
+**2.4** Example with `AuthService.login`: unit tests for "unknown email still runs a hash" (the dummy hash, checked with a spy on `PasswordService.verify`), "wrong password → 401", "unverified email → 403", "`needsRehash` → the new hash is saved", "2FA on → returns `mfaRequired`". After Lesson 3–4 integration and API tests, keep the **dummy hash** test (timing protection is easy to break and hard to see in an API test) and the **rehash** test (it needs an old hash, which is awkward to create through HTTP). Delete the "wrong password → 401" and "2FA → mfaRequired" unit tests: the API tests check the same thing more realistically, and keeping both means two tests to update for one change.
+
+## Lesson 3: Integration tests
+
+**3.1**
+
+```typescript
+// test/smoke.int-spec.ts
+import { createTestPrisma } from './setup/db';
+
+const prisma = createTestPrisma();
+afterAll(() => prisma.$disconnect());
+
+it('connects to the test database', async () => {
+  const [row] = await prisma.$queryRaw<{ one: number }[]>`select 1::int as one`;
+  expect(row.one).toBe(1);
+  expect(process.env.DATABASE_URL).toMatch(/booking_test_\d+$/);   // and it's a worker database, not the template
+});
+```
+
+A typical first run: 20–60 s (image download). After that: 3–6 s to start and migrate, then the test itself takes a few milliseconds.
+
+**3.2** Dropping the constraint in a migration (`alter table bookings drop constraint bookings_no_overlap;`) makes exactly one test fail: "rejects an overlapping booking". The touching-ends, other-staff and cancelled tests still pass, because without a constraint **everything** is allowed. That's a useful lesson: tests that check "this is allowed" can't catch a missing rule; you always need the "this is rejected" test too.
+
+**3.3**
+
+```typescript
+const actor = (businessId: string, id: string, role: Role): AuthUser =>
+  ({ id, sessionId: 's', businessId, role });
+
+const bookAt = (salon: Salon, time: string, staffId = salon.staff.id) =>
+  repo.create({
+    businessId: salon.business.id, serviceId: salon.service.id, staffId,
+    customerEmail: `c-${time}@test.dev`, startsAt: at(time), endsAt: new Date(at(time).getTime() + 30 * 60_000), priceCents: 2_000,
+  });
+
+it('another business cannot list or cancel a booking', async () => {
+  const a = await f.salon();
+  const b = await f.salon();
+  const booking = await bookAt(a, '10:00');
+  const ownerOfB = actor(b.business.id, b.owner.id, 'owner');
+
+  expect(await repo.list(ownerOfB, { limit: 20 })).toEqual(expect.objectContaining({ data: [] }));
+  await expect(repo.cancel(b.business.id, booking.id)).rejects.toBeInstanceOf(NotFoundError);
+
+  const row = await prisma.booking.findUniqueOrThrow({ where: { id: booking.id } });
+  expect(row.status).toBe('confirmed');
+});
+```
+
+(Adjust `list`'s return shape to your keyset pagination result.) `cancel` should use `updateMany({ where: { id, businessId, status: { not: 'cancelled' } } })` and throw `NotFoundError` when `count === 0`; if yours throws Prisma's `P2025` instead, map it in the repository.
+
+**3.4**
+
+```typescript
+it('never removes the last owner, even when two owners remove each other at once', async () => {
+  for (let run = 0; run < 20; run++) {
+    await resetDb(prisma);
+    const business = await f.business();
+    const ownerA = await f.member(business.id, 'owner');
+    const ownerB = await f.member(business.id, 'owner');
+
+    const results = await Promise.allSettled([
+      members.remove(actor(business.id, ownerA.id, 'owner'), ownerB.id),
+      members.remove(actor(business.id, ownerB.id, 'owner'), ownerA.id),
+    ]);
+
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(await prisma.membership.count({ where: { businessId: business.id, role: 'owner' } })).toBe(1);
+  }
+});
+```
+
+Without `for update`, this test **usually** fails, but not always: if the first transaction commits before the second one runs its `select`, the second sees one owner and refuses, which is correct by luck. That's why race tests with `Promise.all` are smoke alarms, and Lesson 5's two-connection test is the proof.
+
+## Lesson 4: API tests
+
+**4.1** With `enableVersioning` commented out, `GET /health/live` still works if the health controller is `VERSION_NEUTRAL`, so that test may stay green. Use a versioned route for this check, like `GET /v1/me` expecting 401 (not 404). That's a good reminder: pick the test that would fail for the bug you're worried about.
+
+**4.2**
+
+```typescript
+// test/factories.ts (add to the factories object)
+userWithPassword: async (email: string, password: string) => {
+  const passwordHash = await new PasswordService().hash(password);   // or app.get(PasswordService) if it has dependencies
+  return prisma.user.create({ data: { email, name: 'Test User', passwordHash, emailVerifiedAt: new Date() } });
+},
+```
+
+```typescript
+// test/setup/auth.ts
+export function refreshCookie(res: Response): string {
+  const cookie = ((res.get('Set-Cookie') ?? []) as string[]).find((c) => c.startsWith('refresh_token='));
+  if (!cookie) throw new Error('No refresh_token in Set-Cookie');
+  return cookie.split(';')[0];
+}
+```
+
+```typescript
+it('after logout, the old access token stops working on routes that check the session', async () => {
+  const user = await f.userWithPassword('rahim@test.dev', 'correct horse battery staple');
+  const login = await client(t.server).post('/v1/auth/login')
+    .send({ email: 'rahim@test.dev', password: 'correct horse battery staple' }).expect(204);
+  const cookie = cookieHeader(login);
+
+  await client(t.server, { cookie }).post('/v1/auth/logout').expect(204);
+
+  await client(t.server, { cookie }).get('/v1/auth/sessions').expect(401);   // checks the session row, not only the JWT
+});
+```
+
+A route that only verifies the JWT would still return 200 for up to 15 minutes. If your test shows that, it's not a bug in the test: it's the trade-off from Auth Lesson 3, and the test documents it. Pick a route that checks the session for the "logged out" test, and write a second test that **documents** the 15-minute window on a normal route.
+
+**4.3** Removing `businessId` from `findOne` makes the "cannot read" test fail with 200 instead of 404. Removing it from `list` makes "list is empty" fail. If you removed it from `cancel` and only `findOne` + `cancel` both use `visibleBookings`, the test catches it; if `cancel` has its own `where`, check that your test cancels **directly** by ID too.
+
+**4.4** Route discovery through the Swagger document:
+
+```typescript
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+
+it('every route that needs a business is in the permissions matrix', () => {
+  const doc = SwaggerModule.createDocument(t.app, new DocumentBuilder().build());
+  const routes = Object.entries(doc.paths).flatMap(([path, ops]) =>
+    Object.keys(ops).map((method) => `${method.toUpperCase()} ${path}`),
+  );
+
+  const skip = /^(GET|POST) \/v1\/(auth|me|health|businesses$|invitations\/accept)/;   // routes without X-Business-Id
+  const covered = new Set(matrix.map((row) => row.route));           // add `route: 'DELETE /v1/services/{id}'` to each row
+
+  expect(routes.filter((r) => !skip.test(r) && !covered.has(r))).toEqual([]);
+});
+```
+
+When someone adds a controller method, this test fails until they add a matrix row, so nobody can forget the permission check.
+
+## Lesson 5: Time, outside services, races
+
+**5.1** For one-time links, the expiry rule must use the app's clock. Change the consume query to take the time as a parameter:
+
+```typescript
+// OneTimeTokenService.consume
+const now = this.clock.now();
+const rows = await this.prisma.$queryRaw<{ user_id: string }[]>`
+  update one_time_tokens set used_at = ${now}
+  where token_hash = ${hash} and purpose = ${purpose} and used_at is null and expires_at > ${now}
+  returning user_id`;
+```
+
+```typescript
+it.each([
+  ['29 minutes', 29, 204],
+  ['31 minutes', 31, 400],
+])('a reset link used after %s → %s', async (_label, minutes, status) => {
+  t.clock.set('2026-12-01T09:00:00Z');
+  await f.userWithPassword('rahim@test.dev', 'old password that is long');
+  await client(t.server).post('/v1/auth/forgot-password').send({ email: 'rahim@test.dev' }).expect(202);
+  await eventually(() => expect(t.emails.sendPasswordReset).toHaveBeenCalled());
+  const [, , token] = t.emails.sendPasswordReset.mock.calls[0];
+
+  t.clock.advance(minutes * 60_000);
+  await client(t.server).post('/v1/auth/reset-password').send({ token, password: 'a brand new long password' }).expect(status);
+});
+```
+
+Note that the token is **created** with the clock too (`expiresAt = this.clock.now() + 30 min`). If creation used the database's `now()` and checking used the app clock, the test would mix two clocks.
+
+**5.2**
+
+- **Spring forward (2027-03-14), 01:00–04:00:** 4 slots (06:00, 06:30, 07:00, 07:30 UTC), as in the lesson. A common bug: generating local times 01:00, 01:30, 02:00, 02:30, 03:00, 03:30 and converting each. Postgres turns the non-existent 02:00 and 02:30 into 03:00 and 03:30 EDT, so you get **duplicate** slots. The fix: convert the opening and closing times to `timestamptz` first, then step through UTC.
+- **Fall back (2027-11-07):** with working hours 00:00–03:00, the day is **4** real hours long (00:00 EDT = 04:00Z to 03:00 EST = 08:00Z), so there are 8 slots: 04:00, 04:30, 05:00, 05:30, 06:00, 06:30, 07:00, 07:30 UTC. On a New York clock they read 00:00, 00:30, 01:00, 01:30, **01:00, 01:30**, 02:00, 02:30. The UI must show which 01:00 is which (for example "1:00 AM EDT" and "1:00 AM EST"). Avoid working hours that start or end inside the repeated hour in tests: Postgres resolves an ambiguous local time to one side, and the test then depends on that choice.
+- **"Today" in Dhaka at 2026-12-01T23:30Z:** Dhaka's today is December 2, which is `[2026-12-01T18:00Z, 2026-12-02T18:00Z)`. A booking at `2026-12-01T17:00Z` (23:00 on Dec 1 in Dhaka) is **not** today; one at `2026-12-01T20:00Z` (02:00 on Dec 2) **is**. A version that uses the UTC date gets both wrong.
+
+**5.3**
+
+```typescript
+it('fails open after a timeout', async () => {
+  mswServer.use(http.get('https://api.pwnedpasswords.com/range/:prefix', async () => {
+    await delay('infinite');
+    return HttpResponse.text('');
+  }));
+  await expect(isBreachedPassword('anything at all 123', { timeoutMs: 50 })).resolves.toBe(false);
+});
+```
+
+(Add an optional `timeoutMs` parameter, default 2,000, so the test doesn't wait 2 seconds.)
+
+```typescript
+it('sign-up with a breached password → 422 with a password field error', async () => {
+  const password = 'password1234567';
+  mswServer.use(hibp.breached(suffixOf(password)));
+
+  const res = await client(t.server).post('/v1/auth/signup')
+    .send({ email: 'new@test.dev', name: 'New', password }).expect(422);
+
+  expect(res.body.errors).toEqual([expect.objectContaining({ field: 'password' })]);
+  expect(t.emails.sendVerifyEmail).not.toHaveBeenCalled();
+});
+```
+
+**5.4** The last-owner version of the two-connection test:
+
+```typescript
+it('makes the second owner removal wait for the first, then refuse', async () => {
+  const business = await f.business();
+  const ownerA = await f.member(business.id, 'owner');
+  const ownerB = await f.member(business.id, 'owner');
+  const [a, b] = [new Client({ connectionString: process.env.DATABASE_URL }), new Client({ connectionString: process.env.DATABASE_URL })];
+  await Promise.all([a.connect(), b.connect()]);
+  const { rows: [{ pid: bPid }] } = await b.query<{ pid: number }>('select pg_backend_pid() as pid');
+
+  const lockOwners = (c: Client) =>
+    c.query(`select user_id from memberships where business_id = $1 and role = 'owner' for update`, [business.id]);
+
+  try {
+    await a.query('begin');
+    await lockOwners(a);                                          // A sees 2 owners and locks them
+
+    await b.query('begin');
+    const bLock = lockOwners(b);                                  // B must wait
+    await eventually(async () => {
+      const { rows } = await a.query('select wait_event_type from pg_stat_activity where pid = $1', [bPid]);
+      expect(rows[0]?.wait_event_type).toBe('Lock');
+    });
+
+    await a.query(`delete from memberships where business_id = $1 and user_id = $2`, [business.id, ownerB.id]);
+    await a.query('commit');
+
+    const { rows } = await bLock;                                 // B wakes up and re-reads the locked rows
+    expect(rows).toHaveLength(1);                                 // only one owner left → the code must refuse
+  } finally {
+    await b.query('rollback').catch(() => {});
+    await Promise.all([a.end(), b.end()]);
+  }
+});
+```
+
+This test checks the **SQL pattern** your service uses. Without `for update`, B doesn't wait: the `eventually` check fails every run, because B's `select` returns immediately with two owners. (For a full check of your service code, run `members.remove` for B while A holds the lock, using the same idea.)
+
+## Lesson 6: React component tests
+
+**6.1** No single answer. A good first test: render the header with a user, `expect(screen.getByRole('button', { name: 'Log out' })).toBeInTheDocument()`, click it, and check the logout request was sent (MSW handler with a counter).
+
+**6.2** With `useActionState` the five tests should pass unchanged, **if** the labels, roles and texts stay the same. Two things often break, and both are component bugs, not test bugs: the "Booking…" text disappears (use `isPending` from `useActionState` to show it), and the double-submit protection is lost (with a form action, React already blocks a second submit while pending, but check it). If a test breaks because you renamed "Book" to "Confirm booking", update the test: the user-visible text changed.
+
+**6.3** The four states:
+
+```tsx
+it('shows the free times in the business’s time zone', async () => {
+  mswServer.use(http.get('/v1/staff/:id/availability', () =>
+    HttpResponse.json({ slots: ['2099-01-01T04:00:00.000Z', '2099-01-01T04:30:00.000Z'] })));
+  render(<SlotPicker staffId="s1" serviceId="svc" date="2099-01-01" timeZone="Asia/Dhaka" onPick={() => {}} />);
+
+  const group = await screen.findByRole('group', { name: 'Free times' });
+  expect(within(group).getAllByRole('button').map((b) => b.textContent)).toEqual(['10:00', '10:30']);   // UTC+6
+});
+
+it('says so when there are no free times', async () => {
+  mswServer.use(http.get('/v1/staff/:id/availability', () => HttpResponse.json({ slots: [] })));
+  render(<SlotPicker staffId="s1" serviceId="svc" date="2099-01-01" timeZone="Asia/Dhaka" onPick={() => {}} />);
+  expect(await screen.findByText('No free times on this day')).toBeInTheDocument();
+});
+
+it('lets the user try again after an error', async () => {
+  let calls = 0;
+  mswServer.use(http.get('/v1/staff/:id/availability', () =>
+    ++calls === 1 ? new HttpResponse(null, { status: 500 }) : HttpResponse.json({ slots: ['2099-01-01T04:00:00.000Z'] })));
+  const user = userEvent.setup();
+  render(<SlotPicker staffId="s1" serviceId="svc" date="2099-01-01" timeZone="Asia/Dhaka" onPick={() => {}} />);
+
+  await user.click(await screen.findByRole('button', { name: 'Try again' }));
+  expect(await screen.findByRole('button', { name: '10:00' })).toBeInTheDocument();
+});
+```
+
+For the loading state, check `screen.getByText('Loading free times…')` right after `render` (before any `await`), and `queryByText` is `null` after the slots appear.
+
+**6.4**
+
+```typescript
+it('refreshes once for two parallel 401s, then retries both', async () => {
+  let refreshCalls = 0;
+  let refreshed = false;
+  mswServer.use(
+    http.get('/v1/me', () => (refreshed ? HttpResponse.json({ id: 'u1' }) : new HttpResponse(null, { status: 401 }))),
+    http.post('/v1/auth/refresh', async () => {
+      refreshCalls++;
+      await delay(20);                       // keep the refresh "in flight" while the second 401 arrives
+      refreshed = true;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+
+  const [a, b] = await Promise.all([api('/v1/me'), api('/v1/me')]);
+
+  expect([a.status, b.status]).toEqual([200, 200]);
+  expect(refreshCalls).toBe(1);
+});
+
+it('goes to /login when the refresh fails', async () => {
+  const redirect = vi.fn();
+  mswServer.use(
+    http.get('/v1/me', () => new HttpResponse(null, { status: 401 })),
+    http.post('/v1/auth/refresh', () => new HttpResponse(null, { status: 401 })),
+  );
+
+  await api('/v1/me', {}, { redirect });     // the helper takes a redirect function (default: window.location.assign)
+
+  expect(redirect).toHaveBeenCalledWith('/login');
+});
+```
+
+Passing `redirect` in is the same idea as the `Clock`: make the side effect an input.
+
+## Lesson 7: Playwright
+
+**7.1** Your trace shows the `goto`, each `fill`, the click, the network calls to `/v1/auth/login` (with `Set-Cookie`) and the dashboard request. If the setup test passes but the reload test shows the login page, check that the `access_token` cookie is in `playwright/.auth/owner.json` and that its `domain` is `localhost`.
+
+**7.2** The usual failure with `--repeat-each=10`: two runs at the same time pick the **same first free slot**, one books it, and the other gets "that time was just taken", or its "slot is gone" check fails because another run's booking also removed a slot. Fixes, best first: give each test its own staff member or service (create them through the API in a fixture), or pick a different day per run (`testInfo.workerIndex` and `testInfo.repeatEachIndex` in the date). Don't fix it with `workers: 1`: the test would still break when the suite grows.
+
+**7.3** Common axe findings in a fresh Next.js app: `color-contrast` on grey helper text, `label` on an input with only a placeholder, `button-name` on an icon-only button (add `aria-label`), `landmark-one-main` (wrap the page content in `<main>`), and `region` (content outside landmarks). Fix them in the components, not with `disableRules`.
+
+**7.4**
+
+```typescript
+test('owner invites a teammate who signs up and accepts', async ({ browser, request }) => {
+  const ownerContext = await browser.newContext({ storageState: 'playwright/.auth/owner.json' });
+  const owner = await ownerContext.newPage();
+  const email = `invitee+${crypto.randomUUID()}@test.dev`;
+
+  await owner.goto('/dashboard/team');
+  await owner.getByRole('button', { name: 'Invite' }).click();
+  await owner.getByLabel('Email').fill(email);
+  await owner.getByLabel('Role').selectOption('staff');
+  await owner.getByRole('button', { name: 'Send invite' }).click();
+  await expect(owner.getByText(`Invitation sent to ${email}`)).toBeVisible();
+
+  const inviteeContext = await browser.newContext();             // no cookies: a different person
+  const invitee = await inviteeContext.newPage();
+  await invitee.goto(linkFrom((await latestEmailTo(request, email)).Text));
+  // ...sign up with the invited email, verify, accept
+  await expect(invitee.getByRole('heading', { name: 'E2E Salon' })).toBeVisible();
+
+  await owner.reload();
+  await expect(owner.getByRole('row', { name: new RegExp(email) })).toContainText('staff');
+
+  await Promise.all([ownerContext.close(), inviteeContext.close()]);
+});
+```
+
+With `--workers=4`, the usual clash is a test that checks "the team has 3 members" while another test is inviting someone. Check for **your** row, not the total count.
+
+## Lesson 8: CI, coverage, flaky tests
+
+**8.1** On a PR, the "checks" job fails and shows the failing test's name and diff in the log. With branch protection, the "Merge" button is greyed out until it's green. (Admins can bypass by default: turn on "Do not allow bypassing the above settings" if you want the rule to apply to you too.)
+
+**8.2** Yes, keeping `--randomize` in CI is a good idea for the integration suite, **because Jest prints the seed**: when a random order fails, you copy the seed from the log and reproduce it locally with `--seed`. The cost is that a failure might not show up on every run, so read the seed in every red run instead of re-running. Some teams randomize only on a nightly run for this reason; both are fine.
+
+**8.3** Red lines that matter: the reuse-detection branch in `refresh()`, the "not a member" branch in `MembershipGuard`, the `ALREADY_CANCELLED` branch, the error-mapping branch for the exclusion constraint. Red lines that don't: `main.ts`, module files, the `SystemClock` class, a `toString` in a DTO. Note that some "red" lines in the **unit** report are green in the **integration** report: check both before writing a test.
+
+**8.4** In the trace you see: the page loads, the 300 ms wait ends, the test reads the slot list while the availability request is still pending (it took 450 ms on that run), so it finds no button, and the click times out. On the retry, the request took 200 ms and the test passed, so the report says "flaky". The fix: delete the `waitForTimeout` and wait for the result instead, with `await expect(day.getByRole('button').first()).toBeVisible()` before reading it. Then remove the random delay from the app.
+
+## Practice project
+
+TODO 5 of the permissions matrix:
+
+```typescript
+const user = await f.member(salon.business.id, role);
+const api = client(t.server, { cookie: await loginAs(t.app, user.id), businessId: salon.business.id });
+const res = await api[row.method](row.path(salon)).send(row.body?.(salon) ?? {});
+
+if (row.allowed.includes(role)) {
+  expect(res.status).not.toBe(403);
+} else {
+  expect(res.status).toBe(403);
+  expect(res.get('Content-Type')).toMatch(/application\/problem\+json/);
+}
+```
+
+Why `not 403` instead of `200`: this test is only about **permission**. An allowed `DELETE` returns 204, an allowed `POST` with a missing field returns 422, and both are fine here. Other tests check the success responses. If the matrix also checked success, every change to a request body would break it, and people would stop trusting it.

@@ -1,0 +1,608 @@
+---
+title: "Solutions"
+description: "Answers and example code for the exercises in Lessons 1–8 and the practice project scaffolds. Try each exercise yourself first."
+---
+
+<Callout type="warn" title="Try first">
+Do each exercise on your own, send it to Claude for a scored review, and only then read the answer here. Your answer can be different and still correct: compare the **reasons**, not the exact code.
+</Callout>
+
+## Lesson 1
+
+### 1.1 What to cache
+
+| Endpoint | Cache? | Where | How long | Invalidation |
+| --- | --- | --- | --- | --- |
+| `GET /v1/public/businesses/:slug` | Yes | HTTP (`public, max-age=60`) + Redis | Redis 5 min, browser/CDN 60 s | Delete the key on business/service changes |
+| `GET /v1/staff/:id/availability` | Yes | Redis (+ short HTTP `max-age=15` if you like) | 60 s | Versioned keys, bumped on booking changes |
+| `GET /v1/bookings` | No | Nowhere (`private, no-store`) | 0 | Owners expect new bookings immediately; per user and tenant |
+| `GET /v1/me` | No | `private, no-store` | 0 | Role and session changes must apply now |
+| `GET /v1/services` (dashboard) | Usually no | `private, no-store` | 0 | Cheap query; the owner just edited it and expects to see the change |
+| `POST /v1/bookings` | Never | Writes aren't cached | – | – (but they **trigger** invalidation) |
+| Google JWKS | Yes | In memory (the OIDC library) | Hours, refreshed on an unknown key ID | The library handles key rotation |
+
+### 1.2 Cache headers
+
+```typescript
+// src/common/cache-headers.interceptor.ts
+export const PUBLIC_CACHE = 'publicCache';
+export const PublicCache = (value: string) => SetMetadata(PUBLIC_CACHE, value);
+
+@Injectable()
+export class CacheHeadersInterceptor implements NestInterceptor {
+  constructor(private readonly reflector: Reflector) {}
+
+  intercept(ctx: ExecutionContext, next: CallHandler) {
+    const value = this.reflector.getAllAndOverride<string>(PUBLIC_CACHE, [ctx.getHandler(), ctx.getClass()]);
+    ctx.switchToHttp().getResponse<Response>().setHeader('Cache-Control', value ?? 'private, no-store');
+    return next.handle();
+  }
+}
+
+// on the public route:
+@PublicCache('public, max-age=60, stale-while-revalidate=300')
+```
+
+Registered globally, every route gets `private, no-store` unless it opts in. Why `private` behind a CDN: a CDN caches by URL. Without `private`, the first owner's `GET /v1/bookings` response could be stored and served to the next person who requests the same URL, with their own cookie ignored. `private` tells shared caches never to store it.
+
+### 1.3 Measure first
+
+There's no single right number. What matters is what you write down: requests per second, p50, p99, and the plan. A good note looks like: "Index scan on `bookings_staff_starts_idx`, 0.4 ms in Postgres, but 18 ms p50 in the API (Prisma + JSON + network) and p99 90 ms with 20 connections. The query is already good; the cost is in doing it on every page view. Cache it." If you see a `Seq Scan` on `bookings`, fix the index first and measure again.
+
+### 1.4 `MemoryCache` tests
+
+```typescript
+// src/common/memory-cache.spec.ts
+describe('MemoryCache', () => {
+  let now = 0;
+  const cache = () => new MemoryCache<string>(2, () => now);
+
+  beforeEach(() => { now = 1_000; });
+
+  it('returns a value before it expires and nothing at the exact expiry', () => {
+    const c = cache();
+    c.set('a', 'A', 100);
+    now = 1_099;
+    expect(c.get('a')).toBe('A');
+    now = 1_100;                                   // expiresAt <= now → expired
+    expect(c.get('a')).toBeUndefined();
+  });
+
+  it('evicts the least recently used entry', () => {
+    const c = cache();
+    c.set('a', 'A', 1_000);
+    c.set('b', 'B', 1_000);
+    c.get('a');                                    // a is now the most recently used
+    c.set('c', 'C', 1_000);                        // over the limit of 2: b goes
+    expect(c.get('b')).toBeUndefined();
+    expect(c.get('a')).toBe('A');
+    expect(c.get('c')).toBe('C');
+  });
+
+  it('is a miss for a key never set', () => {
+    expect(cache().get('nope')).toBeUndefined();
+  });
+});
+```
+
+Two problems with 3 instances: (1) **invalidation only reaches one instance**: the owner changes a service, the request that handled it deletes its own copy, and the other two serve the old data until the TTL ends; (2) **three times the misses and memory**: each instance warms its own cache, so the database does the work three times, and the hit ratio is lower. (A third: users see different data depending on which instance answers.)
+
+## Lesson 2
+
+### 2.1 `redis-cli`
+
+- `TTL` counts down: 30, 29, ...
+- After `SET` again without `EX`, `TTL` returns **-1**: the overwrite removed the expiry. The key now lives forever.
+- `TTL` returns **-1** for a key without an expiry and **-2** for a key that doesn't exist.
+- `ZRANGEBYSCORE key 10 20 WITHSCORES` returns the members with scores between 10 and 20, in score order.
+
+### 2.2 Redis stops
+
+- `/health` reports Redis as down (the ping fails).
+- The logs show your `Redis error:` warnings while ioredis tries to reconnect, repeatedly, with growing delays.
+- Requests that don't use Redis work normally.
+- Requests that use the cache wait while ioredis retries the command (`maxRetriesPerRequest: 2`, so a short time), then fall back to the database thanks to `safeGet`.
+- When Redis starts again, ioredis reconnects by itself, and the warnings stop. No restart needed.
+
+### 2.3 Page views
+
+```typescript
+// src/public/page-views.ts
+@Injectable()
+export class PageViews {
+  constructor(@Inject(REDIS) private readonly redis: Redis, private readonly clock: Clock) {}
+
+  private static localDate(date: Date, timeZone: string): string {
+    return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);  // YYYY-MM-DD
+  }
+
+  private static key(businessId: string, day: string) {
+    return `views:biz:${businessId}:${day}`;
+  }
+
+  async record(businessId: string, timeZone: string) {
+    const key = PageViews.key(businessId, PageViews.localDate(this.clock.now(), timeZone));
+    await this.redis.multi().incr(key).expire(key, 48 * 3600).exec();   // atomic together
+  }
+
+  async lastDays(businessId: string, timeZone: string, days: number) {
+    const dates = Array.from({ length: days }, (_, i) =>
+      PageViews.localDate(new Date(this.clock.now().getTime() - i * 86_400_000), timeZone));
+    const values = await this.redis.mget(...dates.map((d) => PageViews.key(businessId, d)));
+    return dates.map((date, i) => ({ date, views: Number(values[i] ?? 0) }));
+  }
+}
+```
+
+Note the expiry: with 48 hours, only today and yesterday survive, so `days=7` returns zeros for older days. For 7 days, set the expiry to 8 days. For 12 months, keep Redis for "today", and add a nightly scheduled job (Lesson 7) that copies yesterday's counts into a Postgres table `page_views_daily (business_id, day, views)`. Why not a Postgres row per view: page views are many cheap writes; each `insert` costs a transaction, WAL and index updates, and a popular page would create millions of rows that you only ever sum. An `INCR` costs microseconds and gives you the sum directly.
+
+### 2.4 The lock danger
+
+```typescript
+// scripts/lock-demo.ts
+const redis = new Redis('redis://localhost:6379');
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const [a, b] = await Promise.all([
+  withLock(redis, 'lock:demo', 1_000, async () => { await sleep(200); return 'A ran'; }),
+  withLock(redis, 'lock:demo', 1_000, async () => { await sleep(200); return 'B ran'; }),
+]);
+console.log(a, b);                              // one of them is undefined: only one ran
+
+const first = withLock(redis, 'lock:demo', 100, async () => { await sleep(300); return 'slow'; });
+await sleep(150);                               // the 100 ms lock has expired, but "slow" is still running
+const second = await withLock(redis, 'lock:demo', 100, async () => 'second also ran');
+console.log(second, await first);               // both ran at the same time
+await redis.quit();
+```
+
+Why not for double bookings: a Redis lock can expire while the first request is still inside its transaction (a slow query, a pause), and then two bookings for the same slot can both commit. The exclusion constraint is checked by Postgres **at commit**, inside the same transaction as the insert, so no timing can get around it. Redis locks are for "avoid duplicate work"; constraints are for "this must never happen".
+
+## Lesson 3
+
+### 3.1 A cached `null`
+
+`safeGet` returns Redis's `null` only when the key doesn't exist. A cached `null` is the **string** `"null"`, which isn't `null`, so `cached !== null` is true, and `JSON.parse('null')` returns `null`: a hit. The one-line change that breaks it:
+
+```typescript
+const value = cached === null ? null : JSON.parse(cached);
+if (value !== null) return value;                // now a cached null (or a real null) counts as a miss
+```
+
+### 3.2 Negative caching and write paths
+
+Let the TTL depend on the value:
+
+```typescript
+async getOrSet<T>(key: string, ttl: number | ((value: T) => number), load: () => Promise<T>): Promise<T> {
+  // ... same as before, then:
+  const seconds = typeof ttl === 'function' ? ttl(value) : ttl;
+  await this.safeSet(key, JSON.stringify(value), withJitter(seconds));
+}
+
+// in PublicProfileService
+const profile = await this.cache.getOrSet(key, (p) => (p === null ? 30 : 300), () => this.load(slug));
+if (!profile) throw new NotFoundException();
+```
+
+Write paths that must invalidate the profile: service create, service update (name, price, duration), service delete or soft delete, service restore, business update (name, time zone, anything public), slug change (**old** and new slug), business deletion, and anything that changes what's shown (staff names, if the profile shows them). If you have a "import services" feature or a seed script, those too. This list is exactly why event-driven invalidation (Lesson 6) is attractive.
+
+### 3.3 Versioning per staff and date
+
+With 200 staff, a version per business invalidates everyone's availability on every booking, so the hit ratio drops. Use a version per staff member and **local date**: `avail:{businessId}:{staffId}:{date}`. The new problems:
+
+- You must compute the booking's date **in the business's time zone** (a booking at 23:30 UTC is the next day in Dhaka).
+- A booking can cover two dates (late evening across midnight): bump both.
+- A **reschedule** must bump the **old** date and the **new** date, and the old staff member if the staff changed.
+- More keys to read (one version lookup per request is still one `GET`).
+- Changes to working hours or a staff member's services must bump all their dates (or keep a coarse business version as well, and put both in the key).
+
+For your platform, the per-business version is the right first choice. Say this trade-off in an interview: "coarse invalidation is simple and correct; finer invalidation raises the hit ratio but has more ways to be wrong."
+
+### 3.4 Stampede numbers
+
+Typical results: without single-flight, the loader runs close to **200** times (every request misses before the first one writes the key; a few late ones might hit). With single-flight, **1**. With two instances, **2** (one per process). A Redis lock (`SET lock:{key} NX PX 5000`, the winner loads, others wait 50 ms and re-read the cache a few times) brings it to 1 across all instances. Stale-while-revalidate avoids the waiting entirely: as long as an old value exists, everyone gets it immediately, and one request (holding the lock) refreshes it.
+
+## Lesson 4
+
+### 4.1 Shared limits
+
+With in-memory storage, alternating requests means each instance sees only 3 of the 6, so **all 6** reach the password check (the limit of 5 is never reached on either instance). With Redis storage, both instances count in the same key: the 6th request gets **429**. With 3 instances and in-memory storage, an attacker gets 15 attempts per minute instead of 5.
+
+### 4.2 Fixed vs sliding
+
+With a limit of 10 per 10 seconds, 10 requests just before the boundary and 10 just after:
+
+- **Fixed window:** all **20** allowed. The first 10 count in window N, the next 10 in window N+1, which started fresh.
+- **Sliding log:** **10** allowed. At the second burst, the first 10 are still inside the last 10 seconds.
+
+```text
+time:     ... 9.9s | 10.0s ...
+fixed:    [ window N: 10 ✓ ][ window N+1: 10 ✓ ]   → 20 in 0.2 s
+sliding:  [------ last 10 s: 10 already ------]    → 0 more allowed until 19.9 s
+```
+
+### 4.3 Per-plan limits
+
+Don't query the database per request. The public booking route already loads the business through the **cached public profile** (Lesson 3). Add `plan` to the cached data (it's not secret) and pick the limit from it: `const limit = profile.plan === 'pro' ? 500 : 50`. When the plan changes (a Stripe webhook in Month 3), invalidate the profile like any other business update. Put the plan in the rate-limit key too (`ratelimit:public-booking:{plan}:{businessId}`), so an upgrade starts a fresh counter.
+
+### 4.4 Fail open or closed
+
+| Route | Choice | Why |
+| --- | --- | --- |
+| Global limit (all routes) | Open | An outage of the limiter shouldn't take the product down |
+| Login, forgot password, resend verification | Closed (503) | Brute force and email bombing during the outage |
+| Public booking creation | Open, with the per-IP limit at the edge (CDN) | Bookings are the product; spam is annoying, not dangerous |
+| Anything that sends SMS or costs money | Closed | Each request costs you |
+
+```typescript
+// src/common/resilient-throttler.guard.ts
+export const FAIL_CLOSED = 'throttleFailClosed';
+export const FailClosed = () => SetMetadata(FAIL_CLOSED, true);
+
+@Injectable()
+export class ResilientThrottlerGuard extends ThrottlerGuard {
+  private readonly log = new Logger(ResilientThrottlerGuard.name);
+
+  protected async handleRequest(props: ThrottlerRequest): Promise<boolean> {
+    try {
+      return await super.handleRequest(props);
+    } catch (err) {
+      if (err instanceof ThrottlerException) throw err;           // a real "too many requests"
+      this.log.warn(`rate limiter unavailable: ${(err as Error).message}`);
+      const failClosed = this.reflector.getAllAndOverride<boolean>(FAIL_CLOSED, [
+        props.context.getHandler(), props.context.getClass(),
+      ]);
+      if (failClosed) throw new ServiceUnavailableException();
+      return true;
+    }
+  }
+}
+```
+
+Before your change: the storage call throws when Redis is unreachable, and the guard doesn't catch it, so the request fails with **500**. That's "fail closed" by accident, for **every** route, with the wrong status code. Check it yourself: library behaviour can change between versions.
+
+## Lesson 5
+
+### 5.1 Jobs wait in Redis
+
+With the worker stopped, `SCAN 0 MATCH bull:emails:* COUNT 100` shows keys like `bull:emails:wait` (a list of waiting job IDs), `bull:emails:1` ... `bull:emails:5` (a hash per job), `bull:emails:id` (the ID counter), `bull:emails:meta` and `bull:emails:events` (a stream). After the worker starts, the jobs move to `bull:emails:completed` (a sorted set), and the emails appear in Mailpit.
+
+### 5.2 Exhaustive `switch`
+
+Without the case, TypeScript reports an error **on the `never` line**: something like `Type '{ name: "password-changed"; data: {...} }' is not assignable to type 'never'.` That's the point: adding a job type forces you to handle it. The wrong data gives `Object literal may only specify known properties, and 'bookingId' does not exist in type '{ to: string }'` (or a "missing property `to`" error), at the `add` call.
+
+### 5.3 Backoff and unrecoverable errors
+
+With `{ type: 'exponential', delay: 5_000 }`, the gaps are about **5, 10, 20, 40 seconds** (`delay × 2^(attempt-1)`), plus a little time for each attempt. Starting Mailpit before the 5th attempt makes it succeed.
+
+```typescript
+case 'test':
+  if (!email.data.to.includes('@')) throw new UnrecoverableError(`invalid address: ${email.data.to}`);
+  return this.mailer.send(email.data.to, { subject: 'Test', text: 'It works.', html: '<p>It works.</p>' });
+```
+
+The job goes to `failed` after **one** attempt.
+
+### 5.4 At-least-once, for real
+
+You get **two** emails. The job sent the email, then was killed during the wait, so it never completed. Its lock in Redis expired (30 s), the restarted worker's stalled-job check found it, moved it back to waiting, and ran it again from the start, sending a second email.
+
+Idempotency with a log table:
+
+```sql
+create table email_log (
+  dedupe_key text primary key,
+  status     text not null,                 -- 'sending' | 'sent'
+  created_at timestamptz not null default now()
+);
+```
+
+```typescript
+async sendOnce(dedupeKey: string, send: () => Promise<void>) {
+  const claimed = await this.prisma.$executeRaw`
+    insert into email_log (dedupe_key, status) values (${dedupeKey}, 'sending')
+    on conflict (dedupe_key) do nothing`;
+  if (claimed === 0) {
+    const row = await this.prisma.$queryRaw<{ status: string }[]>`select status from email_log where dedupe_key = ${dedupeKey}`;
+    if (row[0]?.status === 'sent') return;           // done before: skip
+    // status 'sending': a previous attempt crashed somewhere between claim and 'sent'. Did the email go out? We can't know.
+  }
+  await send();
+  await this.prisma.$executeRaw`update email_log set status = 'sent' where dedupe_key = ${dedupeKey}`;
+}
+```
+
+The case that still duplicates: the crash happens **after** `send()` returns and **before** the `update`. The row says `sending`, and you must choose: send again (maybe a duplicate) or skip (maybe a lost email). For a test email or a confirmation, sending again is the better failure. The window is now milliseconds instead of 20 seconds.
+
+## Lesson 6
+
+### 6.1 Callers unchanged
+
+The tests still pass because they replace `AuthEmails` with a fake (`overrideProvider(AuthEmails)`), and the method names didn't change: the fake never touches the queue. One catch: `AppModule` now imports `QueuesModule`, which connects to Redis. The tests pass if Redis is running locally, and produce connection errors (or hang on close) if it isn't, until Lesson 8 adds a Redis container. A hidden dependency worth noticing.
+
+### 6.2 Each event published once
+
+The check: after the 50 bookings, `select count(*) from outbox where published_at is null` is 0; the events processor logs `eventId` for each job; there are exactly 50 distinct IDs and no ID appears twice. In Redis, the `events` queue has 50 jobs (`evt-1` ... `evt-50`, or whatever your IDs are). When you kill one worker mid-batch, its open transaction rolls back (the connection dies), the rows unlock, and the other worker publishes them. If the kill happened after `addBulk`, the second publish is ignored because the job IDs already exist.
+
+### 6.3 Time zone and order
+
+`2027-01-15T04:00:00Z` in `Asia/Dhaka` (UTC+6) is **Friday 15 January 2027, 10:00**. If the email says 04:00, you formatted in UTC.
+
+Create and cancel with the worker stopped: the outbox has `booking.created` and `booking.cancelled`. When the worker starts, the confirmation job loads the booking, sees `cancelled`, and sends nothing. The cancellation job sends "your booking was cancelled". Is that right? The customer never got a confirmation, so a cancellation email might confuse them. A reasonable product rule: send the cancellation email only if `confirmation_sent_at` is set. Either choice is fine if it's deliberate.
+
+### 6.4 The failure drill
+
+With Redis stopped, all 5 bookings return **201**: the API only writes to Postgres. The relay fails each second (its transaction rolls back), and when Redis comes back, it publishes all 5 events and the confirmations arrive. With "save, then add a job", the 5 `add` calls would have thrown: either the API returns 500 after the booking was saved (the customer sees an error for a booking that exists, and a retry gets 409 `slot-taken` for their own booking), or you catch the error and the emails are simply never sent.
+
+The second drill: the email was sent, the worker was killed before `confirmationSentAt` was saved, and after restart (the stalled check), the job ran again: `confirmationSentAt` was still null, so a **second** confirmation was sent. That's the documented duplicate window. A provider idempotency key (`confirm-{bookingId}`) would close it.
+
+## Lesson 7
+
+### 7.1 The test table
+
+```typescript
+// src/reminders/reminder-rules.spec.ts
+const H = 3600_000;
+const now = new Date('2027-01-14T10:00:00Z');
+const at = (msFromNow: number) => new Date(now.getTime() + msFromNow);
+const booking = (o: Partial<Parameters<typeof reminderDecision>[0]> = {}) => ({
+  status: 'confirmed' as const,
+  startsAt: at(20 * H),
+  createdAt: at(-7 * 24 * H),
+  reminderSentAt: null,
+  ...o,
+});
+
+it.each([
+  ['confirmed and due (20 h before)', booking(), 'send'],
+  ['too early (30 h before)', booking({ startsAt: at(30 * H) }), 'wait'],
+  ['exactly 24 h before', booking({ startsAt: at(24 * H) }), 'send'],
+  ['just over 24 h before', booking({ startsAt: at(24 * H + 1) }), 'wait'],
+  ['exactly 2 h before', booking({ startsAt: at(2 * H) }), 'send'],
+  ['too late (1 h before)', booking({ startsAt: at(1 * H) }), 'skip'],
+  ['in the past', booking({ startsAt: at(-1 * H) }), 'skip'],
+  ['cancelled', booking({ status: 'cancelled' }), 'skip'],
+  ['already sent', booking({ reminderSentAt: at(-1 * H) }), 'skip'],
+  ['booked 10 h ahead', booking({ startsAt: at(5 * H), createdAt: at(-5 * H) }), 'skip'],
+] as const)('%s → %s', (_name, b, expected) => {
+  expect(reminderDecision(b, now)).toBe(expected);
+});
+```
+
+The boundaries: "exactly 24 hours" sends (`>` for wait), "exactly 2 hours" sends (`<` for too late). The other choice is also fine; what matters is that a test says which one you chose.
+
+### 7.2 The reschedule
+
+```typescript
+// in the reschedule transaction (PostgreSQL Lesson 8's optimistic locking update)
+data: { startsAt, endsAt, version: { increment: 1 }, reminderSentAt: null },
+```
+
+Yes, the new reminder goes out: the sweeper finds the booking again (`reminder_sent_at is null`, and the new time is in the window), and the job ID contains the new start time, so BullMQ doesn't treat it as the old, completed job. The worker's stale check (`startsAt` matches) also makes any leftover old job do nothing.
+
+### 7.3 Delayed jobs vs the sweeper
+
+After `FLUSHALL`: the delayed-job version loses **every** future reminder (nothing recreates them). The sweeper loses nothing: the next sweep finds every due booking in Postgres. After changing the rule to 48 hours: delayed jobs already in Redis still fire at 24 hours (only new bookings get 48); the sweeper applies 48 hours to **all** bookings as soon as you deploy (also the ones between 24 and 48 hours away, which immediately become due: decide whether that's OK).
+
+### 7.4 The daily summary
+
+```typescript
+// src/summaries/summary-sweeper.processor.ts
+async process() {
+  const now = this.clock.now();
+  const due = await this.prisma.$queryRaw<{ id: string; local_date: Date }[]>`
+    select id, (${now}::timestamptz at time zone time_zone)::date as local_date
+    from businesses
+    where extract(hour from ${now}::timestamptz at time zone time_zone) between 7 and 11
+      and (last_summary_on is null or last_summary_on < (${now}::timestamptz at time zone time_zone)::date)`;
+
+  await this.summaries.addBulk(due.map((b) => {
+    const day = b.local_date.toISOString().slice(0, 10);      // a date column comes back as midnight UTC
+    return { name: 'send', data: { businessId: b.id, day }, opts: { jobId: `summary-${b.id}-${day}` } };
+  }));
+}
+```
+
+The test answers:
+
+- **Dhaka at `2027-01-15T01:00:00Z`:** 07:00 local (UTC+6) → due.
+- **New York at `2027-03-14T11:00:00Z`:** the clocks moved forward at 02:00 local that morning, so New York is UTC−4: 07:00 local → due.
+- **New York at `2027-03-13T11:00:00Z`:** still winter time, UTC−5: 06:00 local → not due (it becomes due at 12:00 UTC).
+- **Kolkata (UTC+5:30):** due from `01:30Z` (07:00 local); at `01:15Z` it's 06:45 → not due. A scheduler at exactly :00 UTC would only see 06:30 and 07:30.
+- **Worker down from 06:00 to 08:30 local:** the first run after restart sees 08:30, inside the 7–11 window, and `last_summary_on` is yesterday → sent at 08:30. Late, but not lost.
+
+## Lesson 8
+
+### 8.1 Bull Board
+
+For the failed job, the dashboard shows its name, data, number of attempts, the error message and the stack trace, and timestamps of when it was added, processed and failed. "Retry" moves it back to waiting with its attempts reset; after Mailpit is running, it completes. Note what this means for security: anyone with dashboard access can read job data and retry or delete any job.
+
+### 8.2 Backoff tests
+
+```typescript
+// src/queues/backoff.spec.ts
+describe('webhookBackoff', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('waits between 15 and 30 seconds after the first failure', () => {
+    jest.spyOn(Math, 'random').mockReturnValue(0);
+    expect(webhookBackoff(1)).toBe(15_000);
+    jest.spyOn(Math, 'random').mockReturnValue(0.999999);
+    expect(webhookBackoff(1)).toBeLessThanOrEqual(30_000);
+  });
+
+  it('never waits more than 6 hours', () => {
+    jest.spyOn(Math, 'random').mockReturnValue(0.999999);
+    for (let attempt = 1; attempt <= 30; attempt++) {
+      expect(webhookBackoff(attempt)).toBeLessThanOrEqual(6 * 3600_000);
+    }
+  });
+});
+```
+
+### 8.3 The test setup
+
+The code is in the lesson. Things that usually go wrong: forgetting `/` plus the database number in the URL (all workers share database 0 and flush each other's data); not closing the worker module (Jest prints "open handles" and doesn't exit); the end-to-end test timing out because `eventually` uses its default 2 seconds while the relay runs once per second and the email job retries; and the "Redis down" test leaking into others (put it in its own file, with its own env).
+
+### 8.4 Shutdown
+
+- **60 s grace:** `SIGTERM` → Nest shutdown hooks → `worker.close()` stops taking new jobs and waits for the active job → the job finishes → the process exits. The job is `completed`, no duplicate.
+- **5 s grace:** `SIGTERM` → `worker.close()` starts waiting → after 5 seconds Docker sends `SIGKILL` → the process dies with the job still `active` and its lock in Redis. Nobody renews the lock, so after up to 30 seconds it expires; the stalled-job check (in the restarted worker) moves the job back to waiting, and it runs **again from the start**. If it had already sent its email, that's a duplicate. Lesson: the grace period must be longer than your longest normal job, and jobs must be idempotent anyway.
+
+## Practice project
+
+### Part 1: the reminders processor
+
+```typescript
+async process(job: Job<{ businessId: string; bookingId: string; startsAt: string }>): Promise<'sent' | 'skipped'> {
+  const { businessId, bookingId, startsAt } = job.data;
+
+  const booking = await this.prisma.booking.findFirst({
+    where: { id: bookingId, businessId },
+    include: { customer: true, service: true, staff: true, business: true },
+  });
+  if (!booking) throw new UnrecoverableError(`booking ${bookingId} not found`);
+  if (booking.startsAt.toISOString() !== startsAt) return 'skipped';
+  if (reminderDecision(booking, this.clock.now()) !== 'send') return 'skipped';
+
+  await this.bookingEmails.sendReminder(booking);
+
+  const { count } = await this.prisma.booking.updateMany({
+    where: { id: booking.id, businessId, reminderSentAt: null },
+    data: { reminderSentAt: this.clock.now() },
+  });
+  // count === 0: another worker sent and recorded it at the same moment (or the booking changed).
+  // The email went out twice: log it as a warning, so you'd notice if it ever happens often.
+  if (count === 0) this.logger.warn(`reminder for ${booking.id} was recorded by someone else`);
+  return 'sent';
+}
+
+@OnWorkerEvent('failed')
+async onFailed(job: Job | undefined, err: Error) {
+  if (job && this.deadLetters.isFinal(job, err)) {
+    await this.deadLetters.record(REMINDERS, job, err, { keepData: true });
+  }
+}
+```
+
+### Part 2: the fan-out
+
+```typescript
+// in EventsProcessor, for booking.* topics
+const endpoints = await this.prisma.webhookEndpoint.findMany({
+  where: { businessId, enabled: true, events: { has: event.topic } },
+  select: { id: true },
+});
+if (endpoints.length === 0) return;
+
+const body = JSON.stringify({
+  id: event.eventId,
+  type: event.topic,
+  createdAt: this.clock.now().toISOString(),
+  data: await this.webhookPayloads.booking(businessId, bookingId),   // only fields the business may see
+});
+
+await this.prisma.webhookDelivery.createMany({
+  data: endpoints.map((e) => ({ businessId, endpointId: e.id, eventId: event.eventId, topic: event.topic, body })),
+  skipDuplicates: true,                                                // the event processed twice → no second delivery
+});
+const deliveries = await this.prisma.webhookDelivery.findMany({
+  where: { eventId: event.eventId, endpointId: { in: endpoints.map((e) => e.id) }, status: 'pending' },
+  select: { id: true },
+});
+await this.webhooks.addBulk(deliveries.map((d) => ({
+  name: 'deliver',
+  data: { businessId, deliveryId: d.id },
+  opts: { jobId: `delivery-${d.id}`, attempts: 12, backoff: { type: 'custom' } },
+})));
+```
+
+### Part 2: the delivery processor
+
+```typescript
+async process(job: Job<{ businessId: string; deliveryId: string }>): Promise<void> {
+  const { businessId, deliveryId } = job.data;
+  const delivery = await this.prisma.webhookDelivery.findFirst({
+    where: { id: deliveryId, businessId },
+    include: { endpoint: true },
+  });
+  if (!delivery || delivery.status === 'delivered') return;
+
+  if (!delivery.endpoint.enabled) {
+    await this.prisma.webhookDelivery.update({ where: { id: delivery.id }, data: { status: 'dead', lastError: 'endpoint disabled' } });
+    return;
+  }
+
+  const secret = this.secrets.decrypt(delivery.endpoint.secretEncrypted);
+  const signature = signWebhook(secret, delivery.body);              // a new timestamp each attempt
+
+  let status: number | undefined;
+  let error: string | undefined;
+  try {
+    const res = await this.http.post(delivery.endpoint.url, {        // checks the IP, pins it, no redirects
+      body: delivery.body,
+      timeoutMs: 10_000,
+      headers: {
+        'content-type': 'application/json',
+        'user-agent': 'BookingPlatform-Webhooks/1.0',
+        'booking-event-id': delivery.eventId,
+        'booking-event-type': delivery.topic,
+        'booking-signature': signature,
+      },
+    });
+    status = res.status;
+    if (status < 200 || status >= 300) error = `HTTP ${status}: ${await res.textLimited(2_000)}`;
+  } catch (err) {
+    if (err instanceof UnsafeUrlError) throw new UnrecoverableError(err.message);   // private IP, bad URL
+    error = (err as Error).name === 'TimeoutError' ? 'timeout after 10 s' : (err as Error).message;
+  }
+
+  await this.prisma.webhookDelivery.update({
+    where: { id: delivery.id },
+    data: {
+      attempts: { increment: 1 },
+      lastStatusCode: status ?? null,
+      lastError: error ?? null,
+      ...(error ? {} : { status: 'delivered', deliveredAt: new Date() }),
+    },
+  });
+
+  if (!error) {
+    await this.prisma.webhookEndpoint.update({ where: { id: delivery.endpointId }, data: { failingSince: null } });
+    return;
+  }
+  if (status === 410) {
+    await this.prisma.webhookEndpoint.update({
+      where: { id: delivery.endpointId },
+      data: { enabled: false, disabledReason: 'gone' },
+    });
+    throw new UnrecoverableError('receiver returned 410 Gone: endpoint disabled');
+  }
+  await this.prisma.webhookEndpoint.updateMany({
+    where: { id: delivery.endpointId, failingSince: null },
+    data: { failingSince: new Date() },
+  });
+  throw new Error(error);                                            // retry with webhookBackoff
+}
+
+@OnWorkerEvent('failed')
+async onFailed(job: Job<{ businessId: string; deliveryId: string }> | undefined, err: Error) {
+  if (!job || !this.deadLetters.isFinal(job, err)) return;
+  const delivery = await this.prisma.webhookDelivery.update({
+    where: { id: job.data.deliveryId },
+    data: { status: 'dead' },
+    include: { endpoint: true },
+  });
+  const since = delivery.endpoint.failingSince;
+  if (delivery.endpoint.enabled && since && Date.now() - since.getTime() > 3 * 24 * 3600_000) {
+    await this.prisma.webhookEndpoint.update({
+      where: { id: delivery.endpointId },
+      data: { enabled: false, disabledReason: 'failing for 3 days' },
+    });
+    await this.emails.add('webhook-disabled', { businessId: delivery.businessId, endpointId: delivery.endpointId });
+  }
+}
+```
+
+The `SafeHttp` wrapper (`post`, `textLimited`, `UnsafeUrlError`) is yours to write: it runs `assertPublicHttpsUrl`, connects through an undici `Agent` whose `lookup` runs the same private-IP check, uses `redirect: 'manual'` and `AbortSignal.timeout`, and reads at most N bytes of the response.

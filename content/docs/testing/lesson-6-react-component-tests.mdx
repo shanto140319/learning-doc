@@ -1,0 +1,348 @@
+---
+title: "Lesson 6: React component tests (Vitest, Testing Library, MSW)"
+description: "What to test in a Next.js frontend, Vitest setup with jsdom, React Testing Library's guiding principle and query priority, user-event, testing a booking form's success, loading, conflict, validation and network-error states with MSW, accessible queries, what not to test (async Server Components, styles), and common mistakes."
+---
+
+You've written React for five years, so this lesson is about **testing it well**. Frontend interviews ask about it often ("How do you test a React component?", "What do you mock?"), and Project 1's booking form has real logic: loading states, a slot that was just taken, field errors from the API.
+
+## What to test in the frontend
+
+| Test with components (this lesson) | Test with Playwright (Lesson 7) | Don't test |
+| --- | --- | --- |
+| Forms: validation messages, disabled buttons, error states | Whole pages and flows across pages | Styles, colours, exact layout |
+| Components with logic: a slot picker, a timezone label, a calendar | **Async Server Components** (Vitest can't render them) | That React re-renders, that `useState` works |
+| Custom hooks with logic | Routing, middleware/`proxy.ts`, cookies, redirects | Third-party components (a date picker library) |
+| Pure helpers: formatting money and dates | Anything that needs the real API | Snapshots of whole components |
+
+## The guiding principle
+
+> "The more your tests resemble the way your software is used, the more confidence they can give you." (Kent C. Dodds, the author of Testing Library)
+
+A user doesn't know your component has a `status` state or a `handleSubmit` function. They see a label "Email", type into it, click "Book" and read "Booking confirmed". Your test does the same. Then you can refactor the component (split it, change state to `useReducer`, switch to a form library) and the tests still pass if the user sees the same thing.
+
+## Setup (Next.js + Vitest)
+
+```typescript
+// vitest.config.mts (in the Next.js project root)
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+import tsconfigPaths from 'vite-tsconfig-paths';
+
+export default defineConfig({
+  plugins: [tsconfigPaths(), react()],
+  test: {
+    environment: 'jsdom',                 // a fake browser DOM in Node
+    setupFiles: ['./vitest.setup.ts'],
+    restoreMocks: true,
+    include: ['**/*.test.{ts,tsx}'],
+    exclude: ['node_modules', 'e2e/**'],  // Playwright tests live in e2e/ (Lesson 7)
+  },
+});
+```
+
+```typescript
+// vitest.setup.ts
+import '@testing-library/jest-dom/vitest';           // matchers like toBeDisabled(), toHaveAccessibleDescription()
+import { afterAll, afterEach, beforeAll } from 'vitest';
+import { cleanup } from '@testing-library/react';
+import { mswServer } from './test/msw/server';
+
+beforeAll(() => mswServer.listen({ onUnhandledRequest: 'error' }));   // no Supertest here, so 'error' is right
+afterEach(() => {
+  cleanup();                       // unmount what the test rendered
+  mswServer.resetHandlers();
+});
+afterAll(() => mswServer.close());
+```
+
+```json
+"scripts": {
+  "test": "vitest run",
+  "test:watch": "vitest"
+}
+```
+
+`.test.tsx` for Vitest and `.spec.ts` for Playwright (Lesson 7) keeps the two tools from picking up each other's files.
+
+## The component
+
+A client component from the booking page. It uses the `api()` helper from [Auth Lesson 3](/docs/auth-security/lesson-3-refresh-tokens), which refreshes the session once on a 401:
+
+```tsx
+// app/b/[slug]/booking-form.tsx
+'use client';
+
+import { useState, type FormEvent } from 'react';
+import { api } from '@/lib/api';
+
+type Slot = { iso: string; label: string };
+type Props = { businessId: string; serviceId: string; staffId: string; slots: Slot[] };
+
+export function BookingForm({ businessId, serviceId, staffId, slots }: Props) {
+  const [sending, setSending] = useState(false);
+  const [done, setDone] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+
+  async function onSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (sending) return;                                  // no double submit
+    const form = new FormData(event.currentTarget);
+    setSending(true);
+    setError(null);
+    setFieldErrors({});
+
+    try {
+      const res = await api('/v1/bookings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Business-Id': businessId, 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({
+          serviceId,
+          staffId,
+          customerName: form.get('name'),
+          customerEmail: form.get('email'),
+          startsAt: form.get('slot'),
+        }),
+      });
+      if (res.ok) return setDone(true);
+
+      const problem = await res.json().catch(() => null);
+      if (problem?.type === 'slot-taken') {
+        setError('Sorry, that time was just taken. Please pick another one.');
+      } else if (problem?.type === 'validation-failed') {
+        setFieldErrors(Object.fromEntries(problem.errors.map((e: { field: string; message: string }) => [e.field, e.message])));
+      } else {
+        setError('Something went wrong. Please try again.');
+      }
+    } catch {
+      setError('Could not reach the server. Check your connection and try again.');
+    } finally {
+      setSending(false);
+    }
+  }
+
+  if (done) return <p role="status">Booking confirmed. Check your email for the details.</p>;
+
+  return (
+    <form onSubmit={onSubmit} aria-label="Book an appointment">
+      <label>
+        Name <input name="name" required autoComplete="name" />
+      </label>
+
+      <label>
+        Email
+        <input
+          name="email"
+          type="email"
+          required
+          autoComplete="email"
+          aria-invalid={fieldErrors.customerEmail ? true : undefined}
+          aria-describedby={fieldErrors.customerEmail ? 'email-error' : undefined}
+        />
+      </label>
+      {fieldErrors.customerEmail && <p id="email-error">{fieldErrors.customerEmail}</p>}
+
+      <label>
+        Time
+        <select name="slot" required>
+          {slots.map((s) => <option key={s.iso} value={s.iso}>{s.label}</option>)}
+        </select>
+      </label>
+
+      {error && <p role="alert">{error}</p>}
+
+      <button type="submit" disabled={sending}>{sending ? 'Booking…' : 'Book'}</button>
+    </form>
+  );
+}
+```
+
+<Callout title="Relative URLs in tests">
+In the browser, `fetch('/v1/bookings')` works. In Node (Vitest), `fetch` doesn't know which site it's on and throws `Failed to parse URL`. Make your `api()` helper build a full URL: `fetch(new URL(path, window.location.origin), ...)`. That works in both: jsdom's `window.location` is `http://localhost:3000/`.
+</Callout>
+
+## The tests
+
+```tsx
+// app/b/[slug]/booking-form.test.tsx
+import { describe, expect, it } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { http, HttpResponse, delay } from 'msw';
+import { mswServer } from '@/test/msw/server';
+import { BookingForm } from './booking-form';
+
+const slots = [
+  { iso: '2099-01-01T04:00:00.000Z', label: '10:00' },
+  { iso: '2099-01-01T04:30:00.000Z', label: '10:30' },
+];
+
+function renderForm() {
+  const user = userEvent.setup();
+  render(<BookingForm businessId="biz-1" serviceId="svc-1" staffId="staff-1" slots={slots} />);
+  return { user };
+}
+
+async function fillAndSubmit(user: ReturnType<typeof userEvent.setup>) {
+  await user.type(screen.getByLabelText('Name'), 'Rahim');
+  await user.type(screen.getByLabelText('Email'), 'rahim@test.dev');
+  await user.selectOptions(screen.getByLabelText('Time'), '10:30');
+  await user.click(screen.getByRole('button', { name: 'Book' }));
+}
+
+describe('BookingForm', () => {
+  it('sends the booking and shows a confirmation', async () => {
+    let sent: unknown;
+    let headers: Headers | undefined;
+    mswServer.use(
+      http.post('/v1/bookings', async ({ request }) => {
+        sent = await request.json();
+        headers = request.headers;
+        return HttpResponse.json({ id: 'b1' }, { status: 201 });
+      }),
+    );
+    const { user } = renderForm();
+
+    await fillAndSubmit(user);
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Booking confirmed');
+    expect(sent).toEqual({
+      serviceId: 'svc-1',
+      staffId: 'staff-1',
+      customerName: 'Rahim',
+      customerEmail: 'rahim@test.dev',
+      startsAt: '2099-01-01T04:30:00.000Z',
+    });
+    expect(headers?.get('x-business-id')).toBe('biz-1');
+    expect(headers?.get('idempotency-key')).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it('disables the button while sending, so the user cannot book twice', async () => {
+    let calls = 0;
+    mswServer.use(
+      http.post('/v1/bookings', async () => {
+        calls++;
+        await delay(50);
+        return HttpResponse.json({ id: 'b1' }, { status: 201 });
+      }),
+    );
+    const { user } = renderForm();
+
+    await fillAndSubmit(user);
+
+    const button = screen.getByRole('button', { name: 'Booking…' });
+    expect(button).toBeDisabled();
+    await user.click(button);                          // a second click does nothing
+    await screen.findByRole('status');
+    expect(calls).toBe(1);
+  });
+
+  it('explains when the slot was just taken (409)', async () => {
+    mswServer.use(
+      http.post('/v1/bookings', () =>
+        HttpResponse.json({ type: 'slot-taken', title: 'This time slot is already booked', status: 409 }, { status: 409 }),
+      ),
+    );
+    const { user } = renderForm();
+
+    await fillAndSubmit(user);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('that time was just taken');
+    expect(screen.getByRole('button', { name: 'Book' })).toBeEnabled();     // they can try again
+  });
+
+  it('shows the API’s field error next to the email field (422)', async () => {
+    mswServer.use(
+      http.post('/v1/bookings', () =>
+        HttpResponse.json(
+          { type: 'validation-failed', status: 422, errors: [{ field: 'customerEmail', message: 'This email address cannot receive mail' }] },
+          { status: 422 },
+        ),
+      ),
+    );
+    const { user } = renderForm();
+
+    await fillAndSubmit(user);
+
+    const email = screen.getByLabelText('Email');
+    expect(await screen.findByText('This email address cannot receive mail')).toBeInTheDocument();
+    expect(email).toHaveAttribute('aria-invalid', 'true');
+    expect(email).toHaveAccessibleDescription('This email address cannot receive mail');
+  });
+
+  it('shows a connection message when the network fails', async () => {
+    mswServer.use(http.post('/v1/bookings', () => HttpResponse.error()));
+    const { user } = renderForm();
+
+    await fillAndSubmit(user);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not reach the server');
+  });
+});
+```
+
+The 422 test checks `toHaveAccessibleDescription`: a screen reader will read the error when the user is on the field. That's an accessibility bug you'd never see by looking at the page, and the test catches it.
+
+## Queries: which one to use
+
+Testing Library's order of preference, from best to last resort:
+
+| Query | Example | Why |
+| --- | --- | --- |
+| `getByRole` | `getByRole('button', { name: 'Book' })` | How screen readers see the page. If this fails, your HTML probably isn't accessible |
+| `getByLabelText` | `getByLabelText('Email')` | How users find form fields |
+| `getByPlaceholderText`, `getByText`, `getByDisplayValue` | `getByText('Booking confirmed')` | Visible text |
+| `getByAltText`, `getByTitle` | Images | |
+| `getByTestId` | `getByTestId('slot-grid')` | **Last resort**: users can't see `data-testid` |
+
+And the three prefixes:
+
+| Prefix | When nothing matches | Use for |
+| --- | --- | --- |
+| `getBy...` | Throws | Things that are there **now** |
+| `findBy...` | Waits (up to 1 s), then throws | Things that **appear** after an async step (`await screen.findByRole('status')`) |
+| `queryBy...` | Returns `null` | Checking something is **not** there: `expect(screen.queryByRole('alert')).not.toBeInTheDocument()` |
+
+Use `screen.` (not the values returned by `render`). It reads better and always looks at the whole document.
+
+## `user-event`, not `fireEvent`
+
+`fireEvent.change(input, { target: { value: 'x' } })` sends one fake event. `user.type(input, 'x')` does what a real user does: focus, key down, key press, input, key up, for every character. It catches bugs like a `maxLength` that's ignored or a handler on `onKeyDown` that `fireEvent.change` never triggers. Always `const user = userEvent.setup()` at the start of the test and `await` every call.
+
+## Testing Server Components and Server Actions
+
+- **Async Server Components** (the ones that `await` data) can't be rendered in Vitest today. Keep them thin: fetch data and pass it to a client component like `BookingForm`, which you can test. The page itself is covered by Playwright.
+- **Server Actions** are functions. Move the logic into a plain function (`validateBookingInput`, `toProblemMessage`) and unit test that. Test the wiring with Playwright.
+- **Pure helpers** (formatting `2099-01-01T04:30Z` as "10:30" in `Asia/Dhaka`) are the easiest tests in the whole frontend. Test them with `it.each` and two time zones, like Lesson 5.
+
+## Mistakes to avoid
+
+- Testing state or props instead of what the user sees (`expect(component.state.sending)` was the Enzyme style; it breaks on every refactor).
+- `getByTestId` everywhere. If you can't find an element by role or label, a screen reader can't either. Fix the HTML.
+- `getBy` for something that appears later (fails), or `findBy` for something that must **not** appear (always waits 1 second, then the test checks the wrong thing).
+- Mocking `fetch` or the `api` module with `vi.mock`, so the test never checks the URL, headers or body. Use MSW.
+- `waitFor(() => ...)` with side effects inside (`waitFor(() => user.click(...))`). `waitFor` may run its callback many times.
+- Forgetting `await` before `user.type` and `user.click`.
+- Snapshots of whole components: big, unread, updated blindly.
+- Trying to test an async Server Component in Vitest.
+
+## Exercises
+
+- **6.1** 🟢 Set up Vitest, Testing Library and MSW in your Next.js project. Write a test for a small component you already have (a header with the user's name, a "log out" button). Make it fail once.
+- **6.2** 🟡 Add `BookingForm` and its five tests. Then change the component to use `useActionState` or React Hook Form, without changing the tests. Do they still pass? If not, was it the test's fault or the component's?
+- **6.3** 🟡 Write a `SlotPicker` component: it fetches `GET /v1/staff/:id/availability?date=...` and shows the times in the **business's** time zone as buttons; "No free times on this day" when the list is empty; a "Try again" button on error. Test the loading, empty, error and normal states, with slots for an `Asia/Dhaka` business.
+- **6.4** 🔴 Test the `api()` helper's refresh logic from [Auth Lesson 3](/docs/auth-security/lesson-3-refresh-tokens) with MSW: two requests get 401 at the same time → **one** call to `/v1/auth/refresh` → both requests are retried once and succeed. And: refresh fails → the helper redirects to `/login` (hint: `vi.spyOn(window.location, 'assign')` doesn't work in jsdom; pass a `redirect` function into the helper, or stub `window.location` with `vi.stubGlobal`).
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you test React components?"**
+
+> "I use React Testing Library with Vitest, or Jest in older projects. I test components the way a user uses them: I find elements by their role or label, type and click with user-event, and check what appears on the screen. I don't test internal state or implementation details, so I can refactor freely. For API calls, I use MSW to fake the backend at the network level, which lets me test success, loading, error and conflict states, and also check that the right request was sent. Using role queries also catches accessibility problems: if I can't find a button by its name, a screen reader user can't either. Full pages, Server Components and flows across pages I cover with a few Playwright tests."
+
+**"What do you mock in frontend tests?"**
+
+> "As little as possible: mainly the network, with MSW, because it's the boundary between my frontend and the backend. I don't mock my own components or hooks, and I avoid mocking modules like the fetch helper, because then I'm not testing the real request. Sometimes I also control time or browser APIs that jsdom doesn't support, but that's the exception."

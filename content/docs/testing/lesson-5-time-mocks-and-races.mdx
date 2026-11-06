@@ -1,0 +1,467 @@
+---
+title: "Lesson 5: Time, outside services and race conditions"
+description: "Control time in tests with a Clock provider and Jest fake timers, test time zones and DST, the database's own clock, fake outside HTTP APIs with MSW (the breached-password check), when to fake a whole service instead, and race tests: many parallel requests, deterministic interleaving with two connections, and what a race test can and can't prove."
+---
+
+Three kinds of bugs hide from normal tests:
+
+1. **Time bugs:** the code works today and fails at midnight, on the 31st, on a DST change, or in another time zone.
+2. **Outside-world bugs:** the code works when Google answers, and crashes when Google is slow or returns an error.
+3. **Race bugs:** the code works for one request, and breaks when two requests arrive at the same moment.
+
+Each needs a specific technique.
+
+## Part 1: Time
+
+### The problem
+
+```typescript
+if (!canCancel(actor, booking, new Date())) ...           // depends on today
+const expiresAt = new Date(Date.now() + 30 * 60_000);      // depends on now
+```
+
+A test with `startsAt: '2026-12-01T10:00:00Z'` passes in November 2026 and fails in December. The test didn't change; the calendar did. You used dates in 2099 in Lessons 2–4 to avoid this. That works, but you can't test "a booking 30 minutes from now" or "a reset link that expired 1 minute ago".
+
+Three tools, from simplest to most powerful:
+
+| Tool | Use for |
+| --- | --- |
+| **Pass `now` as a parameter** | Pure functions (`canCancel(actor, booking, now)`, Lesson 2) |
+| **A `Clock` provider** | Services in Nest: the test sets the time, the code asks the clock |
+| **Jest fake timers** | Code that **waits**: `setTimeout`, retries with backoff, debounce |
+
+### A `Clock` provider
+
+```typescript
+// src/common/clock.ts
+export abstract class Clock {
+  abstract now(): Date;
+}
+
+@Injectable()
+export class SystemClock extends Clock {
+  now(): Date {
+    return new Date();
+  }
+}
+
+// @Global() module: { providers: [{ provide: Clock, useClass: SystemClock }], exports: [Clock] }
+```
+
+An abstract class works as a DI token **and** as a type, so services just ask for it:
+
+```typescript
+@Injectable()
+export class BookingsService {
+  constructor(
+    private readonly bookings: BookingsRepository,
+    private readonly services: ServicesService,
+    private readonly clock: Clock,
+  ) {}
+
+  async cancel(actor: AuthUser, id: string) {
+    // ...
+    if (!canCancel(actor, booking, this.clock.now())) throw new ForbiddenError('You cannot cancel this booking');
+  }
+}
+```
+
+The test version is a clock you can set and move:
+
+```typescript
+// test/fakes/test-clock.ts
+export class TestClock extends Clock {
+  constructor(private current = new Date('2026-12-01T09:00:00Z')) {
+    super();
+  }
+  now(): Date {
+    return new Date(this.current);              // a copy: callers can't change our time by accident
+  }
+  set(iso: string): void {
+    this.current = new Date(iso);
+  }
+  advance(ms: number): void {
+    this.current = new Date(this.current.getTime() + ms);
+  }
+}
+```
+
+```typescript
+// Unit test
+const clock = new TestClock();
+// providers: [..., { provide: Clock, useValue: clock }]
+
+it('lets staff cancel until the booking starts', async () => {
+  repo.findOne.mockResolvedValue(aBooking({ startsAt: new Date('2026-12-01T10:00:00Z'), staff: { userId: 'user-staff' } }));
+  repo.cancel.mockResolvedValue(aBooking({ status: 'cancelled' }));
+  const staff = anActor({ id: 'user-staff', role: 'staff' });
+
+  clock.set('2026-12-01T09:59:00Z');
+  await expect(service.cancel(staff, 'booking-1')).resolves.toBeDefined();
+
+  clock.set('2026-12-01T10:00:00Z');
+  await expect(service.cancel(staff, 'booking-1')).rejects.toBeInstanceOf(ForbiddenError);
+});
+
+// API test: createTestApp() adds .overrideProvider(Clock).useValue(clock) and returns the clock
+```
+
+The second half tests the **exact boundary**: one minute before is allowed; exactly at the start time isn't. Boundaries are where off-by-one bugs live.
+
+"Inject the clock" is a common pattern in every language. In an interview: "I inject the clock, so time is an input to my code like any other."
+
+### The database has its own clock
+
+Your schema uses `@default(now())` for `createdAt`, and some SQL may use `now()` directly (refresh-token grace periods, clean-up jobs). The `TestClock` doesn't control Postgres. Two rules:
+
+- If a **rule** depends on time, compute the time in the app (`this.clock.now()`) and pass it into the query as a parameter. Then the test controls it.
+- If a column is only a record (`createdAt`), leave `now()`. In tests, move the data instead: `update ... set used_at = now() - interval '11 seconds'`, like the refresh-token test in Lesson 4.
+
+### Jest fake timers: code that waits
+
+Mini-build B (webhook delivery) retries with exponential backoff. You don't want a test that waits 1 + 2 + 4 seconds:
+
+```typescript
+// src/common/retry.ts
+export async function withRetry<T>(fn: () => Promise<T>, opts: { retries: number; baseMs: number }): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt >= opts.retries) throw err;
+      await new Promise((r) => setTimeout(r, opts.baseMs * 2 ** attempt));   // 1x, 2x, 4x, ...
+    }
+  }
+}
+```
+
+```typescript
+// src/common/retry.spec.ts
+beforeEach(() => jest.useFakeTimers());
+afterEach(() => jest.useRealTimers());
+
+it('retries with exponential backoff, then succeeds', async () => {
+  const fn = jest.fn<Promise<string>, []>()
+    .mockRejectedValueOnce(new Error('503'))
+    .mockRejectedValueOnce(new Error('503'))
+    .mockResolvedValue('ok');
+
+  const result = withRetry(fn, { retries: 3, baseMs: 1_000 });
+
+  await jest.advanceTimersByTimeAsync(999);
+  expect(fn).toHaveBeenCalledTimes(1);           // still waiting for the first retry
+  await jest.advanceTimersByTimeAsync(1);
+  expect(fn).toHaveBeenCalledTimes(2);           // retry 1 after 1 s
+  await jest.advanceTimersByTimeAsync(2_000);
+  expect(fn).toHaveBeenCalledTimes(3);           // retry 2 after 2 more seconds
+
+  await expect(result).resolves.toBe('ok');
+});
+
+it('gives up after the last retry and throws the last error', async () => {
+  const fn = jest.fn<Promise<string>, []>().mockRejectedValue(new Error('503'));
+
+  const result = withRetry(fn, { retries: 2, baseMs: 100 });
+  const assertion = expect(result).rejects.toThrow('503');    // attach the handler BEFORE advancing
+  await jest.runAllTimersAsync();
+  await assertion;
+  expect(fn).toHaveBeenCalledTimes(3);           // 1 try + 2 retries
+});
+```
+
+- Use the **`...Async`** versions (`advanceTimersByTimeAsync`, `runAllTimersAsync`). They also let the `await`s between timers run. With the sync versions, the next `setTimeout` is never registered and the test hangs.
+- In the second test, the `expect(...).rejects` is created **before** the timers run. Otherwise the promise rejects while nobody is listening, and Node reports an "unhandled rejection".
+- `jest.useFakeTimers({ now: new Date('2026-12-01T09:00:00Z') })` also fixes `Date.now()` and `new Date()`. Handy in unit tests of old code without a `Clock`. Don't use fake timers in API tests: Supertest, `pg` and Nest use real timers inside, and tests hang.
+
+### Time zones and DST
+
+Your API stores UTC (`timestamptz`) and shows times in the **business's** time zone ([PostgreSQL Lesson 3](/docs/postgresql/lesson-3-time-and-ranges)). Three rules for tests:
+
+1. **Run every test in UTC** (`process.env.TZ = 'UTC'` in `env.ts`, and `"test": "cross-env TZ=UTC jest"` with `npm i -D cross-env` if a unit test depends on it). Otherwise a test passes on your laptop in Dhaka (UTC+6) and fails in CI (UTC).
+2. **Test at least two time zones**: `Asia/Dhaka` (no DST, ahead of UTC) and `America/New_York` (DST, behind UTC).
+3. **Test the DST days.** On 2027-03-14, New York clocks jump from 02:00 to 03:00: a working day of 01:00–04:00 has only **3 real hours**.
+
+An API test for availability on a DST day:
+
+```typescript
+it('returns real slots on the spring-forward day in New York', async () => {
+  const business = await f.business({ timeZone: 'America/New_York' });
+  const staff = await f.staff(business.id);
+  const service = await f.service(business.id, { durationMinutes: 30 });
+  await f.workingHours(staff.id, { weekday: 'sunday', start: '01:00', end: '04:00' });   // 2027-03-14 is a Sunday
+
+  const res = await publicApi.get(`/v1/staff/${staff.id}/availability?date=2027-03-14&serviceId=${service.id}`).expect(200);
+
+  // 01:00 and 01:30 are EST (UTC-5); 02:00–02:59 doesn't exist; 03:00 and 03:30 are EDT (UTC-4)
+  expect(res.body.slots).toEqual([
+    '2027-03-14T06:00:00.000Z',
+    '2027-03-14T06:30:00.000Z',
+    '2027-03-14T07:00:00.000Z',
+    '2027-03-14T07:30:00.000Z',
+  ]);
+});
+```
+
+Six slots would be the naive answer (01:00 to 04:00 is "3 hours" on the wall clock, minus nothing). The right answer has 4, because one wall-clock hour never happens. Write the expected values **by hand**, with a comment that explains them. Don't compute them in the test.
+
+Also test the **fall-back** day (2027-11-07 in New York: 01:00–02:00 happens twice) and "today's bookings" for a Dhaka business at 23:30 UTC, which is already tomorrow in Dhaka (exercise 5.2).
+
+## Part 2: Outside services
+
+Your API calls other services over HTTP: Have I Been Pwned (breached passwords, [Auth Lesson 1](/docs/auth-security/lesson-1-passwords)), Google (login), later Stripe and an LLM API. Tests must **never** call them for real:
+
+- the tests become slow and flaky (network, rate limits),
+- you can't test the error cases (Google returning 500, a timeout),
+- they might do real things (charge a card, send an email).
+
+### Two ways to fake them
+
+| Fake the **network** (MSW) | Fake the **class** that calls it |
+| --- | --- |
+| Your real code runs, including URL building, headers, parsing and timeouts | Simpler; you control exactly what the class returns |
+| Good for small, direct HTTP calls (HIBP, a webhook target, an LLM API) | Good for complex protocols with signed responses (OpenID Connect: signed ID tokens, JWKS) |
+
+**MSW** (Mock Service Worker) intercepts requests made with `fetch` (and Node's `http`) and answers them from handlers you write. The code under test doesn't change at all.
+
+```typescript
+// test/msw/handlers.ts
+import { http, HttpResponse } from 'msw';
+
+export const hibp = {
+  breached: (suffix: string) =>
+    http.get('https://api.pwnedpasswords.com/range/:prefix', () =>
+      HttpResponse.text(`${suffix}:52\r\n0018A45C4D1DEF81644B54AB7F969B88D65:1\r\n`),
+    ),
+  clean: () =>
+    http.get('https://api.pwnedpasswords.com/range/:prefix', () =>
+      HttpResponse.text('0018A45C4D1DEF81644B54AB7F969B88D65:1\r\n'),
+    ),
+  down: () => http.get('https://api.pwnedpasswords.com/range/:prefix', () => new HttpResponse(null, { status: 503 })),
+};
+
+export const defaultHandlers = [hibp.clean()];
+```
+
+```typescript
+// test/msw/server.ts
+import { setupServer } from 'msw/node';
+import { defaultHandlers } from './handlers';
+
+export const mswServer = setupServer(...defaultHandlers);
+```
+
+```typescript
+// test/setup/msw.ts — add to "setupFilesAfterEnv" in both Jest configs
+import { mswServer } from '../msw/server';
+
+beforeAll(() =>
+  mswServer.listen({
+    onUnhandledRequest(request, print) {
+      const { hostname } = new URL(request.url);
+      if (hostname === '127.0.0.1' || hostname === 'localhost') return;   // Supertest → our own app: let it through
+      print.error();                                                      // anything else is a bug: a real outside call
+    },
+  }),
+);
+afterEach(() => mswServer.resetHandlers());     // remove handlers added by one test
+afterAll(() => mswServer.close());
+```
+
+The `onUnhandledRequest` function matters. With the usual `'error'` setting, MSW also blocks Supertest's requests to your own app (they're HTTP requests too), and every API test fails. With `'bypass'`, a forgotten handler means a real call to the internet. The function above allows only local requests.
+
+Now a test can change the outside world:
+
+```typescript
+import { createHash } from 'node:crypto';
+import { mswServer } from '../msw/server';
+import { hibp } from '../msw/handlers';
+
+const suffixOf = (password: string) => createHash('sha1').update(password).digest('hex').toUpperCase().slice(5);
+
+describe('isBreachedPassword', () => {
+  it('returns true when the suffix is in the range response', async () => {
+    mswServer.use(hibp.breached(suffixOf('password123456')));
+    await expect(isBreachedPassword('password123456')).resolves.toBe(true);
+  });
+
+  it('returns false when it is not', async () => {
+    await expect(isBreachedPassword('a unique and long passphrase')).resolves.toBe(false);   // default handler
+  });
+
+  it('fails open when the service is down', async () => {
+    mswServer.use(hibp.down());
+    await expect(isBreachedPassword('anything at all 123')).resolves.toBe(false);
+  });
+
+  it('sends only the first 5 characters of the hash', async () => {
+    let requested = '';
+    mswServer.use(
+      http.get('https://api.pwnedpasswords.com/range/:prefix', ({ params }) => {
+        requested = String(params.prefix);
+        return HttpResponse.text('');
+      }),
+    );
+    await isBreachedPassword('my secret password');
+    expect(requested).toHaveLength(5);              // k-anonymity: the full hash never leaves the server
+  });
+});
+```
+
+The last test checks a **security property** through the network: only 5 characters are sent. A class-level fake couldn't check that.
+
+For a timeout test, return `delay('infinite')` from `msw` in the handler and check that your 2-second `AbortSignal.timeout` makes the function fail open. (Use a shorter timeout through config in tests, or the test takes 2 seconds.)
+
+### Faking Google login: fake the class
+
+OpenID Connect needs a **signed** ID token that `openid-client` verifies against Google's keys. Faking that with MSW is possible (generate a key pair, serve a JWKS, sign tokens) but a lot of work. Instead, replace your own wrapper class:
+
+```typescript
+// in createTestApp for the Google tests
+.overrideProvider(GoogleOidcService)
+.useValue({
+  authorizationUrl: jest.fn().mockResolvedValue({ url: 'https://accounts.google.test/auth?state=s', state: 's', nonce: 'n', codeVerifier: 'v' }),
+  exchange: jest.fn().mockResolvedValue({ sub: 'google-123', email: 'rahim@test.dev', email_verified: true, name: 'Rahim' }),
+})
+```
+
+Then test **your** rules, which is where the risk is: a new user is created; an existing Google identity logs in; an existing **unverified** password account with the same email loses its password and sessions before linking (pre-account takeover, [Auth Lesson 5](/docs/auth-security/lesson-5-google-login)); `email_verified: false` is rejected; a `returnTo` of `//evil.example` is ignored.
+
+The real OIDC wiring (redirect URLs, Google's discovery document) is tested by hand once, and in production monitoring.
+
+## Part 3: Race conditions
+
+A normal test sends one request at a time, so it never finds bugs that need two at once. You met the most important one already: two customers booking the same slot at the same moment ([PostgreSQL Lesson 6](/docs/postgresql/lesson-6-transactions-and-locking)).
+
+### Many requests at once
+
+```typescript
+// test/bookings-race.e2e-spec.ts
+it('accepts exactly one of 20 simultaneous bookings for the same slot', async () => {
+  const salon = await f.salon();
+  const api = await ownerOf(salon);
+
+  const responses = await Promise.all(
+    Array.from({ length: 20 }, (_, i) =>
+      api
+        .post('/v1/bookings')
+        .set('Idempotency-Key', crypto.randomUUID())
+        .send({ ...body(salon), customerEmail: `race${i}@test.dev` }),
+    ),
+  );
+
+  const statuses = responses.map((r) => r.status).sort();
+  expect(statuses.filter((s) => s === 201)).toHaveLength(1);
+  expect(statuses.filter((s) => s === 409)).toHaveLength(19);      // not 500!
+  expect(await t.prisma.booking.count({ where: { status: { not: 'cancelled' } } })).toBe(1);
+});
+
+it('creates one booking when the same Idempotency-Key arrives twice at once', async () => {
+  const salon = await f.salon();
+  const api = await ownerOf(salon);
+  const key = crypto.randomUUID();
+
+  const [a, b] = await Promise.all([
+    api.post('/v1/bookings').set('Idempotency-Key', key).send(body(salon)),
+    api.post('/v1/bookings').set('Idempotency-Key', key).send(body(salon)),
+  ]);
+
+  expect([a.status, b.status].sort()).toEqual(expect.arrayContaining([201]));
+  expect(await t.prisma.booking.count()).toBe(1);
+});
+```
+
+Check for **19 × 409, not 500**. A common failure: the race is handled (only one booking exists), but the losers get 500 because the constraint error isn't mapped, or because 20 transactions tried to create the same new customer at once (the hint in the [PostgreSQL practice project](/docs/postgresql/practice-project)).
+
+### What a race test can and can't prove
+
+A race test is a **smoke alarm**, not a proof. If the requests don't happen to overlap on this run, a buggy version passes too. In your booking API, the **guarantee** comes from the exclusion constraint; the test checks that the constraint exists and that errors are handled well.
+
+To make race tests catch more:
+
+- Send more requests (20–50) and run the race several times in one test.
+- Use a pool size that lets them really run in parallel (the test app's Prisma pool should be ≥ 10).
+- For a fix that's in **your code** (like `select ... for update`), control the order of events yourself, as below.
+
+### Deterministic interleaving with two connections
+
+You can make the race happen **every time** by opening two database connections and running the steps in the order you choose. This shows exactly what Postgres does with two overlapping inserts:
+
+```typescript
+// src/bookings/no-overlap.int-spec.ts
+import { Client } from 'pg';
+
+it('makes the second overlapping insert wait, then fail when the first commits', async () => {
+  const salon = await f.salon();
+  const customer = await f.customer(salon.business.id);
+  const a = new Client({ connectionString: process.env.DATABASE_URL });
+  const b = new Client({ connectionString: process.env.DATABASE_URL });
+  await Promise.all([a.connect(), b.connect()]);
+  const { rows: [{ pid: bPid }] } = await b.query<{ pid: number }>('select pg_backend_pid() as pid');
+
+  const insert = (client: Client) =>
+    client.query(
+      `insert into bookings (business_id, service_id, staff_id, customer_id, starts_at, ends_at, price_cents, updated_at)
+       values ($1, $2, $3, $4, '2099-01-01T10:00Z', '2099-01-01T10:30Z', 2000, now())`,   // Prisma's @updatedAt has no SQL default
+      [salon.business.id, salon.service.id, salon.staff.id, customer.id],
+    );
+
+  try {
+    await a.query('begin');
+    await insert(a);                                   // A holds the slot, not committed yet
+
+    await b.query('begin');
+    const bInsert = insert(b);                         // B must wait for A: don't await yet
+    bInsert.catch(() => {});                           // avoid an "unhandled rejection" while we wait
+
+    // Prove B is really waiting on a lock (not finished, not failed)
+    await eventually(async () => {
+      const { rows } = await a.query(
+        `select wait_event_type from pg_stat_activity where pid = $1`, [bPid],
+      );
+      expect(rows[0]?.wait_event_type).toBe('Lock');
+    });
+
+    await a.query('commit');                           // now B wakes up...
+    await expect(bInsert).rejects.toMatchObject({ code: '23P01' });   // ...and hits the exclusion constraint
+  } finally {
+    await b.query('rollback').catch(() => {});
+    await Promise.all([a.end(), b.end()]);
+  }
+});
+```
+
+This test is exact: it doesn't depend on luck. Use the same pattern for the **last-owner rule** (exercise 3.4): A runs `select ... for update` on the owners, B tries the same and must wait, A removes an owner and commits, B wakes up, sees only one owner and refuses. Without `for update`, B doesn't wait, and the test fails every time, not just sometimes.
+
+## Mistakes to avoid
+
+- `new Date()` or `Date.now()` inside rules, then tests that break on a future date.
+- Fake timers in API tests (they freeze Supertest, `pg` and Nest's own timers).
+- Using `advanceTimersByTime` (sync) with async code, and a test that hangs.
+- Running tests in your local time zone; CI runs in UTC.
+- Testing only one time zone, and never a DST day.
+- MSW with `onUnhandledRequest: 'bypass'`: a forgotten handler calls the real internet without anyone noticing.
+- MSW with `'error'` in API tests: it blocks Supertest's own requests.
+- Faking a complex protocol at the network level when faking your wrapper class is enough.
+- A race test that only checks "one booking exists", not "the others got 409, not 500".
+- Thinking a passing race test proves there's no race.
+
+## Exercises
+
+- **5.1** 🟢 Add the `Clock` provider, use it in `BookingsService` and the one-time token service ([Auth Lesson 4](/docs/auth-security/lesson-4-email-flows)), and write the "staff can cancel until the start time" test with the exact boundary. Then test that a password reset link works at 29 minutes and fails at 31.
+- **5.2** 🟡 Write the DST availability test (spring forward) and a fall-back test for 2027-11-07 in New York. Then write a test for "today's bookings" for a Dhaka business when it's 2026-12-01T23:30Z (already December 2 in Dhaka). Before running them, write down what you **expect**. Were you right?
+- **5.3** 🟡 Set up MSW with the local-requests rule. Write the four `isBreachedPassword` tests and a timeout test with `delay('infinite')`. Then write an API test: sign-up with a breached password returns 422 with a `password` field error.
+- **5.4** 🔴 Write the deterministic two-connection test for the exclusion constraint, then the same pattern for the last-owner rule. Remove `for update` and check that the last-owner test fails **every** run (run it 10 times with `npm run test:int -- -t "last owner"`).
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you test code that depends on the current time?"**
+
+> "I treat time as an input. Pure functions take `now` as a parameter, and services get a `Clock` provider through dependency injection, which tests replace with a clock they can set and move. That lets me test exact boundaries, like a reset link that works at 29 minutes and fails at 31. For code that waits, like retries with backoff, I use Jest's fake timers with the async advance functions. I run all tests in UTC, and for time zones I test at least one zone with DST, including the day the clocks change, because on that day an hour of slots doesn't exist."
+
+**"How do you test race conditions?"**
+
+> "First, I make sure the guarantee is in the right place. For double bookings, it's a Postgres exclusion constraint, so it holds whatever the timing. Then I write a race test that sends 20 identical booking requests in parallel and checks that exactly one gets 201, the other 19 get 409 and not 500, and only one row exists. Because a race test depends on timing, it's more of a smoke alarm than a proof. When the fix is in my own code, like a `select for update`, I write a deterministic test with two database connections, where I control the order: the first transaction takes the lock, I check the second is waiting, then I commit the first and check what the second sees."

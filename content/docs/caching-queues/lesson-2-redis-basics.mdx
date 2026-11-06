@@ -1,0 +1,315 @@
+---
+title: "Lesson 2: Redis basics"
+description: "What Redis is (and Valkey), running it in Docker, redis-cli, the data types with booking-platform uses, expiry, key naming with the tenant in the key, atomic commands, MULTI, pipelines and Lua scripts, SCAN instead of KEYS, memory limits and eviction, persistence, security, connecting from NestJS with ioredis, and distributed locks and their limits."
+---
+
+**Redis** is a server that keeps data **in memory** and answers in well under a millisecond. It isn't just a key-value store: values can be strings, hashes, lists, sets, sorted sets and streams, each with its own commands. BullMQ (Lesson 5) is built on these data types.
+
+Three facts explain most of how Redis behaves:
+
+1. **In memory.** Fast, but limited by RAM, and data can be lost on a crash unless persistence is on.
+2. **One command at a time.** Redis runs commands one after another on a single thread, so **each command is atomic**: `INCR` from two servers at the same moment never loses a count.
+3. **Optional expiry on every key.** That's what makes it a natural cache.
+
+<Callout title="Redis, Valkey and licences">
+In 2024 Redis changed its licence, and the Linux Foundation started **Valkey**, an open-source fork. Redis 8 (2025) added an open-source licence option again. For your work they're the same: same commands, same clients, and BullMQ works with both. AWS ElastiCache offers Valkey; Upstash offers a serverless Redis. Say "Redis" in interviews; know that Valkey exists.
+</Callout>
+
+## Run it
+
+The service from the [section setup](/docs/caching-queues), in `docker-compose.yml`:
+
+```yaml
+redis:
+  image: redis:8-alpine
+  command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+  ports:
+    - "127.0.0.1:6379:6379"        # only reachable from your machine
+  volumes:
+    - redis-data:/data
+```
+
+Open the command-line client:
+
+```powershell
+docker compose up -d redis
+docker compose exec redis redis-cli
+```
+
+```text
+127.0.0.1:6379> PING
+PONG
+```
+
+## The data types
+
+| Type | Commands | Booking platform use |
+| --- | --- | --- |
+| **String** | `SET`, `GET`, `INCR`, `MGET`, `SET ... EX 60 NX` | Cached JSON, counters, locks |
+| **Hash** | `HSET`, `HGET`, `HGETALL`, `HINCRBY` | An object with fields (a job's data in BullMQ) |
+| **List** | `LPUSH`, `RPOP`, `LRANGE`, `LTRIM` | Simple queues, "last 50 events" |
+| **Set** | `SADD`, `SISMEMBER`, `SMEMBERS` | Unique visitors, tags |
+| **Sorted set** | `ZADD`, `ZRANGE`, `ZRANGEBYSCORE`, `ZREMRANGEBYSCORE` | Sliding-window rate limits (Lesson 4), delayed jobs ordered by time (BullMQ) |
+| **Stream** | `XADD`, `XREAD`, `XREADGROUP` | Event logs; BullMQ uses one for job events |
+| Pub/sub | `PUBLISH`, `SUBSCRIBE` | Live updates across servers (Month 3) |
+
+Try them:
+
+```text
+SET cache:v1:profile:sunny-salon '{"name":"Sunny Salon"}' EX 300
+GET cache:v1:profile:sunny-salon
+TTL cache:v1:profile:sunny-salon      # seconds left, e.g. 297
+
+INCR views:biz:01J...:2027-01-15      # 1, then 2, 3...
+EXPIRE views:biz:01J...:2027-01-15 172800
+
+HSET job:42 name reminder attempts 0
+HINCRBY job:42 attempts 1
+HGETALL job:42
+
+ZADD ratelimit:ip:1.2.3.4 1795000000000 req-1
+ZRANGEBYSCORE ratelimit:ip:1.2.3.4 1794999940000 +inf
+```
+
+### Expiry
+
+- `SET key value EX 60` (seconds) or `PX 60000` (milliseconds) sets a value with a TTL in one command.
+- `EXPIRE key 60` adds a TTL to an existing key. `PERSIST key` removes it.
+- `TTL key` returns the seconds left, `-1` if the key has no TTL, and `-2` if the key doesn't exist.
+- **`SET` without `EX` removes the old TTL.** Overwriting a cached value without a TTL makes it live forever. A common bug.
+
+## Key naming
+
+Keys are just strings, so the convention is yours. Use colons to make a hierarchy, and be consistent:
+
+```text
+cache:v1:profile:{slug}
+cache:v1:avail:{businessId}:{version}:{staffId}:{serviceId}:{date}
+ratelimit:login:email:{sha256(email)}
+lock:reminder-sweep
+```
+
+Rules:
+
+- **A prefix per purpose** (`cache:`, `ratelimit:`, `lock:`). You can find and delete one kind of key without touching others.
+- **A version** in cache keys (`v1`). When you change the shape of the cached JSON, change it to `v2` and old entries are simply never read again.
+- **The tenant in every tenant-scoped key.** `cache:v1:services:{businessId}`, never `cache:v1:services`. A key without `businessId` is the cache version of the IDOR bugs from [Auth Lesson 6](/docs/auth-security/lesson-6-authorisation): business B sees business A's data.
+- **No personal data in keys.** Keys show up in monitoring tools and logs. Hash emails (`sha256`) before putting them in a key.
+
+## Atomic operations
+
+Each command is atomic. When you need **several** commands to act as one:
+
+| Tool | Atomic? | Use |
+| --- | --- | --- |
+| A single command (`INCR`, `SET NX`, `ZADD`) | Yes | Always try this first |
+| `MULTI` / `EXEC` (transaction) | Yes: runs all together, nothing in between | Several writes that must happen together |
+| Pipeline | **No**: just sends many commands in one round trip | Speed (many `GET`s) |
+| **Lua script** (`EVAL`) | Yes: the whole script runs as one command | "Read, decide, write" logic |
+
+`MULTI` can't use the result of one command to decide the next (results come back only at `EXEC`). Lua can, which is why rate limiters and locks use Lua:
+
+```lua
+-- Fixed-window counter: increment, and set the expiry only on the first request
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return count
+```
+
+Without Lua, `INCR` then `PEXPIRE` are two commands. If the app crashes between them, the key never expires and that user is rate-limited forever.
+
+### `KEYS` vs `SCAN`
+
+`KEYS cache:*` looks at **every key** and blocks Redis while it does. With millions of keys, every other client waits, including BullMQ. Never use it in application code. `SCAN` returns keys in small batches without blocking:
+
+```typescript
+// ioredis
+const stream = redis.scanStream({ match: 'cache:v1:profile:*', count: 200 });
+for await (const keys of stream) {
+  if (keys.length) await redis.unlink(...keys);   // UNLINK frees memory in the background
+}
+```
+
+Even `SCAN` is slow for big keyspaces, so prefer designs that don't need it (versioned keys, Lesson 3).
+
+## Memory, eviction and persistence
+
+**`maxmemory`** sets how much RAM Redis may use. When it's full, the **eviction policy** decides what happens:
+
+| Policy | When memory is full | Use for |
+| --- | --- | --- |
+| `noeviction` | Writes fail with an error | **Queues** (BullMQ needs every job kept) |
+| `allkeys-lru` | Delete the least recently used keys | **Pure caches** |
+| `allkeys-lfu` | Delete the least frequently used keys | Caches with a few very hot keys |
+| `volatile-lru` / `volatile-ttl` | Delete only keys with a TTL | A mix (risky: easy to get wrong) |
+
+The policy is for the **whole Redis instance**. A cache wants `allkeys-lru`; a queue must have `noeviction`. That's why production setups usually run **two Redis instances**: one for cache, one for queues (Lesson 8).
+
+**Persistence:**
+
+- **RDB:** a snapshot to disk every few minutes. Small, fast to restart; you lose the last minutes on a crash.
+- **AOF** (append-only file): every write is logged; with `appendfsync everysec` you lose at most about a second. Use it for queues.
+- **None:** fine for a pure cache. On restart the cache is empty and fills again.
+
+## Security
+
+Redis was designed for a trusted network. An open Redis on the internet gets taken over within hours (attackers use it to write files and run code).
+
+- **Never expose the port publicly.** In compose, bind to `127.0.0.1`; in the cloud, a private subnet only.
+- **Password or ACL users** (`requirepass`, or `ACL SETUSER`): `redis://default:password@host:6379`.
+- **TLS** in the cloud: the URL starts with `rediss://` (two s's).
+- Redis is an SSRF target ([Auth Lesson 8](/docs/auth-security/lesson-8-abuse-and-secrets)): another reason to block private IPs in features that fetch URLs.
+
+## Connecting from NestJS
+
+You built a `RedisModule` in [NestJS Lesson 3](/docs/nestjs/lesson-3-advanced-providers). Here is the version used in this section, with a clean shutdown and logging:
+
+```typescript
+// src/redis/redis.module.ts
+import { Global, Inject, Logger, Module, OnApplicationShutdown } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import Redis from 'ioredis';
+import type { Env } from '../config/env';
+
+export const REDIS = Symbol('REDIS');
+
+@Global()
+@Module({
+  providers: [
+    {
+      provide: REDIS,
+      inject: [ConfigService],
+      useFactory: (config: ConfigService<Env, true>) => {
+        const logger = new Logger('Redis');
+        const client = new Redis(config.get('REDIS_URL', { infer: true }), {
+          maxRetriesPerRequest: 2,          // fail a command fast instead of waiting forever
+          connectTimeout: 5_000,
+        });
+        client.on('error', (err) => logger.warn(`Redis error: ${err.message}`));
+        return client;
+      },
+    },
+  ],
+  exports: [REDIS],
+})
+export class RedisModule implements OnApplicationShutdown {
+  constructor(@Inject(REDIS) private readonly redis: Redis) {}
+
+  async onApplicationShutdown() {
+    await this.redis.quit();                // finish pending commands, then close
+  }
+}
+```
+
+Notes:
+
+- ioredis **reconnects automatically**. The `error` listener is required: without one, Node treats connection errors as unhandled and the logs fill with stack traces.
+- `maxRetriesPerRequest: 2` means a command fails after a couple of reconnect attempts. For a **cache** that's what you want: if Redis is down, give up quickly and read the database. BullMQ workers need the opposite (`null`, wait forever); Lesson 5 gives BullMQ its own connections.
+- `onApplicationShutdown` only runs if `main.ts` calls `app.enableShutdownHooks()`.
+
+A health check for `/health` ([NestJS Lesson 8](/docs/nestjs/lesson-8-logging-and-health)):
+
+```typescript
+// src/health/redis.health.ts
+import { Inject, Injectable } from '@nestjs/common';
+import { HealthIndicatorService } from '@nestjs/terminus';
+import Redis from 'ioredis';
+import { REDIS } from '../redis/redis.module';
+
+@Injectable()
+export class RedisHealthIndicator {
+  constructor(
+    @Inject(REDIS) private readonly redis: Redis,
+    private readonly health: HealthIndicatorService,
+  ) {}
+
+  async isHealthy(key = 'redis') {
+    const indicator = this.health.check(key);
+    try {
+      await this.redis.ping();
+      return indicator.up();
+    } catch (err) {
+      return indicator.down({ message: (err as Error).message });
+    }
+  }
+}
+```
+
+Decide what "unhealthy" means. If the cache is optional, a Redis outage shouldn't make the load balancer remove every API instance: put Redis in the **readiness** details, not in the check that restarts the app.
+
+## Distributed locks (and why to be careful)
+
+A **lock** in Redis: "only one process may do this right now". The basic version:
+
+```typescript
+// src/redis/lock.ts
+import { randomUUID } from 'node:crypto';
+import type Redis from 'ioredis';
+
+const RELEASE = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0`;
+
+export async function withLock<T>(redis: Redis, key: string, ttlMs: number, fn: () => Promise<T>): Promise<T | undefined> {
+  const token = randomUUID();
+  const ok = await redis.set(key, token, 'PX', ttlMs, 'NX');   // only if nobody holds it
+  if (ok !== 'OK') return undefined;                            // someone else has the lock
+  try {
+    return await fn();
+  } finally {
+    await redis.eval(RELEASE, 1, key, token);                   // delete only OUR lock
+  }
+}
+```
+
+Why each part:
+
+- `NX`: set only if the key doesn't exist. That's the "take the lock" step, and it's atomic.
+- `PX ttlMs`: if the process crashes, the lock frees itself.
+- The **token** and the Lua release: without them, process A's lock expires, B takes it, then A finishes and deletes **B's** lock.
+
+The problem nobody can fully fix: if `fn` takes **longer** than `ttlMs` (a slow query, a long garbage-collection pause), the lock expires while A is still working, and B starts too. Now two processes do the "only one" work. The Redlock algorithm (locks on several Redis servers) doesn't solve this either; a well-known article by Martin Kleppmann explains why.
+
+So:
+
+- **Use Redis locks for efficiency** ("don't run this job twice if we can avoid it"), where running twice is wasteful but not harmful.
+- **For correctness, use the database**: an exclusion constraint (no double bookings), a unique constraint, `select ... for update`, or a Postgres advisory lock inside the transaction that does the work. Your booking API already does this.
+
+This is a good interview point: "I'd use Redis locks to avoid duplicate work, and database constraints when duplicates would be a bug."
+
+## Mistakes to avoid
+
+- Overwriting a key with `SET` (no `EX`) and losing its TTL.
+- Cache keys without the tenant ID.
+- Emails or other personal data in key names.
+- `KEYS *` in application code.
+- Two commands that must be atomic sent separately (`INCR` then `EXPIRE`).
+- One Redis with `allkeys-lru` for both cache and queue: jobs silently disappear when memory is full.
+- Redis reachable from the internet, or without a password in the cloud.
+- No `error` listener on the ioredis client.
+- Trusting a Redis lock to prevent something that must never happen twice.
+
+## Exercises
+
+- **2.1** 🟢 In `redis-cli`: set a key with a 30-second TTL and watch `TTL` count down; overwrite it with `SET` and check `TTL` again (what changed?); `INCR` a counter five times; build a hash with `HSET` and read it with `HGETALL`; add three members to a sorted set with different scores and read the ones in a score range. What does `TTL` return for a key without expiry, and for a key that doesn't exist?
+- **2.2** 🟡 Add the `RedisModule` and the health indicator to the booking API. Start the API, then stop the Redis container. What happens to `/health`, to the logs, and to requests that don't use Redis? Start Redis again: does the API reconnect by itself?
+- **2.3** 🟡 Count views of each public business page: `INCR` a key per business per day (in the business's time zone) with a 48-hour expiry, and add `GET /v1/businesses/:id/views?days=7` (owner only) that reads 7 keys with one `MGET`. Why is this better than inserting a row in Postgres for every view? What would you do if the owner wanted 12 months of history?
+- **2.4** 🔴 Write `withLock` and a test with a real Redis (a quick script is fine for now; Lesson 8 adds a Redis container to Jest): two callers at the same time, only one runs. Then show the danger: a `fn` that takes 300 ms with a 100 ms TTL, and a second caller that gets the lock while the first is still running. Explain in three sentences why the booking API doesn't use a Redis lock to prevent double bookings.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"What is Redis and what do you use it for?"**
+
+> "Redis is an in-memory data store that's very fast, usually well under a millisecond, and it has data types like strings, hashes, sorted sets and streams, not just key-value. Each command is atomic because it runs one at a time, so counters and `SET NX` are safe from many servers at once. I use it as a shared cache in front of Postgres, for rate-limit counters that all API instances share, and as the backend for BullMQ job queues. I don't use it as the source of truth for business data: it's in memory, so I keep the data in Postgres. In production I separate cache and queue into two instances, because a cache should evict old keys when memory is full, and a queue must never lose jobs."
+
+**"How would you implement a distributed lock? Is it safe?"**
+
+> "The basic version is `SET key token NX PX ttl`, so only one client gets it and it expires if the client crashes, and I release it with a Lua script that deletes the key only if it still holds my token. It's not fully safe: if my work takes longer than the TTL, or the process pauses, the lock expires and another client starts too. So I use Redis locks for efficiency, to avoid duplicate work, and for correctness I rely on the database, like a unique or exclusion constraint, or a row lock inside the transaction."

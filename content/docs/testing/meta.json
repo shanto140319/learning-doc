@@ -1,0 +1,17 @@
+{
+  "title": "Testing",
+  "pages": [
+    "index",
+    "lesson-1-why-and-what",
+    "lesson-2-unit-tests",
+    "lesson-3-integration-tests",
+    "lesson-4-api-e2e-tests",
+    "lesson-5-time-mocks-and-races",
+    "lesson-6-react-component-tests",
+    "lesson-7-playwright",
+    "lesson-8-ci-and-flaky-tests",
+    "practice-project",
+    "solutions",
+    "cheat-sheet"
+  ]
+}

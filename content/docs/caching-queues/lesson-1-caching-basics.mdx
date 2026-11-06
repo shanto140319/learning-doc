@@ -1,0 +1,237 @@
+---
+title: "Lesson 1: Caching basics"
+description: "What a cache is and what it costs, measuring before caching, the cache layers from the browser to Postgres, cache-aside and the other patterns, how stale each kind of booking data may be, TTL and invalidation strategies, HTTP caching with Cache-Control and ETag, a note on Next.js caching, and a small in-memory cache to understand the ideas."
+---
+
+A **cache** is a copy of data kept somewhere faster to read than the original. Instead of running the availability query again, you return the answer you computed 30 seconds ago.
+
+Caching makes reads fast and protects the database. But it has a price: **the copy can be wrong**. The real data changed and the copy didn't. Almost every caching problem is a version of that one problem.
+
+> "There are only two hard things in computer science: cache invalidation and naming things." (Phil Karlton)
+
+So the questions for every cache are always the same:
+
+1. **Is it really slow?** (Measure first.)
+2. **Where** do I keep the copy?
+3. **How stale** can the copy be before it hurts someone?
+4. **How** does the copy get updated or removed when the real data changes?
+
+## Measure first
+
+A cache is not a fix for a missing index. Before caching an endpoint:
+
+1. Measure it: `npx autocannon -c 20 -d 10 http://localhost:3000/v1/staff/<id>/availability?date=2027-01-15&serviceId=<id>` gives you requests per second and latency (p50, p99).
+2. Look at the query with `EXPLAIN (ANALYZE, BUFFERS)` ([PostgreSQL Lesson 5](/docs/postgresql/lesson-5-explain-and-performance)). A missing index or an N+1 is fixed in the query, not hidden with a cache.
+3. Cache only when the query is already good and still too slow or too frequent.
+
+Good candidates are data that is **read much more often than it changes**, and **expensive** to compute or fetch.
+
+## The cache layers
+
+From closest to the user to closest to the data:
+
+| Layer | Example | Shared by | Controlled with |
+| --- | --- | --- | --- |
+| Browser | The public booking page's JSON, images | One user | `Cache-Control`, `ETag` headers |
+| CDN / proxy | Cloudflare, CloudFront in front of public pages | Everyone | `Cache-Control: public, s-maxage`, purge API |
+| Next.js server | Data fetched by Server Components | Everyone (per server or shared) | `'use cache'`, `cacheLife`, tags |
+| App memory | A `Map` or LRU in the Nest process | One process | Your code |
+| **Redis** | Availability, public profile, rate limit counters | All processes | Your code |
+| Postgres | Materialized views, its own memory (shared buffers) | Everyone | SQL, `refresh materialized view` |
+
+Two things to notice:
+
+- **The closer to the user, the faster, and the harder to invalidate.** You can delete a Redis key in a millisecond. You can't delete a response from a user's browser at all; you can only wait for it to expire.
+- **App memory isn't shared.** With 3 API instances, each has its own copy, and deleting it in one doesn't delete it in the others. That's why most backends use Redis: one shared cache for all instances.
+
+## Cache patterns
+
+| Pattern | How it works | Used for |
+| --- | --- | --- |
+| **Cache-aside** (lazy loading) | App checks the cache; on a miss, reads the database and writes the cache | Most app caching. **This section uses it** |
+| Read-through | Same, but a library does the "on a miss" part | `@nestjs/cache-manager` with a loader, CDNs |
+| Write-through | Every write updates the database **and** the cache | Data that must be fresh in the cache right away |
+| Write-behind | Writes go to the cache, saved to the database later | Counters (page views, clicks): fast, but can lose data |
+
+Cache-aside in pseudocode:
+
+```typescript
+async function getProfile(slug: string) {
+  const cached = await cache.get(`profile:${slug}`);
+  if (cached) return cached;                         // hit
+
+  const profile = await db.loadProfile(slug);        // miss: do the real work
+  await cache.set(`profile:${slug}`, profile, { ttlSeconds: 300 });
+  return profile;
+}
+
+async function updateBusiness(slug: string, data: unknown) {
+  await db.update(slug, data);
+  await cache.delete(`profile:${slug}`);             // invalidate AFTER the write
+}
+```
+
+Its strengths: only data that is actually read gets cached, and if the cache is down, the app still works (just slower). Its weakness: the first request after a miss is slow, and invalidation is your job.
+
+## How stale can it be?
+
+This is a **product** question, not a technical one. For the booking platform:
+
+| Data | Cache? | Max staleness | Why |
+| --- | --- | --- | --- |
+| Public business profile and services | Yes | Minutes, with invalidation on change | Changes rarely, read on every booking page visit |
+| Availability (free slots) | Yes | 30–60 seconds, with invalidation on booking changes | Read very often; a stale slot only means "this slot was just taken" (the exclusion constraint still protects you) |
+| An owner's booking list | No | 0 | Per user, changes often, owners expect to see a new booking right away |
+| Session and "is this user still allowed?" | No (or seconds) | ~0 | Logout and role changes must take effect now ([Auth Lesson 3](/docs/auth-security/lesson-3-refresh-tokens)) |
+| Price at payment time | No | 0 | Money: always read the database |
+| Google's public keys (JWKS) | Yes | Hours | The OIDC library already caches them |
+| Mini-build A: short code → URL | Yes | Long, with invalidation | Read millions of times, almost never changes |
+
+Notice the availability row. Caching it is safe **because the guarantee is somewhere else**. The cache only decides what the customer **sees**; the database decides what can be **booked**. Never let a cache be the thing that enforces a rule.
+
+## TTL and invalidation
+
+**TTL** (time to live) means the copy is deleted automatically after a time. There are three common ways to keep a cache correct:
+
+| Strategy | How | Good | Bad |
+| --- | --- | --- | --- |
+| **TTL only** | Every key expires after N seconds | Simple; can't go stale forever | Stale for up to N seconds after a change |
+| **Delete on write** | After a write, delete the affected keys | Fresh quickly | You must know every key a write affects; races (Lesson 3) |
+| **Versioned keys** | Put a version number in the key; a write increases the version | One write invalidates many keys; no race | Old keys stay until their TTL ends (uses some memory) |
+
+The rule used in this section: **always set a TTL, even when you also invalidate.** If your invalidation code has a bug (and at some point it will), the TTL limits how long the data stays wrong.
+
+Add **jitter**: instead of exactly 300 seconds, use 300 plus a random 0–30 seconds. Then thousands of keys created at the same moment (after a deploy, for example) don't all expire at the same moment.
+
+## HTTP caching
+
+The cheapest request is one that never reaches your server. HTTP has caching built in, controlled by response headers.
+
+### `Cache-Control`
+
+| Directive | Meaning |
+| --- | --- |
+| `max-age=60` | Browser (and CDN) can reuse it for 60 seconds without asking |
+| `s-maxage=300` | Same, but only for shared caches (CDN); overrides `max-age` there |
+| `public` | Shared caches (CDN) may store it |
+| `private` | Only the user's browser may store it, never a CDN |
+| `no-cache` | May store it, but must check with the server (revalidate) before each reuse |
+| `no-store` | Don't store it anywhere |
+| `stale-while-revalidate=300` | After `max-age`, still use the old copy for up to 300 s while fetching a new one in the background |
+
+`no-cache` doesn't mean "don't cache". It means "always check first". `no-store` means "don't cache". This is a common interview trick question.
+
+For the booking API:
+
+```typescript
+// Public profile: anyone, a little stale is fine
+@Get('public/businesses/:slug')
+@Header('Cache-Control', 'public, max-age=60, stale-while-revalidate=300')
+getPublicProfile(@Param('slug') slug: string) { ... }
+```
+
+```typescript
+// Everything behind login: never in a shared cache
+// src/common/no-store.middleware.ts, or set it in an interceptor for all /v1 routes except public ones
+res.setHeader('Cache-Control', 'private, no-store');
+```
+
+<Callout type="warn" title="Personal data in a CDN">
+If a response that depends on the user's cookie is cached with `public`, the CDN serves **user A's bookings to user B**. This has happened at real companies. Responses behind login get `private, no-store` (or at least `private`). Make that the default, and opt in to `public` route by route.
+</Callout>
+
+### `ETag` and `304 Not Modified`
+
+An **ETag** is a short fingerprint of the response. The browser sends it back in `If-None-Match`; if nothing changed, the server answers `304 Not Modified` with no body. It saves bandwidth, not database work (the server still builds the response to compare it). Express adds weak ETags to responses automatically, so Nest already does this for JSON.
+
+You used ETags for **optimistic locking** in [PostgreSQL Lesson 8](/docs/postgresql/lesson-8-prisma) (`If-Match`, 412). Same header, different job: `If-None-Match` is for caching, `If-Match` is for safe updates.
+
+### `Vary`
+
+`Vary: Accept-Language` tells caches "this response is different for each `Accept-Language` value". If your public profile returns translated text, you need it, or the CDN serves the Bengali page to an English visitor.
+
+## A note on Next.js caching
+
+Next.js has its own cache for data fetched on the server. In Next.js 16 you turn on `cacheComponents` in `next.config` and mark functions or components with the `'use cache'` directive, set how long with `cacheLife('minutes')`, and label entries with `cacheTag('business-' + slug)`. A Server Action or route handler then calls `revalidateTag` (or `updateTag` for "read your own write") to invalidate.
+
+For the booking platform, the rule is simple: the **API** owns the data and its Redis cache; the Next.js cache is an extra layer for public pages only. Check the Next.js docs for the exact API: it has changed in every major version.
+
+## Understand it: a small in-memory cache
+
+Before Redis, build one yourself. It shows every idea in this lesson in 30 lines.
+
+```typescript
+// src/common/memory-cache.ts
+export class MemoryCache<V> {
+  private readonly entries = new Map<string, { value: V; expiresAt: number }>();
+
+  constructor(
+    private readonly maxEntries = 1_000,
+    private readonly now: () => number = Date.now,     // inject time for tests (Testing Lesson 5)
+  ) {}
+
+  get(key: string): V | undefined {
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= this.now()) {
+      this.entries.delete(key);                         // expired: treat as a miss
+      return undefined;
+    }
+    // Map keeps insertion order: move to the end = "recently used"
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+    return entry.value;
+  }
+
+  set(key: string, value: V, ttlMs: number): void {
+    this.entries.delete(key);
+    this.entries.set(key, { value, expiresAt: this.now() + ttlMs });
+    if (this.entries.size > this.maxEntries) {
+      const oldest = this.entries.keys().next().value!; // first key = least recently used
+      this.entries.delete(oldest);
+    }
+  }
+
+  delete(key: string): void {
+    this.entries.delete(key);
+  }
+}
+```
+
+That's an **LRU** (least recently used) cache with TTL. In real code, use the `lru-cache` package, which does the same thing faster and with more options. An in-memory LRU is still useful as a tiny first layer in front of Redis for very hot data (a few seconds of TTL), but remember: it isn't shared between instances.
+
+### Hit ratio
+
+The **hit ratio** is hits ÷ (hits + misses). A cache with a 20% hit ratio adds a Redis round trip to 80% of requests and saves little. Log or count hits and misses from the first day (Lesson 3 does this), so you know whether a cache is worth keeping.
+
+## Mistakes to avoid
+
+- Caching before measuring, or caching to hide a missing index.
+- A cache that **enforces** a rule ("the slot is free because the cache says so").
+- No TTL, so a bug in invalidation means stale data forever.
+- Thinking `no-cache` means "don't cache" (it's `no-store`).
+- `public` on a response that depends on the user's cookie.
+- Caching data per user that is rarely read twice (low hit ratio, more memory).
+- Using app memory as "the cache" with several instances, and invalidating only one of them.
+- All keys expiring at the same moment (no jitter).
+
+## Exercises
+
+- **1.1** 🟢 For each of these, decide: cache or not? Where (HTTP, Redis, nowhere)? How long? How is it invalidated? `GET /v1/public/businesses/:slug`, `GET /v1/staff/:id/availability`, `GET /v1/bookings`, `GET /v1/me`, `GET /v1/services` (owner dashboard), `POST /v1/bookings`, Google's JWKS. Write your answers as a table.
+- **1.2** 🟢 Add `Cache-Control: public, max-age=60, stale-while-revalidate=300` to the public profile and `private, no-store` as the default for every other route. Check with `curl -i`. Then explain in two sentences why a route behind login needs `private` when a CDN is in front of the API.
+- **1.3** 🟡 Measure the availability endpoint before caching: `autocannon -c 20 -d 10`, and `EXPLAIN (ANALYZE, BUFFERS)` of its query. Write down requests per second, p50 and p99. Keep the numbers: you'll compare them after Lesson 3.
+- **1.4** 🔴 Write `MemoryCache` yourself (don't copy), with unit tests: a hit, a miss, expiry at the exact boundary (inject `now`), the LRU eviction order, and that `get` makes an entry "recently used". Then list two problems you'd have if the booking API used it with 3 instances behind a load balancer.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"When would you add a cache, and what are the risks?"**
+
+> "I add a cache when data is read much more often than it changes and it's expensive to compute, and only after I've measured and fixed the query itself, because a cache shouldn't hide a missing index. The main risk is stale data, so first I decide with the product how stale each piece of data can be. For example, a business's public profile can be a few minutes old, but a customer's booking list or a price at payment time can't be cached at all. I usually use cache-aside with Redis: read from the cache, on a miss load from the database and store it with a TTL, and invalidate after writes. I always keep a TTL as a safety net, and I never let the cache enforce a rule; in my booking API the database constraint decides what can be booked, the cache only decides what's shown."
+
+**"What's the difference between `no-cache` and `no-store`?"**
+
+> "`no-store` means don't keep a copy anywhere. `no-cache` means you can keep a copy, but you must check with the server before using it, usually with an ETag, and the server can answer 304 Not Modified. For anything behind login I use `private, no-store`, so a CDN never stores one user's data and serves it to another."

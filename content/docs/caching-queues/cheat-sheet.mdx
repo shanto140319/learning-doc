@@ -1,0 +1,130 @@
+---
+title: "Cheat sheet"
+description: "One page to revise caching, Redis, rate limiting and BullMQ before an interview."
+---
+
+## Caching: the four questions
+
+1. Is it really slow? (measure, `EXPLAIN ANALYZE`, fix the query first)
+2. Where? Browser → CDN → Next.js → app memory → **Redis** → Postgres
+3. How stale may it be? (a **product** decision, per piece of data)
+4. How is it updated? TTL only · delete on write · **versioned keys**
+
+- Cache-aside: get → miss → load → set with TTL; invalidate **after commit**
+- Always a TTL (+ jitter), even with invalidation
+- The cache never enforces a rule (the exclusion constraint does)
+- Don't cache: per-user lists, sessions/roles, prices at payment
+- Hit ratio = hits ÷ (hits + misses); measure it
+
+## HTTP caching
+
+- `public, max-age=60, stale-while-revalidate=300` for public pages
+- `private, no-store` as the default behind login (never `public` with cookies)
+- `no-cache` = store but revalidate; `no-store` = don't store
+- `ETag` + `If-None-Match` → 304 (saves bandwidth, not work); `If-Match` → 412 (optimistic locking)
+- `Vary` when the response depends on a header
+
+## Redis
+
+- In memory · one command at a time (**atomic**) · optional expiry · Valkey = open-source fork
+- String (cache, `INCR`), hash, list, set, **sorted set** (sliding window, delayed jobs), stream, pub/sub
+- `SET k v EX 60 NX`; `SET` without `EX` removes the TTL; `TTL` → -1 no expiry, -2 no key
+- Keys: `purpose:v1:entity:{businessId}:...`; **tenant in the key**; no emails in keys
+- Several steps atomically: one command > Lua (`EVAL`) > `MULTI`; pipelines are just faster, not atomic
+- `SCAN` + `UNLINK`, never `KEYS *`
+- Eviction: cache `allkeys-lru`, queue **`noeviction`** → two instances
+- Persistence: cache none; queue AOF `everysec`
+- Never public; password/ACL; `rediss://` (TLS)
+- ioredis: `error` listener, `quit()` on shutdown; cache client fails fast (`maxRetriesPerRequest: 2`), BullMQ uses `null`
+- Locks: `SET NX PX` + token + Lua release; can expire mid-work → for efficiency only; correctness = DB constraints
+
+## Caching in NestJS
+
+- `CacheInterceptor` keys by URL only → **leaks across tenants** (`X-Business-Id`)
+- Own `CacheService.getOrSet`: JSON, jitter, single-flight, Redis down = miss
+- Cache response shapes (ISO strings), not Prisma objects with `Date`s
+- Negative cache: `null` for 30 s; compare the raw string to `null`
+- Stale-write race: reader loads old data, writer deletes, reader writes old data back → **versioned keys** fix it
+- Stampede: jitter · single-flight · Redis lock · stale-while-revalidate · refresh ahead
+
+## Rate limiting
+
+- Shared counters in Redis (`@nest-lab/throttler-storage-redis`)
+- Fixed window (edge burst ×2) · sliding log (exact, memory) · sliding counter (approx.) · token bucket (bursts + steady rate)
+- Check + increment atomically (Lua)
+- Key by IP, user, hashed email, API key, **tenant**
+- 429 + `Retry-After`, problem+json
+- Redis down: general → **fail open**; login/reset/SMS/money → **fail closed** (503)
+- Floods: CDN/WAF/gateway, not app code
+
+## BullMQ
+
+- Queue · job (name, data, opts, ID) · producer (API) · worker (separate process)
+- States: waiting · delayed · prioritized · active · completed · failed · waiting-children
+- `BullModule.forRootAsync({ connection })` + `registerQueue({ name, defaultJobOptions })`
+- `@InjectQueue` + `add(name, data, opts)`; `@Processor(name, { concurrency })` + `WorkerHost.process(job)`
+- Processors only in the **worker** module; `createApplicationContext` + `enableShutdownHooks`
+- Return → completed; throw → retry with backoff; `UnrecoverableError` → failed now
+- `attempts`, `backoff: exponential`, `removeOnComplete`, `removeOnFail`
+- Typed jobs: discriminated union + `never` check
+- **At least once**: retries, stalled jobs (lock 30 s), duplicate adds → idempotent jobs
+- Idempotency: `jobId` (no `:`; only while the job exists) + state check + unique constraint
+- Data: IDs not objects, small, JSON, `businessId`, secrets only when unavoidable (remove on complete, never log)
+- `limiter` (per queue), `priority`, flows, progress, `QueueEvents`, sandboxed processors
+
+## Emails and the outbox
+
+- Auth emails: `AuthEmails` keeps its methods; inside, `queue.add`
+- Escape every user value in HTML; no new lines in subjects
+- Dual write (Postgres + Redis) can't be atomic → **outbox** row in the booking transaction
+- Relay: `for update skip locked` → `addBulk` with `evt-{id}` → `published_at`; every 1 s (scheduler)
+- Events queue → one job per effect (email, cache, reminder, webhooks)
+- Handler reads the **current** state (order isn't guaranteed)
+- Format times in the **business's** time zone (`Intl.DateTimeFormat` `timeZone`)
+- Duplicate window: crash after send, before recording → accept, or provider idempotency key
+- Production: SES / Postmark / Resend; SPF, DKIM, DMARC; handle bounces
+
+## Delayed and scheduled jobs
+
+- Rules as a pure function with `now`
+- Delayed job per booking: works, but the plan lives only in Redis (data loss, rule changes, cancel bugs)
+- **Sweeper**: every 5 min, query Postgres for due work (partial index) → jobs with `reminder-{id}-{startsAtMs}` → worker re-checks
+- Reschedule: reset `reminder_sent_at`; new start = new job ID
+- `upsertJobScheduler(id, { every } | { pattern, tz }, template)`: once per run across all workers
+- `@Cron` runs on **every** instance; old `repeat` option → job schedulers
+- "07:00 local": run every 15 min in UTC, `now() at time zone time_zone`, a window (7–11), `last_summary_on` (local date)
+- Half-hour zones (Kolkata +5:30), DST (New York 07:00 = 12:00 UTC winter, 11:00 UTC summer)
+- Cleanup jobs in batches
+- Tests: `TestClock`, pass `now` into SQL; no fake timers for BullMQ delays; `job.promote()`
+
+## Reliability
+
+- Final failure → `failed_jobs` in Postgres (no token data) + alert; replay with a new job ID
+- Backoff with a cap and **jitter**: `settings.backoffStrategy` + `backoff: { type: 'custom' }`
+- Timeouts on every outside call (`AbortSignal.timeout`)
+- CPU-heavy → sandboxed processor (or the lock isn't renewed → runs twice)
+- Graceful shutdown: `worker.close()` waits; `stop_grace_period` > longest job
+- Two Redis: `redis-queue` (AOF, `noeviction`; also rate limits) and `redis-cache` (`allkeys-lru`)
+- Bull Board behind auth; metrics: **lag**, failed, waiting; request ID in job data
+- Cluster: prefix with a hash tag `{bull}`
+
+## Testing
+
+- Redis container in global setup; `/{JEST_WORKER_ID}` database per worker; `flushdb` with `resetDb`
+- Unit: call `process()` / the service with fakes
+- Integration: idempotency (run twice → one effect), cache hit/miss/invalidate, two businesses, Redis down
+- E2E: API + `WorkerModule` in the test, fake `Mailer`, `eventually` (longer timeout), close the worker
+- Fast retries: backoff from env (`QUEUE_BACKOFF_MS=10`)
+
+## Top interview questions
+
+1. When do you add a cache, and what are the risks? → measure first; staleness per data; TTL + invalidation; never the source of truth.
+2. How do you keep a cache consistent? → invalidate after commit; versioned keys; TTL safety net.
+3. What's a cache stampede? → many misses at once; jitter, single-flight, lock, stale-while-revalidate.
+4. Design a rate limiter. → keys, Redis, algorithms, Lua, 429 + `Retry-After`, fail open/closed, edge limits.
+5. Why a job queue? → don't make users wait; retries; separate scaling; at-least-once.
+6. How do you make jobs idempotent? → job IDs, state checks, unique constraints; data = IDs.
+7. Send an email only if the booking was saved? → transactional outbox + relay + idempotent consumer.
+8. Reminder 24 h before an appointment? → sweeper with Postgres as truth; job IDs with start time; re-check.
+9. Scheduled tasks on many servers? → BullMQ job scheduler, not in-process cron; local time zones via SQL.
+10. Design a webhook delivery system. → outbox → deliveries table → queue; HMAC + timestamp; SSRF; backoff + jitter; dead letters + replay; at least once, no ordering; auto-disable.

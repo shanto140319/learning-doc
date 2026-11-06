@@ -1,0 +1,448 @@
+---
+title: "Lesson 3: Integration tests with a real Postgres (Testcontainers)"
+description: "Why database tests need real PostgreSQL, Testcontainers vs a docker-compose test database, a Jest global setup that starts Postgres and runs Prisma migrations, one database per Jest worker from a template, resetting data between tests, test data factories, and repository tests for the exclusion constraint and tenant rules."
+---
+
+Your most important rules live in PostgreSQL: the `bookings_no_overlap` exclusion constraint, unique emails, composite foreign keys, `for update` on the last owner. A unit test with a mocked repository can't prove any of them. An **integration test** runs your repository against a **real** database and checks what really happens.
+
+## Why not SQLite or an in-memory fake?
+
+| Option | Problem |
+| --- | --- |
+| SQLite instead of Postgres | No `tstzrange`, no exclusion constraints, no `timestamptz`, different errors. Tests pass, production fails |
+| `pg-mem` (Postgres emulated in JavaScript) | Doesn't support everything (extensions like `btree_gist`, RLS, many functions) |
+| Mocked Prisma | Tests your mocks, not your queries |
+| **Real PostgreSQL 18 in Docker** | Same version and behaviour as production. A few seconds to start |
+
+Rule: **test against the same database you run in production.**
+
+## Docker Compose or Testcontainers?
+
+| | Test database in `docker-compose.yml` | **Testcontainers** |
+| --- | --- | --- |
+| Start | You run `docker compose up` first | The tests start a fresh container themselves |
+| State | Data stays between runs unless you clean it | New, empty database every run |
+| Ports | Fixed (`5433`), can clash | Random free port |
+| CI | Needs a service container in the workflow | Works anywhere Docker runs (GitHub's Ubuntu runners have it) |
+| Speed | No start-up cost | 2–5 seconds to start (once per run, not per test) |
+
+Use **Testcontainers**: `npm run test:int` works on a fresh clone with only Docker running, which is exactly what a reviewer will try.
+
+## The plan
+
+```
+npm run test:int
+  │
+  ├─ globalSetup (once)
+  │    1. start postgres:18-alpine in Docker
+  │    2. run `prisma migrate deploy` into a "template" database
+  │    3. copy it into one database per Jest worker: booking_test_1, booking_test_2, ...
+  │
+  ├─ each worker (in parallel)
+  │    DATABASE_URL = .../booking_test_<JEST_WORKER_ID>
+  │    before each test: truncate all tables
+  │
+  └─ globalTeardown (once): stop the container
+```
+
+Why one database per worker? Jest runs test **files** in parallel, in several worker processes. If two files share one database, one file's `truncate` deletes the other file's data in the middle of a test, and tests fail randomly. Postgres can copy a database very quickly with `create database ... template ...`, so each worker gets its own.
+
+## The Jest config for integration tests
+
+Create `test/jest-int.json`:
+
+```json
+{
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": "..",
+  "roots": ["<rootDir>/src", "<rootDir>/test"],
+  "testRegex": ".*\\.(int|e2e)-spec\\.ts$",
+  "transform": { "^.+\\.(t|j)s$": "ts-jest" },
+  "testEnvironment": "node",
+  "globalSetup": "<rootDir>/test/setup/global-setup.ts",
+  "globalTeardown": "<rootDir>/test/setup/global-teardown.ts",
+  "setupFiles": ["<rootDir>/test/setup/env.ts"],
+  "clearMocks": true,
+  "restoreMocks": true,
+  "testTimeout": 30000
+}
+```
+
+- Integration tests end in `.int-spec.ts` and sit next to the code (`bookings.repository.int-spec.ts`). API tests (Lesson 4) end in `.e2e-spec.ts` in `test/`. Both need the database, so they share this config.
+- The default `npm test` config only matches `.spec.ts`, so unit tests stay fast and don't need Docker. (`x.int-spec.ts` doesn't match `\.spec\.ts$`, because of the `-`.)
+
+## Global setup: start Postgres, migrate, copy
+
+```typescript
+// test/setup/global-setup.ts
+import { execSync } from 'node:child_process';
+import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
+import { Client } from 'pg';
+import type { Config } from '@jest/types';
+
+declare global {
+  var __PG_CONTAINER__: StartedPostgreSqlContainer | undefined;
+}
+
+export default async function globalSetup(globalConfig: Config.GlobalConfig): Promise<void> {
+  const container = await new PostgreSqlContainer('postgres:18-alpine')   // same major version as production
+    .withDatabase('booking_template')
+    .withUsername('test')
+    .withPassword('test')
+    .start();
+  globalThis.__PG_CONTAINER__ = container;          // only globalTeardown can read this
+
+  const templateUrl = container.getConnectionUri();
+
+  // Apply every migration, including your custom SQL (btree_gist, the exclusion constraint, checks)
+  execSync('npx prisma migrate deploy', {
+    env: { ...process.env, DATABASE_URL: templateUrl },
+    stdio: 'inherit',
+  });
+
+  // One copy per worker. Connect to the "postgres" database: you can't copy a database you're connected to.
+  const admin = new Client({ connectionString: withDatabase(templateUrl, 'postgres') });
+  await admin.connect();
+  const workers = globalConfig.maxWorkers;           // Jest starts at most this many workers
+  for (let i = 1; i <= workers; i++) {
+    await admin.query(`create database booking_test_${i} template booking_template`);
+  }
+  await admin.end();
+
+  // Child processes (the workers) inherit process.env
+  process.env.TEST_DATABASE_URL_BASE = templateUrl;
+}
+
+export function withDatabase(url: string, database: string): string {
+  const u = new URL(url);
+  u.pathname = `/${database}`;
+  return u.toString();
+}
+```
+
+```typescript
+// test/setup/global-teardown.ts
+export default async function globalTeardown(): Promise<void> {
+  await globalThis.__PG_CONTAINER__?.stop();
+}
+```
+
+`pg` is the driver under `@prisma/adapter-pg`. If `import { Client } from 'pg'` fails, install it directly: `npm i pg` and `npm i -D @types/pg`. Never import a package you didn't install yourself; it can disappear in a future update.
+
+### Each worker: point at its own database
+
+`setupFiles` run in every worker before any test file, so this is where `DATABASE_URL` is set:
+
+```typescript
+// test/setup/env.ts
+import { withDatabase } from './global-setup';
+
+const base = process.env.TEST_DATABASE_URL_BASE;
+if (!base) throw new Error('Run integration tests with: npm run test:int');
+
+process.env.DATABASE_URL = withDatabase(base, `booking_test_${process.env.JEST_WORKER_ID ?? '1'}`);
+process.env.NODE_ENV = 'test';
+process.env.TZ = 'UTC';                      // the same time zone on every machine (Lesson 5)
+process.env.THROTTLE_DISABLED = 'true';      // rate limits off, except in their own tests (Lesson 4)
+
+// Every variable your Zod EnvSchema needs (Lesson 4 starts the whole app). Fake values only.
+process.env.APP_URL = 'http://localhost:3001';
+process.env.JWT_SECRET = 'test-jwt-secret-that-is-at-least-32-characters';
+process.env.COOKIE_SECRET = 'test-cookie-secret-that-is-at-least-32-chars';
+process.env.SMTP_URL = 'smtp://localhost:1025';
+process.env.GOOGLE_CLIENT_ID = 'test-client-id';
+process.env.GOOGLE_CLIENT_SECRET = 'test-client-secret';
+process.env.GOOGLE_REDIRECT_URI = 'http://localhost:3000/v1/auth/google/callback';
+process.env.ENCRYPTION_KEY = Buffer.alloc(32, 1).toString('base64');
+```
+
+Importing `withDatabase` from `global-setup.ts` is fine: it doesn't start anything when imported, only when Jest calls the default function.
+
+### The script
+
+```json
+"test:int": "jest --config test/jest-int.json"
+```
+
+Run it with Docker Desktop open. The first run downloads the `postgres:18-alpine` image (about 100 MB), so it's slow once.
+
+<Callout title="Faster local runs">
+Testcontainers can **reuse** a running container between runs: add `.withReuse()` and set the environment variable `TESTCONTAINERS_REUSE_ENABLE=true` on your machine (never in CI). The global setup must then drop old `booking_test_*` databases before creating them. Try it only after everything works without it.
+</Callout>
+
+## A Prisma client for tests
+
+```typescript
+// test/setup/db.ts
+import { PrismaPg } from '@prisma/adapter-pg';
+import { PrismaClient } from '../../src/generated/prisma/client';
+import type { PrismaService } from '../../src/database/prisma.service';
+
+export function createTestPrisma(): PrismaClient {
+  const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL!, max: 5 });
+  return new PrismaClient({ adapter });
+}
+
+/** Repositories expect PrismaService. It's the same client plus lifecycle hooks, so this cast is safe in tests. */
+export const asPrismaService = (prisma: PrismaClient) => prisma as unknown as PrismaService;
+```
+
+## Resetting data between tests
+
+Each test must start from a known state. Options:
+
+| Strategy | How | Good | Bad |
+| --- | --- | --- | --- |
+| **Truncate before each test** | `truncate ... restart identity cascade` on every table | Simple, works with any code, including code that opens its own transactions | ~5–20 ms per test |
+| Transaction rollback | Start a transaction, run the test inside it, roll back | Very fast | Breaks when the code under test commits or uses its own transaction (yours does: booking + outbox) |
+| Unique data, never clean | Every test creates its own business and only reads that business's rows | Fastest, fully parallel | Tests can't check "the table has exactly 1 row" |
+| New database per test file | `create database ... template` in `beforeAll` | Total isolation | Slower; more setup code |
+
+Use **truncate**. It's the easiest to get right. Combine it with the "unique data" habit anyway (each test makes its own business), because it also catches tenant bugs.
+
+```typescript
+// test/setup/db.ts (continued)
+let tableList: string | undefined;
+
+export async function resetDb(prisma: PrismaClient): Promise<void> {
+  // Read the table names once from the catalog (not from user input, so building SQL here is safe)
+  tableList ??= (
+    await prisma.$queryRaw<{ tablename: string }[]>`
+      select tablename from pg_tables
+      where schemaname = 'public' and tablename <> '_prisma_migrations'`
+  ).map((t) => `"public"."${t.tablename}"`).join(', ');
+
+  await prisma.$executeRawUnsafe(`truncate table ${tableList} restart identity cascade`);
+}
+```
+
+Two things to know:
+
+- Your `audit_events` table is append-only: you revoked `update` and `delete` from the app role ([Auth Lesson 9](/docs/auth-security/lesson-9-audit-and-2fa)). `truncate` is a separate privilege, and the tests connect as the container's superuser, so this works. In production, the app role has no `truncate`.
+- A superuser **bypasses row-level security**. If you test RLS ([PostgreSQL Lesson 10](/docs/postgresql/lesson-10-multi-tenancy-and-scaling)), create a `booking_app` role in the global setup and run those tests as that role, or the policies never run.
+
+## Factories: test data that's easy to read
+
+In Lesson 2, builders made plain objects. **Factories** insert real rows, with sensible defaults, and return them:
+
+```typescript
+// test/factories.ts
+import { faker } from '@faker-js/faker';
+import type { PrismaClient, Role } from '../src/generated/prisma/client';
+
+export function factories(prisma: PrismaClient) {
+  const f = {
+    business: (data: { name?: string; timeZone?: string } = {}) =>
+      prisma.business.create({
+        data: {
+          name: data.name ?? faker.company.name(),
+          slug: faker.helpers.slugify(faker.company.name()).toLowerCase() + '-' + faker.string.alphanumeric(6),
+          timeZone: data.timeZone ?? 'Asia/Dhaka',
+        },
+      }),
+
+    user: (data: { email?: string; name?: string } = {}) =>
+      prisma.user.create({
+        data: {
+          email: (data.email ?? faker.internet.email()).toLowerCase(),
+          name: data.name ?? faker.person.fullName(),
+          emailVerifiedAt: new Date(),
+        },
+      }),
+
+    member: async (businessId: string, role: Role) => {
+      const user = await f.user();
+      await prisma.membership.create({ data: { businessId, userId: user.id, role } });
+      return user;
+    },
+
+    staff: (businessId: string, userId: string | null = null) =>
+      prisma.staff.create({ data: { businessId, userId, name: faker.person.fullName() } }),
+
+    service: (businessId: string, data: { durationMinutes?: number; priceCents?: number } = {}) =>
+      prisma.service.create({
+        data: {
+          businessId,
+          name: faker.commerce.productName(),
+          durationMinutes: data.durationMinutes ?? 30,
+          priceCents: data.priceCents ?? 2_000,
+        },
+      }),
+
+    customer: (businessId: string) =>
+      prisma.customer.create({
+        data: { businessId, email: faker.internet.email().toLowerCase(), name: faker.person.fullName() },
+      }),
+
+    /** A business with an owner, one staff member (who is also a user) and one 30-minute service. */
+    salon: async () => {
+      const business = await f.business();
+      const owner = await f.member(business.id, 'owner');
+      const staffUser = await f.member(business.id, 'staff');
+      const staff = await f.staff(business.id, staffUser.id);
+      const service = await f.service(business.id);
+      return { business, owner, staffUser, staff, service };
+    },
+  };
+  return f;
+}
+```
+
+- `faker` makes values unique, so unique constraints don't clash between rows. Don't use random values for things the test **checks**: if a test checks the price, pass `priceCents: 2_500` explicitly.
+- A **scenario** factory like `salon()` creates a whole small world in one line. Most tests start with `const a = await f.salon(); const b = await f.salon();`: two businesses, so you can always check that `b` can't see `a`'s data.
+- If a test fails only sometimes and you suspect the random data, set `faker.seed(123)` at the top of the file to get the same values every run.
+
+## Testing the repository
+
+```typescript
+// src/bookings/bookings.repository.int-spec.ts
+import { createTestPrisma, asPrismaService, resetDb } from '../../test/setup/db';
+import { factories } from '../../test/factories';
+
+const prisma = createTestPrisma();
+const f = factories(prisma);
+const repo = new BookingsRepository(asPrismaService(prisma));
+
+const at = (time: string) => new Date(`2099-01-01T${time}:00Z`);
+
+beforeEach(() => resetDb(prisma));
+afterAll(() => prisma.$disconnect());
+
+describe('BookingsRepository.create', () => {
+  async function book(salon: Awaited<ReturnType<typeof f.salon>>, from: string, to: string, staffId = salon.staff.id) {
+    return repo.create({
+      businessId: salon.business.id,
+      serviceId: salon.service.id,
+      staffId,
+      customerEmail: 'rahim@test.dev',
+      startsAt: at(from),
+      endsAt: at(to),
+      priceCents: 2_000,
+    });
+  }
+
+  it('saves a booking and creates the customer', async () => {
+    const salon = await f.salon();
+
+    const booking = await book(salon, '10:00', '10:30');
+
+    const saved = await prisma.booking.findUniqueOrThrow({ where: { id: booking.id }, include: { customer: true } });
+    expect(saved).toMatchObject({ status: 'confirmed', startsAt: at('10:00'), endsAt: at('10:30') });
+    expect(saved.customer.email).toBe('rahim@test.dev');
+  });
+
+  it('rejects an overlapping booking for the same staff member with SLOT_TAKEN', async () => {
+    const salon = await f.salon();
+    await book(salon, '10:00', '10:30');
+
+    await expect(book(salon, '10:15', '10:45')).rejects.toMatchObject({ code: 'SLOT_TAKEN', statusCode: 409 });
+    expect(await prisma.booking.count()).toBe(1);
+  });
+
+  it('allows back-to-back bookings (touching ends)', async () => {
+    const salon = await f.salon();
+    await book(salon, '10:00', '10:30');
+
+    await expect(book(salon, '10:30', '11:00')).resolves.toBeDefined();
+  });
+
+  it('allows the same time for a different staff member', async () => {
+    const salon = await f.salon();
+    const otherStaff = await f.staff(salon.business.id);
+    await book(salon, '10:00', '10:30');
+
+    await expect(book(salon, '10:00', '10:30', otherStaff.id)).resolves.toBeDefined();
+  });
+
+  it('frees the slot when the booking is cancelled', async () => {
+    const salon = await f.salon();
+    const first = await book(salon, '10:00', '10:30');
+    await repo.cancel(salon.business.id, first.id);
+
+    await expect(book(salon, '10:00', '10:30')).resolves.toBeDefined();
+  });
+
+  it('writes an outbox event in the same transaction', async () => {
+    const salon = await f.salon();
+    const booking = await book(salon, '10:00', '10:30');
+
+    const events = await prisma.outboxEvent.findMany();
+    expect(events).toEqual([expect.objectContaining({ type: 'booking.created', aggregateId: booking.id })]);
+  });
+});
+```
+
+(Adjust `outboxEvent`, `type` and `aggregateId` to the names in your own schema from the PostgreSQL project.)
+
+Look at what these tests prove that Lesson 2 couldn't: the constraint exists, the `[start, end)` bounds are right, the `where status <> 'cancelled'` part of the constraint works, the error is mapped to `SLOT_TAKEN`, and the outbox row is written with the booking.
+
+### Tenant rules belong here too
+
+`visibleBookings(actor)` builds a Prisma `where`. A unit test could only check the object it returns. Here you check what it **finds**:
+
+```typescript
+describe('BookingsRepository.findOne (tenant and role rules)', () => {
+  it('does not find another business’s booking', async () => {
+    const a = await f.salon();
+    const b = await f.salon();
+    const booking = await bookAt(a, '10:00');
+
+    const ownerOfB = actor(b.business.id, b.owner.id, 'owner');
+    expect(await repo.findOne(ownerOfB, booking.id)).toBeNull();
+  });
+
+  it('lets staff see only their own bookings', async () => {
+    const salon = await f.salon();
+    const colleague = await f.staff(salon.business.id, (await f.member(salon.business.id, 'staff')).id);
+    const mine = await bookAt(salon, '10:00');
+    const theirs = await bookAt(salon, '11:00', colleague.id);
+
+    const me = actor(salon.business.id, salon.staffUser.id, 'staff');
+    expect(await repo.findOne(me, mine.id)).not.toBeNull();
+    expect(await repo.findOne(me, theirs.id)).toBeNull();
+  });
+});
+```
+
+(`bookAt` and `actor` are two-line helpers you write at the top of the file: exercise 3.3.)
+
+## How fast is it?
+
+On a normal laptop: 3–6 seconds to start the container and migrate, then 10–50 ms per test. 200 integration tests finish in well under a minute. If yours are much slower, check:
+
+- Are you starting a container **per file** instead of once? (Look for `new PostgreSqlContainer` outside the global setup.)
+- Are you running `prisma migrate deploy` per file? Do it once, then copy with `template`.
+- Is the Prisma client created per test? Create it once per file.
+- Did you forget `prisma.$disconnect()` in `afterAll`? Jest then waits and prints "Jest did not exit one second after the test run has completed".
+
+## Mistakes to avoid
+
+- Testing against SQLite or a mock "because it's faster". The constraint you care about doesn't exist there.
+- Sharing one database between parallel Jest workers.
+- Using `prisma db push` in tests instead of `migrate deploy`: your custom SQL migration (the exclusion constraint) is skipped, and tests pass without the constraint.
+- Tests that depend on data from an earlier test, or on the seed script.
+- Random data in values the test checks.
+- Forgetting `afterAll(() => prisma.$disconnect())`, so Jest never exits.
+- Running integration tests with `npm test` by mistake and wondering why they need Docker. Keep the two configs separate.
+- Testing RLS as the superuser (RLS is skipped for superusers).
+
+## Exercises
+
+- **3.1** 🟢 Set up `test/jest-int.json`, the global setup and teardown, `env.ts` and `db.ts`. Write one test: `select 1` through Prisma returns 1. Run `npm run test:int` and write the start-up time in your notes.
+- **3.2** 🟡 Write `test/factories.ts` and the `BookingsRepository.create` tests. **See them fail:** write a new migration that drops `bookings_no_overlap`, apply it in the test run, and check which tests turn red. Then delete that migration.
+- **3.3** 🟡 Write the tenant tests for `findOne`, `list` and `cancel`: an owner of business B can't find, list or cancel a booking of business A, and `cancel` with the wrong business ID changes nothing (check the row afterwards).
+- **3.4** 🔴 Test the **last-owner rule** from [Auth Lesson 6](/docs/auth-security/lesson-6-authorisation): two owners try to remove each other at the same moment (`Promise.all`). Exactly one succeeds and the business still has an owner. Run the test 20 times in a loop inside the test. Then remove `for update` from the code and see if the test catches it. (It might not catch it every time: write down why, and what that tells you about race tests. Lesson 5 comes back to this.)
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you test code that uses the database?"**
+
+> "I test it against a real PostgreSQL, the same version as production, because my most important rules are in the database: an exclusion constraint that prevents double bookings, unique indexes and foreign keys. A mock or SQLite can't prove those. I use Testcontainers: a Jest global setup starts Postgres in Docker, runs the Prisma migrations once into a template database, and then copies it into one database per Jest worker, so tests can run in parallel without touching each other. Before each test I truncate the tables, and I create test data with small factory functions, usually two businesses, so every test can also check that one tenant can't see the other's data. The whole suite runs in under a minute locally and in CI."
+
+**"Mock the database or use a real one?"**
+
+> "For repositories and anything that depends on constraints or transactions, a real one. Mocking the database client only proves that my code calls the methods I told the mock to expect. For service logic above the repository, I do mock the repository in unit tests, because there I'm testing my rules, not the database. So it's both, at different layers."

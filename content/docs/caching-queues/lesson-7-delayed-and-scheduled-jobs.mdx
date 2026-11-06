@@ -1,0 +1,285 @@
+---
+title: "Lesson 7: Delayed and scheduled jobs"
+description: "Booking reminders two ways: a delayed job per booking (and removing or moving it on cancel and reschedule) vs a sweeper that treats Postgres as the source of truth; job IDs that change on reschedule; the reminder rules as a pure function; BullMQ job schedulers (every, cron pattern, time zone) vs in-process cron; recurring jobs at 07:00 in each business's own time zone, DST and catch-up; cleanup jobs; and testing time-based jobs."
+---
+
+The booking platform's reminder rule:
+
+> Send the customer a reminder **24 hours before** the booking starts. Not if it's cancelled. Not twice. If it's rescheduled, remind them about the **new** time.
+
+It sounds like one line of code. It's actually the best interview question in this section, because every simple answer has a hole.
+
+## The rules as a pure function
+
+Start with the decision, without any queue. A pure function with `now` as a parameter is easy to test ([Testing Lesson 2](/docs/testing/lesson-2-unit-tests)):
+
+```typescript
+// src/reminders/reminder-rules.ts
+export const REMIND_BEFORE_MS = 24 * 3600_000;
+export const TOO_LATE_MS = 2 * 3600_000;
+
+type BookingForReminder = {
+  status: 'pending' | 'confirmed' | 'cancelled';
+  startsAt: Date;
+  createdAt: Date;
+  reminderSentAt: Date | null;
+};
+
+export type ReminderDecision = 'send' | 'wait' | 'skip';
+
+export function reminderDecision(b: BookingForReminder, now: Date): ReminderDecision {
+  if (b.status !== 'confirmed') return 'skip';
+  if (b.reminderSentAt) return 'skip';                                       // already sent
+  if (b.startsAt.getTime() - b.createdAt.getTime() < REMIND_BEFORE_MS) return 'skip';   // booked late: the confirmation is enough
+  const msUntilStart = b.startsAt.getTime() - now.getTime();
+  if (msUntilStart < TOO_LATE_MS) return 'skip';                             // too close (or in the past)
+  if (msUntilStart > REMIND_BEFORE_MS) return 'wait';                        // not yet
+  return 'send';
+}
+```
+
+The product decisions are now visible and testable: a booking made 10 hours ahead gets no reminder (it just got a confirmation); a reminder that's more than 22 hours late isn't sent at all.
+
+## Option 1: a delayed job per booking
+
+When the booking is created, add a job that waits until 24 hours before:
+
+```typescript
+// in the booking.created event handler (Lesson 6)
+const booking = await this.prisma.booking.findFirstOrThrow({ where: { id: bookingId, businessId } });
+const delay = booking.startsAt.getTime() - REMIND_BEFORE_MS - this.clock.now().getTime();
+if (delay > 0) {
+  await this.reminders.add(
+    'send',
+    { businessId, bookingId, startsAt: booking.startsAt.toISOString() },
+    { jobId: `reminder-${bookingId}`, delay },
+  );
+}
+```
+
+On cancel, remove it:
+
+```typescript
+const removed = await this.reminders.remove(`reminder-${bookingId}`);   // 1 if removed, 0 if not found or running
+```
+
+On reschedule, move it: `const job = await this.reminders.getJob(id)` then `await job?.changeDelay(newDelay)` (only works while the job is still delayed), or remove it and add a new one.
+
+And **in the worker**, check again, because the remove can fail or come too late:
+
+```typescript
+// src/reminders/reminders.processor.ts
+async process(job: Job<{ businessId: string; bookingId: string; startsAt: string }>) {
+  const { businessId, bookingId, startsAt } = job.data;
+  const booking = await this.prisma.booking.findFirst({ where: { id: bookingId, businessId } });
+  if (!booking) return;
+  if (booking.startsAt.toISOString() !== startsAt) return;           // rescheduled since: this job is stale
+  if (reminderDecision(booking, this.clock.now()) !== 'send') return;
+
+  await this.bookingEmails.sendReminder(booking);                     // sends, then sets reminderSentAt
+}
+```
+
+This works, and BullMQ handles delays well (delayed jobs are a sorted set ordered by run time). But think about what can go wrong when a delay is **three weeks** long:
+
+| Problem | Why it hurts |
+| --- | --- |
+| Redis loses data (a restart without AOF, a failover, someone runs `FLUSHALL`) | Every future reminder is gone, and nothing notices |
+| The rule changes ("remind 48 hours before") | Existing jobs still fire at 24 hours |
+| A bug in the cancel or reschedule path | The job fires anyway (the worker check saves you only if you wrote it) |
+| Millions of future bookings | Millions of jobs in Redis memory |
+| The booking was created when Redis was down | No job was ever added |
+
+The root problem: the **plan** ("send at 10:00 tomorrow") lives only in Redis, while the **truth** (the booking) lives in Postgres. They can disagree.
+
+## Option 2: the sweeper (Postgres is the source of truth)
+
+Instead of a job per booking, run one **scheduled** job every 5 minutes that asks Postgres: "which bookings need a reminder now?". Then add one short-lived job for each.
+
+```typescript
+// src/reminders/reminder-sweeper.processor.ts
+@Processor(REMINDER_SWEEP, { concurrency: 1 })
+export class ReminderSweeperProcessor extends WorkerHost {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly clock: Clock,
+    @InjectQueue(REMINDERS) private readonly reminders: Queue,
+  ) {
+    super();
+  }
+
+  async process(): Promise<{ queued: number }> {
+    const now = this.clock.now();
+    const due = await this.prisma.$queryRaw<{ id: string; business_id: string; starts_at: Date }[]>`
+      select id, business_id, starts_at
+      from bookings
+      where status = 'confirmed'
+        and reminder_sent_at is null
+        and starts_at >  ${now}::timestamptz + interval '2 hours'
+        and starts_at <= ${now}::timestamptz + interval '24 hours'
+        and starts_at - created_at >= interval '24 hours'
+      order by starts_at
+      limit 1000`;
+
+    await this.reminders.addBulk(
+      due.map((b) => ({
+        name: 'send',
+        data: { businessId: b.business_id, bookingId: b.id, startsAt: b.starts_at.toISOString() },
+        opts: { jobId: `reminder-${b.id}-${b.starts_at.getTime()}` },   // new start time = new job
+      })),
+    );
+    return { queued: due.length };
+  }
+}
+```
+
+The partial index from [PostgreSQL Lesson 4](/docs/postgresql/lesson-4-indexes) makes this query cheap even with millions of bookings:
+
+```sql
+create index bookings_reminder_due_idx on bookings (starts_at)
+  where status = 'confirmed' and reminder_sent_at is null;
+```
+
+How each problem from Option 1 disappears:
+
+| Problem | Sweeper |
+| --- | --- |
+| Redis loses data | The next sweep (≤ 5 minutes) finds the same bookings again |
+| The rule changes | Change the SQL (and `reminderDecision`); it applies to all bookings immediately |
+| Cancel or reschedule | Nothing to remove: a cancelled booking doesn't match the query |
+| Millions of future bookings | Only the ones due in the next 5 minutes are in Redis |
+| Created while Redis was down | It's in Postgres; the sweep finds it |
+
+Why the job ID includes `starts_at`: the reschedule sets `reminder_sent_at = null` (in the same transaction that moves the booking). If the reminder for the **old** time was already sent and its job is still in Redis (`removeOnComplete` keeps it for a day), a job ID of only `reminder-{bookingId}` would make BullMQ **ignore** the new one. With the start time in the ID, the new time gets a new job.
+
+The cost: reminders are up to 5 minutes late ("24 hours before" becomes "23 hours 55 minutes to 24 hours before"). Nobody minds.
+
+<Callout title="The pattern, not just reminders">
+"Postgres holds what should happen; a scheduled sweeper turns it into jobs" works for many things: expiring unpaid bookings after 15 minutes, retrying failed webhooks (the practice project), sending a review request after the appointment. It's the same idea as the outbox: **the database is the truth, the queue is just the delivery mechanism.** You can combine both options: delayed jobs for precise timing, plus the sweeper as a safety net.
+</Callout>
+
+## Job schedulers
+
+The sweeper, the outbox relay (Lesson 6) and cleanup tasks all run on a schedule. BullMQ's **job schedulers** create the jobs:
+
+```typescript
+// src/scheduling/schedules.ts (provided only in the worker)
+@Injectable()
+export class Schedules implements OnModuleInit {
+  constructor(
+    @InjectQueue(OUTBOX) private readonly outbox: Queue,
+    @InjectQueue(REMINDER_SWEEP) private readonly sweep: Queue,
+    @InjectQueue(MAINTENANCE) private readonly maintenance: Queue,
+  ) {}
+
+  async onModuleInit() {
+    const done = { removeOnComplete: true, removeOnFail: 50 };
+
+    await this.outbox.upsertJobScheduler('outbox-relay', { every: 1_000 }, { name: 'relay', opts: done });
+    await this.sweep.upsertJobScheduler('reminder-sweep', { every: 5 * 60_000 }, { name: 'sweep', opts: done });
+    await this.maintenance.upsertJobScheduler(
+      'outbox-cleanup',
+      { pattern: '15 3 * * *', tz: 'UTC' },                  // cron: 03:15 UTC every day
+      { name: 'outbox-cleanup', opts: done },
+    );
+  }
+}
+```
+
+- `every` (milliseconds) or `pattern` (cron syntax: minute, hour, day of month, month, day of week) with an optional `tz`.
+- **`upsert`**: calling it on every worker start creates the scheduler once, or updates it. Safe with several workers.
+- **One job per run, however many workers you have.** The schedule lives in Redis, not in the process.
+- Renamed a scheduler? The old one is still in Redis: remove it with `removeJobScheduler('old-id')`. List them with `getJobSchedulers()`.
+
+<Callout type="warn" title="In-process cron runs on every instance">
+`@nestjs/schedule`'s `@Cron()` runs inside each process. With 3 API instances, a `@Cron('0 7 * * *')` that sends daily summaries sends **three** of each. A BullMQ job scheduler runs once. Older BullMQ code uses `queue.add(name, data, { repeat: { pattern } })` ("repeatable jobs"); job schedulers replaced it in BullMQ 5.
+</Callout>
+
+## Recurring jobs in each business's time zone
+
+New feature: every owner gets a **daily summary** ("You have 7 bookings today") at **07:00 in their business's time zone**.
+
+You can't make one cron per business (thousands of schedulers, and the time zone can change). Instead, run one scheduler every 15 minutes in UTC and let Postgres work out who is due:
+
+```sql
+-- businesses where it's between 07:00 and 11:59 local time, and today's summary isn't sent yet
+select id, (now() at time zone time_zone)::date as local_date
+from businesses
+where extract(hour from now() at time zone time_zone) between 7 and 11
+  and (last_summary_on is null or last_summary_on < (now() at time zone time_zone)::date);
+```
+
+Then add one job per business with `jobId: summary-{businessId}-{localDate}`, and the job sets `last_summary_on = localDate` after sending.
+
+Why every 15 minutes, and why a window (7 to 11) instead of exactly 7:
+
+- Some time zones aren't whole hours: India is UTC+5:30, Nepal UTC+5:45. A job at exactly :00 UTC never sees 07:00 local there.
+- **Catch-up:** if the worker was down at 07:00 (a deploy, an outage), the summary still goes out at 07:15 or 08:00, instead of being skipped for the day.
+- `last_summary_on` (a **local** date) makes it idempotent: one summary per business per local day.
+
+### DST
+
+For `America/New_York`, 07:00 local is **12:00 UTC** in winter (UTC−5) and **11:00 UTC** in summer (UTC−4). On 2027-03-14 the clocks jump from 02:00 to 03:00, so 07:00 that day is already 11:00 UTC. `now() at time zone time_zone` handles this because Postgres knows the time zone rules. For `Asia/Dhaka` (UTC+6, no DST), 07:00 is always 01:00 UTC.
+
+If you **do** use a cron `pattern` with `tz` (for one platform-wide report, say), avoid times between 01:00 and 03:00 in zones with DST: on the spring-forward day 02:30 doesn't exist, and on the fall-back day 01:30 happens twice.
+
+## Cleanup jobs
+
+Background work creates data that must be cleaned up:
+
+```typescript
+// src/maintenance/maintenance.processor.ts
+case 'outbox-cleanup':
+  await this.prisma.$executeRaw`delete from outbox where published_at < now() - interval '7 days'`;
+  return;
+case 'expired-tokens':
+  await this.prisma.$executeRaw`delete from one_time_tokens where expires_at < now() - interval '1 day'`;
+  return;
+```
+
+For very large tables, delete in batches (`... where id in (select id ... limit 5000)`, repeated) so one huge `delete` doesn't lock and bloat the table ([PostgreSQL Lesson 9](/docs/postgresql/lesson-9-migrations-and-operations)).
+
+## Deduplication and debouncing
+
+Sometimes many events should cause **one** job. For example, an owner edits 20 working-hour slots in a row, and each edit would recalculate a staff member's cached availability. BullMQ's `deduplication` option (`{ deduplication: { id: 'recalc-' + staffId, ttl: 5_000 } }`) ignores new adds with the same ID while the first is still pending or within the TTL. Check the BullMQ docs for the exact modes: this API has changed in recent versions (it used to be called `debounce`).
+
+## Testing time-based jobs
+
+- **Rules:** `reminderDecision` with a test table, exact boundaries (24 h, 2 h), a booking made 23 hours ahead.
+- **The sweeper query:** an integration test with a `TestClock` ([Testing Lesson 5](/docs/testing/lesson-5-time-mocks-and-races)): create bookings at known times relative to the clock, run `process()`, check which jobs were added. Because the query uses the clock's `now` (passed in), not Postgres's `now()`, the test controls time.
+- **The daily summary:** set the clock (pass `now` into the query instead of `now()`) to `2027-03-14T11:00:00Z` and check that the New York business is due and the Dhaka business isn't.
+- **Don't** fake timers for BullMQ delays: delays are stored in Redis and checked by the worker against real time. In tests, add a tiny delay, or call `await job.promote()` to make a delayed job run now.
+
+## Mistakes to avoid
+
+- A delayed job as the only record that a reminder must be sent.
+- Not checking the booking again in the worker (cancelled or moved since the job was planned).
+- A job ID that stays the same after a reschedule (the new reminder is ignored).
+- `@Cron()` in a process that runs on several instances.
+- One cron per business, or a cron at exactly `0 7 * * *` UTC for "07:00 local".
+- Forgetting half-hour time zones and DST.
+- No catch-up: a scheduler that only runs at one exact moment skips work after an outage.
+- Old schedulers left in Redis after renaming them.
+- Cleanup jobs that delete millions of rows in one statement.
+- Faking Jest timers to test BullMQ delays.
+
+## Exercises
+
+- **7.1** 🟢 Write `reminderDecision` and a test table with at least 8 rows: confirmed and due, too early, too late (1 hour before), exactly 24 hours before, exactly 2 hours before, cancelled, already sent, booked 10 hours ahead. Decide what "exactly" should do at each boundary and make the tests say it.
+- **7.2** 🟡 Build the reminder sweeper: the partial index, the scheduler every 5 minutes, the reminders processor with the stale-job check, `sendReminder` that sets `reminderSentAt`, and the reschedule resetting `reminder_sent_at` in its transaction. Test by hand with bookings starting 23 hours from now (the clock in `.env`, or real time). Reschedule one after its reminder was sent: does the new reminder go out?
+- **7.3** 🟡 Build Option 1 (a delayed job per booking) on a branch. Cancel a booking, reschedule one, then run `FLUSHALL` in `redis-cli` (on your local Redis only!). Compare with the sweeper: which reminders are lost? Then change the rule to 48 hours in both versions: which bookings get the new rule?
+- **7.4** 🔴 Build the daily summary: `last_summary_on` (a `date` column), the 15-minute scheduler, the query, the job and the email. Write integration tests with a `TestClock` for: a Dhaka business at `2027-01-15T01:00:00Z` (due), a New York business at `2027-03-14T11:00:00Z` (due: why?), the same New York business at `2027-03-13T11:00:00Z` (not due: why?), a Kolkata business (UTC+5:30), and "the worker was down from 06:00 to 08:30 local".
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How would you send a reminder 24 hours before each appointment?"**
+
+> "The simple approach is a delayed job per booking, scheduled when the booking is created. It works, but the plan lives only in Redis: if Redis loses data, or the reminder rule changes, or a cancel doesn't remove the job, the reminders are wrong. So I treat Postgres as the source of truth. A scheduled job runs every five minutes and queries for confirmed bookings starting in the next 24 hours that haven't had a reminder, using a partial index, and adds one job per booking with a job ID made of the booking ID and its start time. The reminder job loads the booking again, checks it's still confirmed and at the same time, sends the email and sets `reminder_sent_at`. Cancelled bookings simply don't match the query, rescheduled ones get a new job ID, and if Redis is wiped, the next sweep recovers everything. The reminders can be a few minutes late, which is fine."
+
+**"How do you run a scheduled task when your app runs on several servers?"**
+
+> "Not with an in-process cron, because every instance would run it. I use a BullMQ job scheduler, which is stored in Redis and creates one job per run however many workers there are, and the job itself is idempotent in case it runs twice. For things like 'at 7 a.m. in each customer's time zone', I run one scheduler every 15 minutes and let the database find who is due in their local time, with a column that records the local date it last ran. That handles half-hour time zones, daylight saving and catching up after an outage."

@@ -1,0 +1,391 @@
+---
+title: "Lesson 8: Reliability, monitoring and testing"
+description: "What can fail in background work and what happens each time, final failures and a dead-letter table with replay, custom backoff with jitter, timeouts and long jobs, graceful shutdown, two Redis instances (cache vs queue) with the right memory and persistence settings, Bull Board, queue metrics and alerts, logs with correlation IDs, and testing: a Redis container per test run, one Redis database per Jest worker, processor unit tests, end-to-end job tests, retries, idempotency and cache tests."
+---
+
+Background work fails **quietly**. When an API request fails, the user sees an error and tells you. When a reminder job fails, nobody sees anything, and you find out a week later from an angry salon owner.
+
+This lesson makes failures **visible** and **recoverable**, makes the Redis setup production-ready, and adds caches and workers to your test suite.
+
+## What can fail
+
+| Failure | What BullMQ does | What you add |
+| --- | --- | --- |
+| The job throws (SMTP down, a bug) | Retries with backoff until attempts run out, then `failed` | Good backoff; a record of final failures; an alert |
+| A problem retrying can't fix | Retries anyway (wasted attempts) | `UnrecoverableError` |
+| The worker crashes mid-job | The lock expires; the job is **stalled** and runs again (after `maxStalledCount`, default 1, it fails) | Idempotent jobs (Lesson 5) |
+| The job blocks the event loop (CPU-heavy code) | The lock can't be renewed → stalled → runs **twice at the same time** | Sandboxed processors or splitting the work |
+| A job hangs forever (an HTTP call with no timeout) | Nothing: it stays `active`, using a concurrency slot | Timeouts in your code |
+| Redis is down | Producers' `add` throws; workers wait and reconnect | The outbox (Lesson 6); fail-open/closed choices (Lesson 4) |
+| Redis loses data | Jobs are gone | AOF persistence; the sweeper (Lesson 7) and the outbox to rebuild |
+| An outside service is down for hours | Retries use up all attempts in minutes | Long backoff (up to hours), and a way to replay |
+
+## Final failures and dead letters
+
+Many queue systems have a **dead-letter queue** (DLQ): where messages go when they can't be processed. In BullMQ, jobs that use up their attempts stay in the `failed` state (for as long as `removeOnFail` keeps them). That's a DLQ of sorts, but it lives in Redis and gets cleaned up. For anything important, record final failures in **Postgres**:
+
+```prisma
+model FailedJob {
+  id         BigInt    @id @default(autoincrement())
+  queue      String
+  jobId      String    @map("job_id")
+  name       String
+  data       Json?                                   // null for jobs that contain secrets
+  error      String
+  attempts   Int
+  failedAt   DateTime  @default(now()) @map("failed_at") @db.Timestamptz(3)
+  replayedAt DateTime? @map("replayed_at") @db.Timestamptz(3)
+
+  @@index([queue, failedAt(sort: Desc)])
+  @@map("failed_jobs")
+}
+```
+
+```typescript
+// src/queues/dead-letters.ts
+@Injectable()
+export class DeadLetters {
+  private readonly logger = new Logger(DeadLetters.name);
+
+  constructor(private readonly prisma: PrismaService) {}
+
+  isFinal(job: Job, err: Error): boolean {
+    return err instanceof UnrecoverableError || job.attemptsMade >= (job.opts.attempts ?? 1);
+  }
+
+  async record(queue: string, job: Job, err: Error, opts: { keepData: boolean }) {
+    this.logger.error(`job ${queue}/${job.id} (${job.name}) failed for good: ${err.message}`);
+    await this.prisma.failedJob.create({
+      data: {
+        queue, jobId: String(job.id), name: job.name,
+        data: opts.keepData ? job.data : undefined,
+        error: err.stack ?? err.message,
+        attempts: job.attemptsMade,
+      },
+    });
+  }
+}
+```
+
+```typescript
+// in each processor
+@OnWorkerEvent('failed')
+async onFailed(job: Job | undefined, err: Error) {
+  if (!job || !this.deadLetters.isFinal(job, err)) return;
+  await this.deadLetters.record(EMAILS, job, err, { keepData: !['verify-email', 'password-reset'].includes(job.name) });
+}
+```
+
+**Replay** is just adding the job again: `queue.add(row.name, row.data, { jobId: row.jobId + '-replay-' + row.id })`, then set `replayedAt`. A new job ID is needed because the old one may still exist in Redis. Expose it to platform admins only (an admin endpoint, or the Bull Board "retry" button for jobs still in Redis).
+
+Jobs without data (tokens) can't be replayed, and don't need to be: the user asks for a new link.
+
+## Better backoff: longer and with jitter
+
+`{ type: 'exponential', delay: 5_000 }` with 5 attempts covers about a minute. That's fine for "SMTP blipped". It's useless when a customer's webhook server is down for three hours. And if 1,000 jobs failed at the same moment, they all retry at the same moment too, and hit the recovering server together.
+
+A custom strategy with a cap and **jitter**:
+
+```typescript
+// src/queues/backoff.ts
+/** 30 s, 1 min, 2 min, 4 min ... capped at 6 h, each randomised between 50% and 100%. */
+export function webhookBackoff(attemptsMade: number): number {
+  const base = Math.min(30_000 * 2 ** (attemptsMade - 1), 6 * 3600_000);
+  return Math.round(base / 2 + Math.random() * (base / 2));
+}
+```
+
+```typescript
+@Processor(WEBHOOKS, { concurrency: 20, settings: { backoffStrategy: webhookBackoff } })
+export class WebhooksProcessor extends WorkerHost { ... }
+
+// when adding: { attempts: 12, backoff: { type: 'custom' } }   → retries spread over about 10–15 hours
+```
+
+## Timeouts and long jobs
+
+BullMQ doesn't stop a job that takes too long. Your code must:
+
+```typescript
+const res = await fetch(url, { method: 'POST', body, headers, signal: AbortSignal.timeout(10_000), redirect: 'manual' });
+```
+
+- Every outside call gets a timeout (HTTP, SMTP: Nodemailer has `connectionTimeout` and `socketTimeout`).
+- Prisma queries in workers: the same `statement_timeout` you'd use in the API.
+- **Long jobs** (a 10-minute export): the lock is renewed automatically while the event loop is free. Keep the work async, split it into smaller jobs (a flow), or use a sandboxed processor for CPU-heavy code.
+
+## Graceful shutdown
+
+Deploys stop the old worker. If it's killed mid-job, the job is stalled and runs again (fine, it's idempotent, but slower and noisier). Better: stop taking new jobs, finish the active ones, then exit.
+
+- `app.enableShutdownHooks()` in `worker.ts` (Lesson 5). On `SIGTERM`, Nest closes the module, and `@nestjs/bullmq` calls `worker.close()`, which **waits for active jobs** to finish.
+- The platform must wait long enough. Docker sends `SIGTERM`, waits 10 seconds by default, then kills the process. Set it to longer than your longest normal job:
+
+```yaml
+worker:
+  build: .
+  command: ["node", "dist/worker"]
+  stop_grace_period: 60s
+```
+
+(Kubernetes: `terminationGracePeriodSeconds`. AWS ECS: `stopTimeout`. Month 3.)
+
+On Windows, closing a terminal or `Stop-Process` doesn't send `SIGTERM` the same way, so test shutdown with Docker (exercise 8.4).
+
+## Two Redis instances
+
+From Lesson 2: a cache wants `allkeys-lru` and doesn't need persistence; a queue needs `noeviction` and AOF. One instance can't be both. Split them:
+
+```yaml
+# docker-compose.yml
+services:
+  redis-queue:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    ports: ["127.0.0.1:6379:6379"]
+    volumes: ["redis-queue-data:/data"]
+
+  redis-cache:
+    image: redis:8-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports: ["127.0.0.1:6380:6379"]
+
+volumes:
+  redis-queue-data:
+```
+
+```text
+QUEUE_REDIS_URL=redis://localhost:6379     # BullMQ, rate-limit counters
+CACHE_REDIS_URL=redis://localhost:6380     # CacheService
+```
+
+`REDIS_URL` from the earlier lessons is replaced by these two: `RedisModule` (the cache client) reads `CACHE_REDIS_URL`; `QueuesModule` and the throttler's storage read `QUEUE_REDIS_URL`.
+
+Rate-limit counters go on the **queue** instance: they're small and expire by themselves, and you don't want memory pressure in the cache to evict a login counter and give an attacker fresh attempts.
+
+In the cloud, these are two managed Redis (or Valkey) instances, with a replica for the queue one. BullMQ also warns at startup if the eviction policy isn't `noeviction`: don't ignore that warning.
+
+<Callout title="Redis Cluster">
+If you ever use Redis **Cluster** (data split over several nodes), BullMQ needs all keys of one queue on the same node: give the queue a prefix with a "hash tag", like `prefix: '{bull}'`. You won't need Cluster for a long time; know it exists.
+</Callout>
+
+## Seeing what's happening
+
+### Bull Board
+
+A web dashboard for queues: counts per state, job data, errors and stack traces, retry and remove buttons.
+
+```typescript
+// src/admin/queues-board.module.ts (imported by the API's AppModule)
+import { BullBoardModule } from '@bull-board/nestjs';
+import { ExpressAdapter } from '@bull-board/express';
+import { BullMQAdapter } from '@bull-board/api/bullMQAdapter';
+
+@Module({
+  imports: [
+    BullBoardModule.forRoot({ route: '/admin/queues', adapter: ExpressAdapter, middleware: basicAuth() }),
+    BullBoardModule.forFeature(
+      { name: EMAILS, adapter: BullMQAdapter },
+      { name: EVENTS, adapter: BullMQAdapter },
+      { name: REMINDERS, adapter: BullMQAdapter },
+      { name: WEBHOOKS, adapter: BullMQAdapter },
+    ),
+  ],
+})
+export class QueuesBoardModule {}
+```
+
+`basicAuth()` is a small Express middleware that checks a username and password from env vars with `timingSafeEqual`. The dashboard shows job data (emails, sometimes tokens) and can delete jobs: it's an **admin** tool. Never public, never with a default password; in production, only reachable from a private network or VPN if you can.
+
+### Metrics and alerts
+
+Three numbers tell you almost everything about a queue:
+
+```typescript
+const counts = await queue.getJobCounts('waiting', 'active', 'delayed', 'failed');
+const [oldest] = await queue.getJobs(['waiting'], 0, 0, true);          // oldest waiting job
+const lagSeconds = oldest ? (Date.now() - oldest.timestamp) / 1000 : 0;
+```
+
+| Metric | Alert when | Means |
+| --- | --- | --- |
+| **Lag** (age of the oldest waiting job) | Over a few minutes | Workers are down, stuck or too few |
+| **Failed** (new final failures) | Any for important queues | A bug, or an outside service is down |
+| **Waiting** count | Growing for a long time | Work comes in faster than workers finish it |
+
+Until Month 3 (observability), log these every minute from a scheduled job, and check `failed_jobs` daily. The log line is enough to notice "the emails queue has been lagging for 20 minutes".
+
+### Logs that connect
+
+A request creates a booking; a minute later a worker sends an email. To follow one booking through both, put the **request ID** ([NestJS Lesson 8](/docs/nestjs/lesson-8-logging-and-health), AsyncLocalStorage) into the outbox payload and job data, and log it with every job line: `requestId`, `queue`, `jobId`, `name`, `attempt`. Never log the whole `job.data`.
+
+## Testing caches and workers
+
+Since Lesson 5, `AppModule` imports `QueuesModule`, so **even the API tests need Redis**. Add a Redis container next to Postgres in the Testing section's global setup.
+
+### Global setup and env
+
+```typescript
+// test/setup/global-setup.ts (add to the existing function)
+import { RedisContainer } from '@testcontainers/redis';
+
+const redis = await new RedisContainer('redis:8-alpine').start();
+globalThis.__REDIS_CONTAINER__ = redis;
+process.env.TEST_REDIS_URL_BASE = redis.getConnectionUrl();    // redis://localhost:<random port>
+```
+
+```typescript
+// test/setup/global-teardown.ts
+await globalThis.__REDIS_CONTAINER__?.stop();
+```
+
+```typescript
+// test/setup/env.ts: one Redis database per Jest worker (databases 1–15 exist by default)
+const worker = Number(process.env.JEST_WORKER_ID ?? '1');
+const redisUrl = `${process.env.TEST_REDIS_URL_BASE}/${worker}`;
+process.env.QUEUE_REDIS_URL = redisUrl;
+process.env.CACHE_REDIS_URL = redisUrl;
+process.env.QUEUE_BACKOFF_MS = '10';                            // fast retries in tests
+```
+
+Redis has 16 databases (0–15), so this works up to 15 Jest workers, which is plenty. (Declare `__REDIS_CONTAINER__` in the same `global.d.ts` as `__PG_CONTAINER__`.) Read `QUEUE_BACKOFF_MS` in `QueuesModule` for the backoff delay so tests don't wait 5 seconds per retry.
+
+Reset Redis with Postgres:
+
+```typescript
+// test/setup/db.ts
+export async function resetAll(prisma: PrismaClient, redis: Redis) {
+  await resetDb(prisma);
+  await redis.flushdb();                                        // only this worker's database
+}
+```
+
+### Unit test a processor
+
+A processor's `process()` is a normal method. Call it with a fake job:
+
+```typescript
+// src/emails/booking-emails.spec.ts (a unit test: Prisma and Mailer faked)
+it('does not send a confirmation for a cancelled booking', async () => {
+  prisma.booking.findFirst.mockResolvedValue(aBookingWithRelations({ status: 'cancelled' }));
+
+  await service.sendConfirmation({ businessId: 'b1', bookingId: 'bk1' });
+
+  expect(mailer.send).not.toHaveBeenCalled();
+});
+
+it('throws UnrecoverableError when the booking does not exist', async () => {
+  prisma.booking.findFirst.mockResolvedValue(null);
+  await expect(service.sendConfirmation({ businessId: 'b1', bookingId: 'nope' })).rejects.toBeInstanceOf(UnrecoverableError);
+});
+```
+
+### Integration test: idempotency with a real database
+
+```typescript
+// src/emails/booking-emails.int-spec.ts
+it('sends the confirmation only once when the job runs twice', async () => {
+  const salon = await f.salon();
+  const booking = await f.booking({ salon });
+
+  await bookingEmails.sendConfirmation({ businessId: salon.business.id, bookingId: booking.id });
+  await bookingEmails.sendConfirmation({ businessId: salon.business.id, bookingId: booking.id });
+
+  expect(mailer.send).toHaveBeenCalledTimes(1);
+  const saved = await prisma.booking.findUniqueOrThrow({ where: { id: booking.id } });
+  expect(saved.confirmationSentAt).not.toBeNull();
+});
+```
+
+### End-to-end: API → outbox → worker → email
+
+Start the API **and** the worker in the test, with the `Mailer` faked:
+
+```typescript
+// test/booking-emails.e2e-spec.ts
+let t: Awaited<ReturnType<typeof createTestApp>>;
+let worker: TestingModule;                                      // a TestingModule is an application context
+const mailer = { send: jest.fn().mockResolvedValue(undefined), link: (p: string, tk: string) => `http://app.test${p}#token=${tk}` };
+
+beforeAll(async () => {
+  t = await createTestApp();                                   // now also returns redis: app.get(REDIS)
+  worker = await Test.createTestingModule({ imports: [WorkerModule] })
+    .overrideProvider(Mailer).useValue(mailer)
+    .compile();
+  await worker.init();                                         // starts the BullMQ workers and schedulers
+});
+beforeEach(() => resetAll(t.prisma, t.redis));
+afterAll(async () => {
+  await worker.close();                                        // closes BullMQ workers: no open handles
+  await t.close();
+});
+
+it('emails a confirmation after a public booking', async () => {
+  const salon = await f.salon();
+
+  await request(t.server).post(`/v1/public/businesses/${salon.business.slug}/bookings`).send(validBooking(salon)).expect(201);
+
+  await eventually(() => expect(mailer.send).toHaveBeenCalledTimes(1), 10_000);
+  expect(mailer.send).toHaveBeenCalledWith(salon.customerEmail, expect.objectContaining({ subject: expect.stringContaining('Booking confirmed') }));
+});
+```
+
+Notes:
+
+- `eventually` from [Testing Lesson 4](/docs/testing/lesson-4-api-e2e-tests), with a longer timeout: the relay runs every second.
+- Retries: make `mailer.send` reject once (`mockRejectedValueOnce`), and check it's called twice. With `QUEUE_BACKOFF_MS=10`, it takes milliseconds.
+- Only a few tests like this: they're slow. Most behaviour is tested by calling `process()` or the service directly.
+- **Close the worker** in `afterAll`, or Jest hangs with "open handles" (Redis connections).
+
+### Testing the cache
+
+```typescript
+it('serves availability from the cache until a booking changes it', async () => {
+  const salon = await f.salon();
+  const load = jest.spyOn(availabilityRepo, 'freeSlots');
+
+  await availability.slots(salon.business.id, salon.staff.id, salon.service.id, '2099-01-15');
+  await availability.slots(salon.business.id, salon.staff.id, salon.service.id, '2099-01-15');
+  expect(load).toHaveBeenCalledTimes(1);                        // second call was a hit
+
+  await availability.invalidate(salon.business.id);
+  await availability.slots(salon.business.id, salon.staff.id, salon.service.id, '2099-01-15');
+  expect(load).toHaveBeenCalledTimes(2);                        // version changed: miss
+});
+```
+
+Also test: **two businesses** never share a cached value (the tenant in the key), and with Redis unreachable (`CACHE_REDIS_URL` pointing at a closed port, in a separate test file) the endpoint still returns correct data.
+
+## Mistakes to avoid
+
+- Final failures that only live in Redis and disappear after `removeOnFail`.
+- Saving job data with tokens into the failed-jobs table.
+- A few seconds of backoff for outside services that can be down for hours; no jitter.
+- Outside calls without timeouts.
+- CPU-heavy code in a normal processor (stalled jobs running twice).
+- Default 10-second stop timeout with jobs that take a minute.
+- One Redis for cache and queue; ignoring BullMQ's eviction-policy warning.
+- Bull Board without authentication.
+- No alert on queue lag: the worker has been down since Friday.
+- Tests that share one Redis database between Jest workers, or never close the worker.
+
+## Exercises
+
+- **8.1** 🟢 Add Bull Board at `/admin/queues` with basic auth from env vars. Make a job fail for good (stop Mailpit, attempts 2) and find it in the dashboard: what does it show? Retry it from the dashboard after starting Mailpit.
+- **8.2** 🟡 Add the `failed_jobs` table, `DeadLetters`, the `failed` handlers (without data for token jobs), and `POST /v1/admin/failed-jobs/:id/replay` for platform admins. Replace the webhook queue's backoff with `webhookBackoff` and unit test it: attempt 1 is between 15 and 30 seconds, and no attempt is ever over 6 hours.
+- **8.3** 🟡 Add the Redis container to the test setup, the per-worker database and `resetAll`. Write: the two `BookingEmails` unit tests, the idempotency integration test, the end-to-end confirmation test, a retry test, and the three cache tests (hit then miss after invalidation, two businesses, Redis down). Run the whole suite with `--randomize` three times.
+- **8.4** 🔴 Split Redis into `redis-queue` and `redis-cache`. Run the worker in Docker Compose with a `test` job that takes 20 seconds. Run `docker compose stop worker` while the job runs, first with `stop_grace_period: 60s`, then with `5s`. What happens to the job each time? Check the logs and Bull Board, and explain using what you know about locks and stalled jobs.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you make background jobs reliable in production?"**
+
+> "First, every job is idempotent, because queues deliver at least once: retries and crashed workers mean a job can run twice. Temporary errors retry with exponential backoff and jitter, capped, so a service that's down for hours still gets its retries without everyone retrying at once, and errors that retrying can't fix fail immediately. Every outside call has a timeout. When a job fails for good, I record it in a Postgres table and alert, and an admin can replay it. Workers shut down gracefully, finishing active jobs before a deploy kills them. For Redis, I run the queue on its own instance with `noeviction` and AOF persistence, separate from the cache, and the source of truth stays in Postgres, with the outbox and sweepers able to rebuild jobs. And I monitor queue lag, failed jobs and backlog size, because background failures are silent unless you look."
+
+**"How do you test code that uses a queue?"**
+
+> "Most tests call the job's logic directly: the processor's `process` method or the service behind it, with fakes in unit tests and a real Postgres in integration tests, including running the same job twice to prove it's idempotent. Then a few end-to-end tests start a real Redis with Testcontainers, the API and the worker together, with the email sender faked, and check that creating a booking eventually sends one confirmation. Each Jest worker gets its own Redis database, which I flush before each test, and I use very short backoff delays in tests so retries are fast."

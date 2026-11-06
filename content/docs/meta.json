@@ -6,6 +6,8 @@
     "nestjs",
     "postgresql",
     "auth-security",
+    "testing",
+    "caching-queues",
     "roadmap"
   ]
 }

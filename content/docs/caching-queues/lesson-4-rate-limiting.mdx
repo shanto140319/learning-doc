@@ -1,0 +1,214 @@
+---
+title: "Lesson 4: Rate limiting with Redis"
+description: "Why in-memory rate limits break with several instances, moving @nestjs/throttler to Redis, the four algorithms (fixed window, sliding log, sliding window counter, token bucket) with Lua versions, what to limit by (IP, user, email, API key, tenant), 429 responses and headers, fail-open vs fail-closed when Redis is down, where rate limits belong in the stack, and Mini-build A's limits and redirect cache."
+---
+
+In [Auth Lesson 8](/docs/auth-security/lesson-8-abuse-and-secrets) you added `@nestjs/throttler` with its default **in-memory** storage. That lesson ended with a warning: each API instance counts on its own.
+
+- 3 instances behind a load balancer: a "5 logins per minute" limit really allows 15.
+- Every deploy restarts the processes, and all counters go back to zero.
+
+Rate limit counters must be **shared**, and Redis is the standard place: fast, atomic `INCR`, and keys that expire by themselves.
+
+## Move the throttler to Redis
+
+```typescript
+// app.module.ts
+import { ThrottlerModule, seconds } from '@nestjs/throttler';
+import { ThrottlerStorageRedisService } from '@nest-lab/throttler-storage-redis';
+import Redis from 'ioredis';
+import { REDIS } from './redis/redis.module';
+
+ThrottlerModule.forRootAsync({
+  inject: [ConfigService, REDIS],
+  useFactory: (config: ConfigService<Env, true>, redis: Redis) => ({
+    throttlers: [{ name: 'default', ttl: seconds(60), limit: 100 }],
+    storage: new ThrottlerStorageRedisService(redis),
+    skipIf: () => config.get('THROTTLE_DISABLED', { infer: true }),   // from the Testing section
+  }),
+}),
+```
+
+Nothing else changes: the same `@Throttle()` decorators and the `LoginEmailThrottlerGuard` from the Auth section now count in Redis. Keys look like `{throttler-name}:{hash}`; you don't need to manage them.
+
+To check it works, start two instances (in a second PowerShell terminal: `$env:PORT=3002; npm run start:dev`) and send requests to both: the limit is now shared (exercise 4.1).
+
+## The four algorithms
+
+"Design a rate limiter" is one of the most common system design questions. Know these four:
+
+| Algorithm | How | Good | Bad |
+| --- | --- | --- | --- |
+| **Fixed window** | Count requests per clock window (`10:00:00–10:00:59`); reset at the next window | Simplest; one `INCR` | **Edge burst**: 100 at 10:00:59 + 100 at 10:01:00 = 200 in 2 seconds |
+| **Sliding window log** | Store a timestamp per request; count those in the last 60 s | Exact | Memory grows with the limit (one entry per request) |
+| **Sliding window counter** | Current window count + previous window count × the part of it still inside the last 60 s | Nearly exact, two counters | An approximation |
+| **Token bucket** | A bucket holds N tokens, refilled at R per second; each request takes one | Allows short bursts, smooth average; used by AWS, Stripe | Slightly more state (tokens + last refill time) |
+
+`@nestjs/throttler` uses a fixed window per key (with a block period when the limit is passed). For login and password-reset limits, that's fine. Build the others once to understand them.
+
+### Fixed window in Lua
+
+```typescript
+// src/rate-limit/fixed-window.ts
+import type Redis from 'ioredis';
+
+const FIXED_WINDOW = `
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return { count, redis.call('PTTL', KEYS[1]) }`;
+
+export async function fixedWindow(redis: Redis, key: string, limit: number, windowMs: number) {
+  const windowStart = Math.floor(Date.now() / windowMs) * windowMs;           // the clock window
+  const [count, ttlMs] = (await redis.eval(FIXED_WINDOW, 1, `${key}:${windowStart}`, windowMs)) as [number, number];
+  return { allowed: count <= limit, remaining: Math.max(0, limit - count), retryAfterMs: ttlMs };
+}
+```
+
+### Sliding window log with a sorted set
+
+Each request is a member of a sorted set, with its timestamp as the score:
+
+```typescript
+// src/rate-limit/sliding-log.ts
+const SLIDING_LOG = `
+local key, now, window, limit, member = KEYS[1], tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)        -- drop requests older than the window
+local count = redis.call('ZCARD', key)
+if count >= limit then
+  local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+  return { 0, tonumber(oldest[2]) + window - now }           -- not allowed; ms until the oldest leaves
+end
+redis.call('ZADD', key, now, member)
+redis.call('PEXPIRE', key, window)
+return { 1, 0 }`;
+
+export async function slidingLog(redis: Redis, key: string, limit: number, windowMs: number) {
+  const now = Date.now();
+  const [allowed, retryAfterMs] = (await redis.eval(
+    SLIDING_LOG, 1, key, now, windowMs, limit, `${now}-${Math.random()}`,   // member must be unique
+  )) as [number, number];
+  return { allowed: allowed === 1, retryAfterMs };
+}
+```
+
+Why Lua: "count, then decide, then add" must happen as **one step**. With separate commands, two requests can both see `count = 99` and both get in.
+
+<Callout title="Whose clock?">
+Both scripts use `Date.now()` from the API server. If your servers' clocks differ by a second, limits are slightly off. That's acceptable for rate limiting. If you need one clock, call `redis.call('TIME')` inside the script instead.
+</Callout>
+
+### Token bucket (the idea)
+
+State per key: `tokens` and `updatedAt`. On each request: add `(now - updatedAt) × rate` tokens (up to `capacity`), then take one if `tokens >= 1`. In Lua that's a `HGET`, some arithmetic and a `HSET`, all in one script. Exercise 4.2 is the fixed vs sliding comparison; a token bucket is a good extra if you want one.
+
+## What to limit by
+
+The **key** decides who shares a limit:
+
+| Key | Use | Watch out |
+| --- | --- | --- |
+| IP address | Anonymous traffic, the global limit | Behind proxies, set `trust proxy` correctly ([Auth Lesson 8](/docs/auth-security/lesson-8-abuse-and-secrets)); many users share one IP on mobile networks and offices |
+| User ID | Logged-in API use | Only after authentication |
+| Email (hashed) | Login, forgot password, resend verification | Stops attacks on one account from many IPs |
+| API key | Machine clients ([Auth Lesson 8](/docs/auth-security/lesson-8-abuse-and-secrets)) | Different limits per plan |
+| **Tenant** (business) | Public booking creation, plan limits | One business's traffic must not hurt others ("noisy neighbour") |
+
+Real systems combine several. For the public booking endpoint: per IP (stops one bot) **and** per business (stops a flood against one salon from many IPs).
+
+```typescript
+// src/bookings/public-booking.guard.ts
+@Injectable()
+export class PublicBookingLimitGuard implements CanActivate {
+  constructor(@Inject(REDIS) private readonly redis: Redis) {}
+
+  async canActivate(ctx: ExecutionContext): Promise<boolean> {
+    const req = ctx.switchToHttp().getRequest<Request>();
+    const businessId = req.params.businessId;
+    const result = await fixedWindow(this.redis, `ratelimit:public-booking:biz:${businessId}`, 50, 60 * 60_000);
+    if (!result.allowed) {
+      throw new TooManyRequestsException(Math.ceil(result.retryAfterMs / 1000));   // your problem+json exception
+    }
+    return true;
+  }
+}
+```
+
+## The response
+
+- Status **429 Too Many Requests**, in your problem+json format (`type: .../rate-limited`).
+- A **`Retry-After`** header in seconds. Good clients (and your frontend) wait that long.
+- Optionally, headers that show the limit before it's hit. The throttler sends `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset`; an IETF draft standardises `RateLimit-Policy` and `RateLimit`. Either is fine; be consistent.
+- **Never** different messages for "too many attempts for this email" and "wrong password" that would let someone discover which emails have accounts ([Auth Lesson 1](/docs/auth-security/lesson-1-passwords)).
+
+## When Redis is down: fail open or fail closed?
+
+If the limiter can't reach Redis, it must decide:
+
+| Choice | Behaviour | Use for |
+| --- | --- | --- |
+| **Fail open** | Allow the request, log a warning | General API limits: an outage of the limiter shouldn't become an outage of the product |
+| **Fail closed** | Reject (503) | Login, password reset, sending SMS or emails, anything an attacker can abuse **during** the outage, or that costs money |
+
+```typescript
+async function limitOrDecide(check: () => Promise<{ allowed: boolean }>, failClosed: boolean) {
+  try {
+    return await check();
+  } catch (err) {
+    logger.warn(`rate limiter unavailable: ${(err as Error).message}`);
+    if (failClosed) throw new ServiceUnavailableException();
+    return { allowed: true };
+  }
+}
+```
+
+Check what your library does by default: stop Redis and try (exercise 4.4). This is a great interview detail because most people never think about it.
+
+## Where rate limits belong
+
+Your app isn't the only (or first) place to limit:
+
+1. **Edge / CDN / WAF** (Cloudflare, AWS WAF): stops floods before they reach your servers. Cheap, coarse (per IP).
+2. **API gateway or load balancer** (nginx, AWS API Gateway): per route, per key.
+3. **The app** (this lesson): limits that need business knowledge, like per email, per tenant, per plan.
+
+A DDoS can't be stopped by app code: by the time your Nest app counts the request, it has already used your server. App rate limits are for **abuse and fairness**, not floods.
+
+## Mini-build A: the URL shortener
+
+The URL shortener (Month 2) is mostly this lesson and Lesson 3:
+
+- **Creating links:** limited per API key and per plan (fixed window per hour), so one customer can't create millions of links.
+- **Redirects** (`GET /:code`): the hot path. Cache `code → url` in Redis with a long TTL (cache-aside, invalidated when the link is edited or deleted, negative cache for unknown codes). A redirect should be one Redis `GET` and no Postgres query.
+- **Click counting:** don't write a Postgres row per click on the hot path. `INCR` a per-link-per-day counter in Redis (Lesson 2's view counter), or add each click to a list, and let a scheduled job (Lesson 7) write the totals to Postgres every minute. That's **write-behind**: fast, but if Redis loses data you lose some recent clicks. For analytics, that's usually an acceptable trade-off; say so in the README.
+- **Per-IP redirect limits** to stop scrapers that walk through every code.
+
+## Mistakes to avoid
+
+- In-memory rate limits with more than one instance.
+- `INCR` and `EXPIRE` as two commands (a key that never expires blocks a user forever).
+- "Check, then add" without Lua or another atomic step.
+- Limiting by IP when `trust proxy` is wrong (everyone shares the proxy's IP).
+- Only per-IP limits on login (attackers use many IPs).
+- No per-tenant limit, so one busy or attacked business slows everyone.
+- No `Retry-After` header.
+- Never deciding what happens when Redis is down.
+- Thinking app rate limits protect against DDoS.
+
+## Exercises
+
+- **4.1** 🟢 Move the throttler to Redis. Start two API instances (ports 3000 and 3002). Write a small script that sends 6 failed logins for the same email, alternating between the two ports. With the old in-memory storage, how many get through before 429? With Redis?
+- **4.2** 🟡 Write `fixedWindow` and `slidingLog`. Write a script with a limit of 10 per 10 seconds: wait until just before a window boundary, send 10 requests, then send 10 more just after it. How many does each algorithm allow? Draw (or write) a timeline that explains the difference.
+- **4.3** 🟡 Add `PublicBookingLimitGuard` to the public booking endpoint: 50 per hour per business, plus the global per-IP limit. Return problem+json 429 with `Retry-After`. How would you make the limit depend on the business's plan (free: 50, pro: 500) without a database query on every request?
+- **4.4** 🔴 Decide fail-open or fail-closed for each route in your API and write it down. Implement it: the global limit fails open, login and forgot-password fail closed with 503. Stop Redis and test both. Then check: what does `@nest-lab/throttler-storage-redis` do on its own when Redis is down, before your change?
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How would you design a rate limiter?"**
+
+> "First I'd decide what to limit by: IP for anonymous traffic, user or API key for logged-in clients, and things like email for login and the tenant for fairness between businesses. The counters live in Redis so every API instance shares them. For the algorithm, a fixed window is one atomic `INCR` with an expiry, but it allows a burst at the window edge. A sliding window log with a sorted set is exact but uses more memory, and a token bucket allows short bursts while keeping a steady average rate. The check and the increment must be atomic, so I use a Lua script. Blocked requests get a 429 with a `Retry-After` header. I also decide what happens if Redis is down: general limits fail open so the product keeps working, but login and anything that sends emails or costs money fails closed. And large floods are stopped earlier, at the CDN or gateway, not in the app."

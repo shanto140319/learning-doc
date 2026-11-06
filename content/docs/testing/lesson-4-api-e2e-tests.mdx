@@ -1,0 +1,480 @@
+---
+title: "Lesson 4: API tests with Supertest: auth, roles and tenants"
+description: "Start the whole NestJS app in a test with one shared configureApp function, replace only the edges (email, rate limits), send requests with Supertest, log in with real cookies, test status codes, problem+json errors, validation, cookies and CSRF, a permissions matrix for every role, and other-tenant 404s."
+---
+
+An API test sends a real HTTP request to your **whole** Nest app (guards, pipes, interceptors, filters, services, repositories) running on a real Postgres, and checks the response. It's the test that proves the pieces fit together, as a client sees them:
+
+- the route exists and uses the right guards,
+- the DTO accepts good input and rejects bad input,
+- errors come back as problem+json with the right status,
+- the response doesn't leak private fields,
+- cookies have the right flags,
+- another business gets 404.
+
+Most of your tests for Project 1 should be at this level, plus the repository tests from Lesson 3.
+
+## Step 1: one `configureApp` for production and tests
+
+Some setup lives in `main.ts`, not in `AppModule`: `cookieParser`, `helmet`, versioning, `trust proxy`. If tests don't run the same lines, they test a different app. A classic bug: all tests pass, but in production every route is `/bookings` instead of `/v1/bookings`, or the opposite.
+
+Move that code into one function:
+
+```typescript
+// src/app.setup.ts
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import { VersioningType } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import cookieParser from 'cookie-parser';
+import helmet from 'helmet';
+
+export function configureApp(app: NestExpressApplication): NestExpressApplication {
+  const config = app.get(ConfigService<Env, true>);
+  app.set('trust proxy', 1);                                   // Auth Lesson 8
+  app.use(helmet());
+  app.use(cookieParser(config.get('COOKIE_SECRET', { infer: true })));
+  app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' });
+  app.enableShutdownHooks();
+  return app;
+}
+```
+
+```typescript
+// src/main.ts
+async function bootstrap() {
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bufferLogs: true });
+  configureApp(app);
+  await app.listen(app.get(ConfigService).getOrThrow('PORT'));
+}
+```
+
+Guards, pipes, filters and interceptors registered with `APP_GUARD`, `APP_PIPE`, `APP_FILTER` and `APP_INTERCEPTOR` are already inside `AppModule`, so tests get them automatically. That's another reason to register them that way ([NestJS Lesson 4](/docs/nestjs/lesson-4-request-lifecycle)).
+
+## Step 2: replace only the edges
+
+In API tests, almost everything is real. Replace only what talks to the **outside world** or makes tests flaky:
+
+| Real in API tests | Replaced |
+| --- | --- |
+| Controllers, guards, pipes, filters, services, repositories | Email sending (`AuthEmails`): a fake that records calls |
+| PostgreSQL (Testcontainers) | Rate limits: switched off, except in the rate-limit tests |
+| JWT signing, argon2, cookies | Google, Stripe and other HTTP APIs: MSW (Lesson 5) |
+| The config validation (Zod `EnvSchema`) | The clock, when a test needs a fixed time (Lesson 5) |
+
+### Rate limits in tests
+
+Ten login tests in one file trip your login limit (5 per email per 15 minutes), and the 6th test fails with 429. Make the limit switchable. `@nestjs/throttler` has a `skipIf` option:
+
+```typescript
+// app.module.ts
+ThrottlerModule.forRoot({
+  throttlers: [{ name: 'default', ttl: 60_000, limit: 120 }],
+  skipIf: () => process.env.THROTTLE_DISABLED === 'true',      // read on every request
+}),
+```
+
+Set `THROTTLE_DISABLED=true` in `test/setup/env.ts`. The rate-limit test file sets it to `'false'` in its `beforeAll` and back in `afterAll`. Never set it outside tests.
+
+### A fake for emails
+
+```typescript
+// test/fakes/fake-auth-emails.ts
+export function fakeAuthEmails() {
+  return {
+    sendVerifyEmail: jest.fn<Promise<void>, [to: string, name: string, token: string]>().mockResolvedValue(undefined),
+    sendAlreadyRegistered: jest.fn().mockResolvedValue(undefined),
+    sendPasswordReset: jest.fn<Promise<void>, [to: string, name: string, token: string]>().mockResolvedValue(undefined),
+    sendPasswordChanged: jest.fn().mockResolvedValue(undefined),
+    sendInvite: jest.fn<Promise<void>, [to: string, businessName: string, token: string]>().mockResolvedValue(undefined),
+  } satisfies Record<keyof AuthEmails, unknown>;     // a compile error if AuthEmails gets a new method
+}
+```
+
+The token is an argument, so a test can "click the link" by reading it from `mock.calls`. (Another option: keep the real class and point `SMTP_URL` at a Mailpit container, then read emails from Mailpit's HTTP API. Slower, but it also tests the email text. Do that in one or two tests at most.)
+
+## Step 3: a test app helper
+
+```typescript
+// test/setup/test-app.ts
+import { Test } from '@nestjs/testing';
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import { AppModule } from '../../src/app.module';
+import { configureApp } from '../../src/app.setup';
+import { AuthEmails } from '../../src/auth/auth-emails';
+import { PrismaService } from '../../src/database/prisma.service';
+import { fakeAuthEmails } from '../fakes/fake-auth-emails';
+
+export async function createTestApp() {
+  const emails = fakeAuthEmails();
+
+  const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+    .overrideProvider(AuthEmails)
+    .useValue(emails)
+    .compile();
+
+  const app = configureApp(moduleRef.createNestApplication<NestExpressApplication>({ logger: false }));
+  await app.init();                                  // no listen(): Supertest uses the server directly
+
+  return {
+    app,
+    server: app.getHttpServer(),
+    prisma: app.get(PrismaService),
+    emails,
+    close: () => app.close(),
+  };
+}
+```
+
+- `logger: false` keeps test output clean. Turn it on (`logger: ['error', 'warn']`) when you're debugging a failing test.
+- `app.init()` without `listen()`: Supertest gives requests straight to the HTTP server, with no real port. Tests can't clash on ports.
+- Create the app **once per file** (`beforeAll`), not per test. Starting Nest takes 100–500 ms.
+
+## Step 4: logging in
+
+Your API uses httpOnly cookies. Supertest's `request.agent()` normally keeps cookies between requests, but there's a trap: your cookies are `Secure`, and the agent **won't send a `Secure` cookie over plain `http://`**. Supertest talks plain HTTP, so after login the agent silently sends no cookie, and every request gets 401.
+
+Handle cookies yourself. It's only a few lines, and the test shows exactly what's sent:
+
+```typescript
+// test/setup/auth.ts
+import type { Response } from 'supertest';
+
+/** "a=1; Path=/; HttpOnly", "b=2; ..." → "a=1; b=2" for a Cookie header */
+export function cookieHeader(res: Response): string {
+  const setCookie = (res.get('Set-Cookie') ?? []) as string[];
+  return setCookie.map((c) => c.split(';')[0]).join('; ');
+}
+
+/** Fast login: creates a real session and a real signed JWT, without a password or argon2. */
+export async function loginAs(app: INestApplication, userId: string): Promise<string> {
+  const { accessToken } = await app.get(SessionsService).start(userId, { ip: '127.0.0.1', userAgent: 'jest' });
+  return `access_token=${accessToken}`;
+}
+```
+
+Use the **fast** login in most tests: it signs a real token and creates a real session, so the `AuthGuard` and `MembershipGuard` run for real. Use the **real** `POST /v1/auth/login` only in the login tests themselves.
+
+And a tiny client that sets the headers every logged-in request needs:
+
+```typescript
+// test/setup/client.ts
+import request, { type Test } from 'supertest';
+
+type Auth = { cookie: string; businessId?: string };
+
+export function client(server: unknown, auth?: Auth) {
+  const prepare = (req: Test): Test => {
+    req.set('Origin', process.env.APP_URL!);                  // OriginGuard (Auth Lesson 7) checks unsafe methods
+    if (auth) req.set('Cookie', auth.cookie);
+    if (auth?.businessId) req.set('X-Business-Id', auth.businessId);
+    return req;
+  };
+  const http = request(server as Parameters<typeof request>[0]);
+  return {
+    get: (url: string) => prepare(http.get(url)),
+    post: (url: string) => prepare(http.post(url)),
+    patch: (url: string) => prepare(http.patch(url)),
+    delete: (url: string) => prepare(http.delete(url)),
+  };
+}
+```
+
+## Step 5: the tests
+
+```typescript
+// test/bookings.e2e-spec.ts
+import { createTestApp } from './setup/test-app';
+import { resetDb } from './setup/db';
+import { factories } from './factories';
+import { client } from './setup/client';
+import { loginAs } from './setup/auth';
+
+let t: Awaited<ReturnType<typeof createTestApp>>;
+let f: ReturnType<typeof factories>;
+
+beforeAll(async () => {
+  t = await createTestApp();
+  f = factories(t.prisma);
+});
+beforeEach(() => resetDb(t.prisma));
+afterAll(() => t.close());
+
+async function ownerOf(salon: Awaited<ReturnType<typeof f.salon>>) {
+  return client(t.server, { cookie: await loginAs(t.app, salon.owner.id), businessId: salon.business.id });
+}
+
+const body = (salon: Awaited<ReturnType<typeof f.salon>>, startsAt = '2099-01-01T10:00:00.000Z') => ({
+  serviceId: salon.service.id,
+  staffId: salon.staff.id,
+  customerName: 'Rahim',
+  customerEmail: 'rahim@test.dev',
+  startsAt,
+});
+
+describe('POST /v1/bookings', () => {
+  it('creates a booking (201) with the public fields only', async () => {
+    const salon = await f.salon();
+    const api = await ownerOf(salon);
+
+    const res = await api.post('/v1/bookings').set('Idempotency-Key', crypto.randomUUID()).send(body(salon)).expect(201);
+
+    expect(res.body).toEqual({
+      id: expect.any(String),
+      serviceId: salon.service.id,
+      staffId: salon.staff.id,
+      customerEmail: 'rahim@test.dev',
+      startsAt: '2099-01-01T10:00:00.000Z',
+      endsAt: '2099-01-01T10:30:00.000Z',
+      status: 'confirmed',
+      priceCents: 2_000,
+    });
+  });
+
+  it('returns 409 slot-taken as problem+json for an overlapping time', async () => {
+    const salon = await f.salon();
+    const api = await ownerOf(salon);
+    await api.post('/v1/bookings').set('Idempotency-Key', crypto.randomUUID()).send(body(salon)).expect(201);
+
+    const res = await api
+      .post('/v1/bookings')
+      .set('Idempotency-Key', crypto.randomUUID())
+      .send(body(salon, '2099-01-01T10:15:00.000Z'))
+      .expect(409)
+      .expect('Content-Type', /application\/problem\+json/);
+
+    expect(res.body).toMatchObject({ type: 'slot-taken', status: 409, instance: '/v1/bookings' });
+  });
+
+  it('returns 422 with field errors for invalid input', async () => {
+    const salon = await f.salon();
+    const api = await ownerOf(salon);
+
+    const res = await api
+      .post('/v1/bookings')
+      .set('Idempotency-Key', crypto.randomUUID())
+      .send({ ...body(salon), customerEmail: 'nope', status: 'cancelled' })
+      .expect(422);
+
+    expect(res.body.type).toBe('validation-failed');
+    expect(res.body.errors).toEqual(
+      expect.arrayContaining([expect.objectContaining({ field: 'customerEmail' })]),
+    );
+  });
+
+  it('returns 401 without a login', async () => {
+    const salon = await f.salon();
+    await client(t.server).post('/v1/bookings').send(body(salon)).expect(401);
+  });
+});
+```
+
+`toEqual` on the whole body (not `toMatchObject`) is on purpose in the first test: it fails if a new field appears. That's how you catch the day someone returns `notes` or `customer.phone` by accident. Use it on the main response of each resource; use `toMatchObject` elsewhere.
+
+### Tenants: the most important tests in the project
+
+```typescript
+describe('other businesses', () => {
+  it('cannot read, change or cancel another business’s booking (404)', async () => {
+    const a = await f.salon();
+    const b = await f.salon();
+    const created = await (await ownerOf(a))
+      .post('/v1/bookings').set('Idempotency-Key', crypto.randomUUID()).send(body(a)).expect(201);
+    const id = created.body.id as string;
+
+    const asB = await ownerOf(b);
+    await asB.get(`/v1/bookings/${id}`).expect(404);
+    await asB.patch(`/v1/bookings/${id}`).set('If-Match', '"1"').send({ startsAt: '2099-01-02T10:00:00Z' }).expect(404);
+    await asB.post(`/v1/bookings/${id}/cancel`).expect(404);
+    const list = await asB.get('/v1/bookings').expect(200);
+    expect(list.body.data).toEqual([]);
+
+    // and nothing changed
+    const row = await t.prisma.booking.findUniqueOrThrow({ where: { id } });
+    expect(row.status).toBe('confirmed');
+  });
+
+  it('rejects a business the user is not a member of (403)', async () => {
+    const a = await f.salon();
+    const b = await f.salon();
+    const api = client(t.server, { cookie: await loginAs(t.app, a.owner.id), businessId: b.business.id });
+
+    await api.get('/v1/bookings').expect(403);
+  });
+});
+```
+
+The second test is different from the first: the attacker sends **their own** cookie with **another** business's ID in `X-Business-Id`. It checks the `MembershipGuard`.
+
+### A permissions matrix
+
+The role table from [Auth Lesson 6](/docs/auth-security/lesson-6-authorisation) is a specification. Turn it into a test table, so every cell is checked:
+
+```typescript
+// test/permissions.e2e-spec.ts
+type Role = 'owner' | 'admin' | 'staff';
+
+const matrix: { name: string; method: 'get' | 'post' | 'patch' | 'delete'; path: (s: Salon) => string; allowed: Role[] }[] = [
+  { name: 'list services',   method: 'get',    path: () => '/v1/services',            allowed: ['owner', 'admin', 'staff'] },
+  { name: 'create service',  method: 'post',   path: () => '/v1/services',            allowed: ['owner', 'admin'] },
+  { name: 'delete service',  method: 'delete', path: (s) => `/v1/services/${s.service.id}`, allowed: ['owner', 'admin'] },
+  { name: 'daily report',    method: 'get',    path: () => '/v1/reports/daily?from=2099-01-01&to=2099-01-07', allowed: ['owner', 'admin'] },
+  { name: 'list invitations', method: 'get',   path: () => '/v1/invitations',         allowed: ['owner', 'admin'] },
+  // ...one line per route
+];
+
+const roles: Role[] = ['owner', 'admin', 'staff'];
+
+describe.each(matrix)('$name', ({ method, path, allowed }) => {
+  it.each(roles)('%s', async (role) => {
+    const salon = await f.salon();
+    const user = await f.member(salon.business.id, role);
+    const api = client(t.server, { cookie: await loginAs(t.app, user.id), businessId: salon.business.id });
+
+    const res = await api[method](path(salon)).send(validBodyFor(method, path(salon), salon));
+
+    if (allowed.includes(role)) expect(res.status).not.toBe(403);
+    else expect(res.status).toBe(403);
+  });
+});
+```
+
+`not.toBe(403)` (not `toBe(200)`) keeps the test about **permission** only: an allowed request may still return 201, 204 or 422 for other reasons, and that's covered by other tests. `validBodyFor` is a small switch that returns a valid body for the routes that need one.
+
+When you add a route, you add a row. Missing one row = one route nobody checked. (Stretch in exercise 4.4: list every route automatically and fail if one isn't in the matrix.)
+
+### Auth flows
+
+```typescript
+// test/auth.e2e-spec.ts (extracts)
+it('login sets an httpOnly access cookie and a refresh cookie limited to /v1/auth', async () => {
+  const user = await f.userWithPassword('rahim@test.dev', 'correct horse battery staple');
+
+  const res = await client(t.server)
+    .post('/v1/auth/login')
+    .send({ email: 'rahim@test.dev', password: 'correct horse battery staple' })
+    .expect(204);
+
+  const cookies = res.get('Set-Cookie') as string[];
+  expect(cookies.find((c) => c.startsWith('access_token='))).toMatch(/HttpOnly.*Secure.*SameSite=Lax/i);
+  expect(cookies.find((c) => c.startsWith('refresh_token='))).toMatch(/Path=\/v1\/auth/);
+});
+
+it('gives the same answer for a wrong password and an unknown email', async () => {
+  await f.userWithPassword('rahim@test.dev', 'correct horse battery staple');
+  const api = client(t.server);
+
+  const wrongPassword = await api.post('/v1/auth/login').send({ email: 'rahim@test.dev', password: 'wrong-password-123' });
+  const unknownEmail = await api.post('/v1/auth/login').send({ email: 'nobody@test.dev', password: 'wrong-password-123' });
+
+  expect(wrongPassword.status).toBe(401);
+  expect(unknownEmail.status).toBe(401);
+  expect(wrongPassword.body.title).toBe(unknownEmail.body.title);      // no user enumeration
+});
+
+it('detects refresh token reuse and revokes the session', async () => {
+  const login = await loginWithPassword();                   // helper: real login, returns the response
+  const refresh1 = refreshCookie(login);                     // "refresh_token=..."
+
+  const r1 = await client(t.server).post('/v1/auth/refresh').set('Cookie', refresh1).expect(204);
+  const refresh2 = refreshCookie(r1);
+
+  // Pretend the first refresh happened 11 seconds ago: past the 10-second grace period, without waiting
+  await t.prisma.$executeRaw`update refresh_tokens set used_at = now() - interval '11 seconds' where used_at is not null`;
+
+  await client(t.server).post('/v1/auth/refresh').set('Cookie', refresh1).expect(401);       // old token again
+  await client(t.server).post('/v1/auth/refresh').set('Cookie', refresh2).expect(401);       // the whole session is dead
+
+  const session = await t.prisma.session.findFirstOrThrow();
+  expect(session.revokedReason).toBe('refresh_token_reuse');
+});
+
+it('blocks a cookie request from another site (CSRF)', async () => {
+  const salon = await f.salon();
+  const cookie = await loginAs(t.app, salon.owner.id);
+
+  await request(t.server)
+    .post('/v1/auth/logout')
+    .set('Cookie', cookie)
+    .set('Origin', 'https://evil.example')
+    .expect(403);
+});
+```
+
+The reuse test doesn't wait 11 seconds: it moves the **data** back in time instead. Changing timestamps in the database is often the simplest way to test "after X seconds" rules in API tests. (Use your real table and column names.) Lesson 5 shows the other way: controlling the clock with a `Clock` provider. `request` in the CSRF test is Supertest's default export, used directly so no helper adds the correct `Origin`.
+
+`f.userWithPassword` is a factory that hashes with your real `PasswordService` (about 30 ms). `refreshCookie(res)` picks the `refresh_token=...` part from `Set-Cookie`. Write both in exercise 4.2.
+
+### Testing a flow with an email
+
+```typescript
+it('sign-up → verify email → log in', async () => {
+  const api = client(t.server);
+  await api.post('/v1/auth/signup').send({ email: 'new@test.dev', name: 'New', password: 'a long enough password' }).expect(202);
+
+  // The email is sent in the background (Auth Lesson 4), so wait for it
+  await eventually(() => expect(t.emails.sendVerifyEmail).toHaveBeenCalledTimes(1));
+  const [to, , token] = t.emails.sendVerifyEmail.mock.calls[0];
+  expect(to).toBe('new@test.dev');
+
+  await api.post('/v1/auth/verify-email').send({ token }).expect(204);
+  await api.post('/v1/auth/verify-email').send({ token }).expect(400);     // single use
+  await api.post('/v1/auth/login').send({ email: 'new@test.dev', password: 'a long enough password' }).expect(204);
+});
+```
+
+```typescript
+// test/setup/eventually.ts
+/** Retries `check` until it stops throwing, or fails after `timeoutMs`. For work that happens in the background. */
+export async function eventually(check: () => void | Promise<void>, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      await check();
+      return;
+    } catch (err) {
+      if (Date.now() > deadline) throw err;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+}
+```
+
+Never use a fixed `await sleep(500)` for background work: it's slow when the work is fast, and flaky when the machine is slow. Wait for the **result**.
+
+## What not to put in API tests
+
+- Every validation rule of every DTO (unit-test the DTO, Lesson 2; keep one 422 test per endpoint for the format).
+- Every branch of a pure function (unit tests).
+- The Swagger UI, Prisma itself, or Nest's routing.
+
+## Mistakes to avoid
+
+- Building the test app differently from production (no `cookieParser`, no versioning), so tests and production disagree. Use one `configureApp`.
+- Using `request.agent()` with `Secure` cookies over HTTP and getting 401s you can't explain.
+- Logging in with a real password (argon2) in every test: slow. Use a session helper, and test the real login separately.
+- Forgetting the `Origin` header on POST/PATCH/DELETE, then "fixing" the 403 by switching the `OriginGuard` off in tests. Now your CSRF protection is untested.
+- Only testing your own business. Always create a second one.
+- `toMatchObject` everywhere, so leaked fields never fail a test.
+- `await sleep(...)` to wait for emails or jobs.
+- Creating the Nest app in `beforeEach`.
+
+## Exercises
+
+- **4.1** 🟢 Move the `main.ts` setup into `configureApp`. Write the `createTestApp` helper and one test: `GET /health/live` returns 200. Then comment out `enableVersioning` in `configureApp` and check the test fails.
+- **4.2** 🟡 Write `f.userWithPassword`, `refreshCookie`, `loginWithPassword` and the auth flow tests: login cookies, no enumeration, refresh rotation, reuse detection, logout (the old access cookie gets 401 on a route that checks the session), and sign-up → verify → login.
+- **4.3** 🟡 Write the tenant tests for bookings, services, customers and the daily report: for each, business B gets 404 (or an empty list) and nothing changes. Then remove the `businessId` filter from one repository method and see which test catches it.
+- **4.4** 🔴 Write the permissions matrix for **every** route in your API. Stretch: in a separate test, read all routes from Nest (the `DiscoveryService` from `@nestjs/core` with `MetadataScanner`, or the Swagger document from `SwaggerModule.createDocument`) and fail if any route is missing from the matrix.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you write end-to-end tests for a NestJS API?"**
+
+> "I start the real application in the test with `Test.createTestingModule` and my real `AppModule`, and I apply the same setup function as `main.ts`, so cookies, versioning and security headers are the same as in production. It runs against a real Postgres from Testcontainers. I only replace the edges, like the email sender, with fakes. Then I use Supertest to send HTTP requests and check the status, the headers and the JSON body. Most tests log in through a helper that creates a real session and token, and a few test the real login flow, refresh rotation and logout. I always create two businesses, so I can check that the second one gets a 404 for the first one's data, and I have a permissions matrix that checks every route against every role."
+
+**"How do you test authorisation?"**
+
+> "At the API level, because a unit test can show that a guard works, but only an HTTP test shows that the route actually uses it. I keep a table of routes and the roles allowed on each, and the test checks that every other role gets 403. For multi-tenancy, every resource has a test where a user from another business tries to read, update and delete it, gets 404, and then I check in the database that nothing changed."

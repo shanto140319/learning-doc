@@ -1,0 +1,379 @@
+---
+title: "Lesson 3: Caching in NestJS"
+description: "@nestjs/cache-manager and why its CacheInterceptor is dangerous with tenants, a small CacheService on ioredis (getOrSet, TTL jitter, Redis-down fallback, hit and miss logging), caching the public profile with invalidation after commit, negative caching, caching availability with versioned keys, the stale-write race, cache stampedes and how to stop them, and a tiny in-memory first layer."
+---
+
+Lesson 1 was the theory. Now you cache two real things in the booking API:
+
+1. The **public business profile** (name, time zone, services): read on every visit to the booking page, changes rarely.
+2. **Availability** (free slots for a staff member, service and date): the most expensive and most frequent query.
+
+## Option A: `@nestjs/cache-manager`
+
+Nest has an official cache module. With Redis:
+
+```typescript
+// app.module.ts
+import { CacheModule } from '@nestjs/cache-manager';
+import KeyvRedis from '@keyv/redis';
+
+CacheModule.registerAsync({
+  isGlobal: true,
+  inject: [ConfigService],
+  useFactory: (config: ConfigService<Env, true>) => ({
+    stores: [new KeyvRedis(config.get('REDIS_URL', { infer: true }))],
+    ttl: 60_000,                                   // milliseconds in cache-manager v6+
+  }),
+}),
+```
+
+Then you can inject `CACHE_MANAGER` and call `get`, `set` and `del`, or put `@UseInterceptors(CacheInterceptor)` on a controller to cache `GET` responses automatically.
+
+<Callout type="error" title="CacheInterceptor and tenants">
+`CacheInterceptor` builds the cache key from the **URL only**. In the booking API, the active business comes from the `X-Business-Id` **header** ([Auth Lesson 6](/docs/auth-security/lesson-6-authorisation)). So `GET /v1/services` for business A is cached, and business B gets A's services from the cache. It also ignores who the user is. Never put `CacheInterceptor` on authenticated routes unless you override `trackBy()` to include the tenant and the user, and even then, prefer explicit caching.
+</Callout>
+
+The module is fine for simple apps. This section uses a small service of its own instead, because you need control over keys, versions, fallbacks and stampedes, and because writing it teaches you what the module hides. (In interviews, mentioning both is good.)
+
+## Option B: a small `CacheService`
+
+```typescript
+// src/cache/cache.service.ts
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import Redis from 'ioredis';
+import { REDIS } from '../redis/redis.module';
+
+@Injectable()
+export class CacheService {
+  private readonly logger = new Logger(CacheService.name);
+  private readonly inFlight = new Map<string, Promise<unknown>>();
+
+  constructor(@Inject(REDIS) private readonly redis: Redis) {}
+
+  /**
+   * Cache-aside: return the cached value, or run `load`, store the result and return it.
+   * If Redis is down, `load` still runs: the cache is optional.
+   */
+  async getOrSet<T>(key: string, ttlSeconds: number, load: () => Promise<T>): Promise<T> {
+    const cached = await this.safeGet(key);
+    if (cached !== null) {
+      this.logger.debug(`hit ${key}`);
+      return JSON.parse(cached) as T;
+    }
+    this.logger.debug(`miss ${key}`);
+
+    // Single-flight: if this process is already loading this key, wait for that result
+    const running = this.inFlight.get(key);
+    if (running) return running as Promise<T>;
+
+    const promise = (async () => {
+      try {
+        const value = await load();
+        await this.safeSet(key, JSON.stringify(value), withJitter(ttlSeconds));
+        return value;
+      } finally {
+        this.inFlight.delete(key);
+      }
+    })();
+    this.inFlight.set(key, promise);
+    return promise;
+  }
+
+  async delete(...keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
+    try {
+      await this.redis.unlink(...keys);
+    } catch (err) {
+      this.logger.warn(`cache delete failed for ${keys.join(', ')}: ${(err as Error).message}`);
+    }
+  }
+
+  /** Increase a version counter. Keys built with the old version are never read again. */
+  async bumpVersion(name: string): Promise<void> {
+    try {
+      await this.redis.incr(`cache:ver:${name}`);
+    } catch (err) {
+      this.logger.warn(`version bump failed for ${name}: ${(err as Error).message}`);
+    }
+  }
+
+  async version(name: string): Promise<string> {
+    try {
+      return (await this.redis.get(`cache:ver:${name}`)) ?? '0';
+    } catch {
+      return 'redis-down';                         // safeGet will miss anyway
+    }
+  }
+
+  private async safeGet(key: string): Promise<string | null> {
+    try {
+      return await this.redis.get(key);
+    } catch (err) {
+      this.logger.warn(`cache get failed for ${key}: ${(err as Error).message}`);
+      return null;                                 // treat as a miss
+    }
+  }
+
+  private async safeSet(key: string, value: string, ttlSeconds: number): Promise<void> {
+    try {
+      await this.redis.set(key, value, 'EX', ttlSeconds);
+    } catch (err) {
+      this.logger.warn(`cache set failed for ${key}: ${(err as Error).message}`);
+    }
+  }
+}
+
+function withJitter(ttlSeconds: number): number {
+  return ttlSeconds + Math.floor(Math.random() * Math.max(1, ttlSeconds * 0.1));   // +0–10%
+}
+```
+
+What each part is for:
+
+| Part | Why |
+| --- | --- |
+| `safeGet` / `safeSet` catch errors | **Redis down = slower, not broken.** Every cache failure becomes a miss |
+| JSON | Redis stores strings. You cache plain data, never class instances |
+| Single-flight (`inFlight`) | 100 requests miss at the same moment → one `load()` in this process, not 100 (the stampede section below) |
+| Jitter | Keys created together don't expire together |
+| `bumpVersion` / `version` | Versioned keys (the availability section below) |
+
+<Callout type="warn" title="Dates in JSON">
+`JSON.stringify` turns a `Date` into a string, and `JSON.parse` doesn't turn it back. Code that does `profile.createdAt.getTime()` works on a miss and crashes on a hit. The simplest fix: cache the **response shape** (already with ISO strings, exactly what the controller returns), not Prisma objects. Then a hit and a miss return the same thing.
+</Callout>
+
+## Caching the public profile
+
+```typescript
+// src/public/public-profile.service.ts
+@Injectable()
+export class PublicProfileService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly cache: CacheService,
+  ) {}
+
+  static key(slug: string) {
+    return `cache:v1:profile:${slug}`;
+  }
+
+  get(slug: string): Promise<PublicProfile> {
+    return this.cache.getOrSet(PublicProfileService.key(slug), 300, async () => {
+      const business = await this.prisma.business.findUnique({
+        where: { slug },
+        select: {
+          id: true, name: true, slug: true, timeZone: true,
+          services: {
+            where: { deletedAt: null },
+            select: { id: true, name: true, durationMinutes: true, priceCents: true, currency: true },
+            orderBy: { name: 'asc' },
+          },
+        },
+      });
+      if (!business) throw new NotFoundException();      // not cached (see "negative caching")
+      return business;                                   // only plain strings and numbers: safe to cache
+    });
+  }
+}
+```
+
+The slug is globally unique, so it doesn't need the business ID in the key: the slug **is** the tenant here. The data is public anyway; only `select` what a visitor may see (no owner email, no internal notes).
+
+### Invalidate after the write commits
+
+Every change that affects the profile deletes the key:
+
+```typescript
+// src/services/services.service.ts
+async create(businessId: string, input: CreateServiceDto) {
+  const service = await this.prisma.service.create({ data: { ...input, businessId } });
+  await this.invalidateProfile(businessId);              // AFTER the write is committed
+  return service;
+}
+
+private async invalidateProfile(businessId: string) {
+  const { slug } = await this.prisma.business.findUniqueOrThrow({ where: { id: businessId }, select: { slug: true } });
+  await this.cache.delete(PublicProfileService.key(slug));
+}
+```
+
+Rules:
+
+- **After the commit, never inside the transaction.** If you delete first and the transaction then rolls back, nothing is wrong (just one extra miss). If you delete inside the transaction, another request can read the **old** row (not committed yet) and put it back in the cache before your commit, and it stays stale until the TTL.
+- **Every write path.** Create, update, delete of services, and updating the business (name, time zone). If the **slug** changes, delete the old slug's key too.
+- If you forget a path, the TTL (5 minutes) limits the damage. That's why it's there.
+
+A more robust way to "never forget a path" is to invalidate from **events**: every write already creates an outbox event in the same transaction (PostgreSQL section), and in Lesson 6 a worker processes those events. One handler for `service.*` and `business.updated` deletes the key. You'll wire that up in Lesson 6.
+
+### Negative caching
+
+Someone scripts requests for `/v1/public/businesses/aaaa`, `aaab`, `aaac`... Each one misses the cache **and** the database. Cache "not found" too, for a short time:
+
+```typescript
+// inside the loader
+if (!business) return null;                              // cache the null for a short time
+```
+
+```typescript
+const profile = await this.cache.getOrSet(key, 30, loadOrNull);   // short TTL for nulls: see exercise 3.2
+if (!profile) throw new NotFoundException();
+```
+
+Keep the TTL short (30 seconds), because a business might be created with that slug a moment later.
+
+`getOrSet` above handles a cached `null` correctly: it compares the **raw string** from Redis with `null` (no key) before parsing, and the stored string `"null"` isn't `null`. The classic bug is checking the **parsed** value instead (`const v = JSON.parse(raw); if (v) return v;`): then a cached `null` (or `0`, or `false`) counts as a miss, and every request for an unknown slug goes to the database again.
+
+## Caching availability
+
+Availability is harder. A new booking for **any** customer changes the free slots for that staff member on that day. And there are many keys: one per staff × service × date.
+
+The key:
+
+```text
+cache:v1:avail:{businessId}:{version}:{staffId}:{serviceId}:{date}
+```
+
+### Why not just delete keys?
+
+After a booking is created, which keys must go? That staff member, that date (in the business's time zone), **every service** they offer. You'd have to work out the exact list, or `SCAN` for a pattern (slow). And there's a race:
+
+| Time | Request A (availability) | Request B (new booking) |
+| --- | --- | --- |
+| 1 | Cache miss. Reads slots from Postgres: 10:00 is free | |
+| 2 | | Inserts the 10:00 booking, commits |
+| 3 | | Deletes the availability key |
+| 4 | Writes its result (10:00 free) **into the cache** | |
+
+Now the cache says 10:00 is free, until the TTL ends. This is the **stale write** race, and "delete on write" can't prevent it.
+
+### Versioned keys
+
+Instead of deleting, keep a **version number** per business, put it in the key, and increase it on every booking change:
+
+```typescript
+// src/availability/availability.service.ts
+@Injectable()
+export class AvailabilityService {
+  constructor(
+    private readonly repo: AvailabilityRepository,
+    private readonly cache: CacheService,
+  ) {}
+
+  async slots(businessId: string, staffId: string, serviceId: string, date: string) {
+    const version = await this.cache.version(`avail:${businessId}`);
+    const key = `cache:v1:avail:${businessId}:${version}:${staffId}:${serviceId}:${date}`;
+    return this.cache.getOrSet(key, 60, () => this.repo.freeSlots(businessId, staffId, serviceId, date));
+  }
+
+  /** Call after any booking change in this business has COMMITTED. */
+  invalidate(businessId: string) {
+    return this.cache.bumpVersion(`avail:${businessId}`);
+  }
+}
+```
+
+```typescript
+// src/bookings/bookings.service.ts
+async create(actor: Actor, input: CreateBookingDto) {
+  const booking = await this.bookings.create(actor.businessId, input);   // the transaction (with outbox)
+  await this.availability.invalidate(actor.businessId);                  // after commit
+  return booking;
+}
+// same after cancel and reschedule
+```
+
+Why this fixes the race: request A read the version (say 7) **before** reading Postgres. B commits and bumps the version to 8. A then writes its stale result under the **version 7** key, and nobody reads version 7 any more. Old keys just expire with their TTL.
+
+The trade-off: one booking in a business invalidates availability for **all** its staff and dates. For small businesses (your platform), that's fine. For a business with 200 staff, you'd version per staff member and date instead: `avail:{businessId}:{staffId}:{date}` (exercise 3.3 asks you to think about this).
+
+<Callout title="Remember what protects you">
+Even with a perfect cache, a customer can see a slot that was taken a second ago. That's normal. The exclusion constraint returns 409 `slot-taken`, and the frontend shows "Sorry, this time was just booked" and reloads the slots. The cache makes the page fast; the database keeps it correct.
+</Callout>
+
+## Cache stampede
+
+A popular key expires. In the next 100 ms, 500 requests miss at the same time, and all 500 run the expensive query. The database slows down, more requests pile up, and sometimes the whole system falls over. This is a **cache stampede** (also called "thundering herd" or "dog-piling").
+
+Ways to stop it, from simplest:
+
+| Fix | How | Limit |
+| --- | --- | --- |
+| **Jitter** | Random extra TTL | Spreads expiry of **many** keys; doesn't help one hot key |
+| **Single-flight** (in process) | One `load()` per key per process; others wait for the same promise (the `inFlight` map above) | With 3 instances, 3 loads instead of 1: usually fine |
+| **Lock in Redis** | `SET lock:key NX PX 5000`; the winner loads; others wait a little and read the cache again | Across all instances; more code; waiters add latency |
+| **Stale-while-revalidate** | Store the value with a "soft" expiry earlier than the real TTL. After the soft expiry, return the old value **and** refresh it in the background (one refresher, using the lock) | Best for very hot keys; users never wait |
+| **Refresh ahead** | A scheduled job (Lesson 7) refreshes known hot keys before they expire | Only for a known, small set of keys |
+
+For the booking platform, **jitter + single-flight** is enough. Know the others for system design interviews: "how would you protect the database when a hot key expires?"
+
+A stale-while-revalidate sketch, so you can explain it:
+
+```typescript
+type Entry<T> = { value: T; freshUntil: number };     // stored as JSON with a longer real TTL
+
+async function getSwr<T>(key: string, freshSeconds: number, load: () => Promise<T>): Promise<T> {
+  const entry = await readEntry<T>(key);
+  if (entry && Date.now() < entry.freshUntil) return entry.value;          // fresh
+  if (entry) {
+    void refreshInBackground(key, freshSeconds, load);                       // stale: refresh (with a lock), don't wait
+    return entry.value;
+  }
+  return loadAndStore(key, freshSeconds, load);                              // nothing at all: must wait
+}
+```
+
+## A tiny in-memory first layer (optional)
+
+For extremely hot, tiny data (the business's time zone, read on every request), even a Redis round trip (~0.3 ms) adds up. Put an LRU with a **very short** TTL in front:
+
+```typescript
+import { LRUCache } from 'lru-cache';
+
+const local = new LRUCache<string, BusinessSettings>({ max: 5_000, ttl: 5_000 });   // 5 seconds
+```
+
+Each instance may be up to 5 seconds stale, and you can't invalidate it from another instance (unless you add Redis pub/sub). Use it only where that's acceptable. Most apps don't need it.
+
+## Observe it
+
+You logged `hit` and `miss` at debug level. For a real number, count them:
+
+```typescript
+// in getOrSet, instead of only logging
+this.metrics.increment('cache_requests_total', { name: keyName(key), result: 'hit' });
+```
+
+Month 3 (observability) turns this into a dashboard. Until then, a log line per miss and a quick count is enough to check that the hit ratio is good.
+
+## Mistakes to avoid
+
+- `CacheInterceptor` on routes where the tenant or user isn't in the URL.
+- Letting a Redis error fail the request.
+- Caching Prisma objects with `Date`s and reading them back as if they were still `Date`s.
+- Invalidating inside the transaction instead of after the commit.
+- Forgetting one write path (business update, slug change, soft delete).
+- Thinking "delete on write" is always enough (the stale-write race).
+- Caching `null` by accident, or for too long.
+- No single-flight and no jitter on hot keys.
+- Caching data that isn't safe to show publicly (select only public fields).
+
+## Exercises
+
+- **3.1** 🟢 Write `CacheService` (try from memory first). Test it by hand: log a miss on the first call and a hit on the second; stop Redis and check the endpoint still answers (slower) with only warnings in the log. Then explain why a cached `null` is a hit in this version, and write the one-line change that would turn it into a miss.
+- **3.2** 🟡 Cache the public profile. Invalidate it on service create, update and delete, business update and slug change. Add negative caching with a 30-second TTL (hint: `getOrSet` needs a way to use a different TTL for `null`). Write the list of every write path you found.
+- **3.3** 🟡 Cache availability with versioned keys; bump the version after booking create, cancel and reschedule commit. Measure again with the same `autocannon` command as exercise 1.3 and compare. Then answer: for a business with 200 staff, how would you change the version key, and what new problem does that create? (Hint: what's the "date" of a booking, and what if a reschedule moves it to another day?)
+- **3.4** 🔴 Prove the stampede: temporarily remove single-flight, add a log line in the availability loader, delete the key, and send 200 requests at once (`autocannon -c 200 -a 200`). Count the loader calls. Add single-flight back and count again. Then start a second API instance on another port, split the requests between them, and count. Explain how a Redis lock or stale-while-revalidate would bring it to one.
+
+## My notes and mistakes
+
+_Add the mistakes I made in this lesson and what fixed them._
+
+## Interview answer
+
+**"How do you keep a cache consistent with the database?"**
+
+> "First, every key gets a TTL, so a bug can only make data stale for a limited time. Then I invalidate after the write commits, never before or inside the transaction. For data where many keys depend on one change, like availability, I use versioned keys: there's a version counter per business, it's part of every key, and a booking change increments it. That also fixes the race where a slow reader writes old data into the cache after the invalidation, because it writes under the old version that nobody reads any more. And I accept that the cache can be a little stale: for availability, the database constraint is what actually prevents double bookings."
+
+**"What is a cache stampede and how do you prevent it?"**
+
+> "It's when a popular key expires and many requests miss at the same moment, so they all hit the database together and can overload it. Simple fixes are random jitter on TTLs, so keys don't expire together, and single-flight, where concurrent misses in one process share one database call. Across many servers, I can add a short Redis lock so only one request rebuilds the value, or use stale-while-revalidate: serve the old value while one background request refreshes it. For very hot keys I can also refresh them on a schedule before they expire."
